@@ -25,6 +25,8 @@ dist/
 *.exe
 *.msi
 *.tar
+*.zip
+*.rar
 *.gz
 *.7z
 *.bak
