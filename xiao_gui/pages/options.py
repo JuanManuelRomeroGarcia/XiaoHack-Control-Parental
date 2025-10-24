@@ -1,7 +1,9 @@
 # xiao_gui/pages/options.py — XiaoHack GUI: pestaña Opciones (revisado)
+import json
 import os
 import sys  # noqa: F401
 import subprocess
+import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 from pathlib import Path  # noqa: F401
@@ -67,6 +69,35 @@ def _venv_python(cfg: dict) -> str:
 
 def _run_guardian_bat(cfg: dict) -> str:
     return os.path.join(_install_dir(cfg), "run_guardian.bat")
+
+def _xh_root() -> Path:
+    # raíz del runtime (donde está updater.py y VERSION)
+    return Path(__file__).resolve().parents[2]
+
+def _read_version() -> str:
+    try:
+        return (_xh_root() / "VERSION").read_text(encoding="utf-8").strip()
+    except Exception:
+        return "0.0.0"
+
+def _python_exe() -> str:
+    # usa el mismo intérprete que corre la app (pythonw.exe/ python.exe del venv)
+    return sys.executable or str(_xh_root() / "venv" / "Scripts" / "python.exe")
+
+def _run_updater(args):
+    """Ejecuta updater.py y devuelve el JSON como dict."""
+    up = str(_xh_root() / "updater.py")
+    cmd = [_python_exe(), up] + args
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=300)
+        return json.loads(out.decode("utf-8", "ignore"))
+    except subprocess.CalledProcessError as e:
+        try:
+            return json.loads(e.output.decode("utf-8", "ignore"))
+        except Exception:
+            return {"error": f"Updater fallo: {e}"}
+    except Exception as e:
+        return {"error": str(e)}
 
 # ---------- Guardian: consultas/acciones de tarea ----------
 def _query_task_state_local() -> str:
@@ -265,6 +296,37 @@ class OptionsPage(ttk.Frame):
         ttk.Button(btns_notif, text="Detener Notifier", command=self._stop_notifier).grid(row=0, column=1, padx=4)
         ttk.Button(btns_notif, text="Reiniciar Notifier", command=self._restart_notifier).grid(row=0, column=2, padx=4)
         ttk.Button(btns_notif, text="Abrir log (control.log)", command=self._open_control_log).grid(row=0, column=3, padx=4)
+        
+        ttk.Separator(self).grid(row=11, column=0, columnspan=6, sticky="ew", padx=6, pady=12)
+
+        # === Actualizaciones ===
+        upd = ttk.LabelFrame(self, text="Actualizaciones")
+        upd.grid(row=12, column=0, sticky="ew", padx=6, pady=6)
+        upd.grid_columnconfigure(1, weight=1)
+
+        self.var_cur = tk.StringVar(value=_read_version())
+        self.var_lat = tk.StringVar(value="—")
+        self.var_upd = tk.StringVar(value="Sin comprobar")
+
+        ttk.Label(upd, text="Versión instalada:").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        ttk.Label(upd, textvariable=self.var_cur).grid(row=0, column=1, sticky="w", padx=6)
+
+        ttk.Label(upd, text="Última versión:").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        ttk.Label(upd, textvariable=self.var_lat).grid(row=1, column=1, sticky="w", padx=6)
+
+        ttk.Label(upd, text="Estado:").grid(row=2, column=0, sticky="w", padx=6, pady=4)
+        ttk.Label(upd, textvariable=self.var_upd).grid(row=2, column=1, sticky="w", padx=6)
+
+        btns_upd = ttk.Frame(upd)
+        btns_upd.grid(row=3, column=0, columnspan=2, sticky="w", padx=6, pady=(6, 4))
+
+        self.btn_check = ttk.Button(btns_upd, text="Comprobar", command=self._on_check_updates)
+        self.btn_apply = ttk.Button(btns_upd, text="Actualizar", command=self._on_apply_update, state="disabled")
+        self.btn_check.pack(side="left", padx=4)
+        self.btn_apply.pack(side="left", padx=4)
+
+        # Comprobación automática tras abrir la pestaña
+        self.after(1200, self._auto_check_updates)
 
     # ---------------- PIN ----------------
     def _change_pin(self):
@@ -279,6 +341,71 @@ class OptionsPage(ttk.Frame):
             log.info("PIN actualizado y guardado en configuración.")
         else:
             log.debug("Cambio de PIN cancelado o inválido.")
+            
+    # ---------------- Actualizaciones ----------------
+    def _set_upd_busy(self, busy: bool, msg: str = None):
+        st = "disabled" if busy else "normal"
+        self.btn_check.configure(state=st)
+        # solo habilitar "Actualizar" si había update disponible
+        if busy:
+            self.btn_apply.configure(state="disabled")
+        self.var_upd.set(msg or ("Trabajando…" if busy else "Listo"))
+
+    def _auto_check_updates(self):
+        if self.var_lat.get() == "—":  # solo si no se ha hecho ya
+            self._on_check_updates()
+
+    def _on_check_updates(self):
+        def work():
+            self._set_upd_busy(True, "Comprobando…")
+            res = _run_updater(["--check"])
+            self.after(0, self._after_check_updates, res)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _after_check_updates(self, res: dict):
+        self._set_upd_busy(False)
+        if not isinstance(res, dict):
+            messagebox.showerror("Actualizaciones", f"Respuesta inválida: {res}")
+            return
+        if res.get("error"):
+            self.var_upd.set("Error")
+            messagebox.showerror("Actualizaciones", f"Error: {res['error']}")
+            return
+
+        cur = res.get("current") or _read_version()
+        lat = res.get("latest") or "—"
+        upd = bool(res.get("update_available"))
+
+        self.var_cur.set(cur)
+        self.var_lat.set(lat)
+        self.var_upd.set("Actualización disponible" if upd else "Al día")
+        self.btn_apply.configure(state=("normal" if upd else "disabled"))
+
+        if upd:
+            if messagebox.askyesno("Actualización disponible",
+                                   f"Se encontró la versión {lat}.\n¿Quieres instalarla ahora?"):
+                self._on_apply_update()
+
+    def _on_apply_update(self):
+        def work():
+            self._set_upd_busy(True, "Descargando e instalando…")
+            res = _run_updater(["--apply"])
+            self.after(0, self._after_apply_update, res)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _after_apply_update(self, res: dict):
+        self._set_upd_busy(False)
+        if res.get("error"):
+            self.var_upd.set("Error al actualizar")
+            messagebox.showerror("Actualizar", f"No se pudo actualizar:\n{res['error']}")
+            return
+
+        latest = res.get("latest") or self.var_lat.get()
+        self.var_cur.set(latest)
+        self.var_lat.set(latest)
+        self.var_upd.set("Actualizado")
+        messagebox.showinfo("Actualizar", "Actualización aplicada correctamente.\nReinicia el Panel para ver cambios.")
+
 
     # ---------------- Servicio ----------------
     def refresh_service(self):

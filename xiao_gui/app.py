@@ -1,6 +1,10 @@
 # app.py — XiaoHack Control Parental — GUI Tutor (revisado)
 
 import contextlib
+import json
+from pathlib import Path
+import subprocess
+import threading
 import traceback
 import sys
 import tkinter as tk
@@ -87,6 +91,54 @@ def _compute_enforcement(cfg, st, *, allowed: bool):
     changed = (prev != rules)
     st["enforcement"] = rules
     return rules, changed
+
+def _read_version():
+    try:
+        root = Path(__file__).resolve().parents[1]  # raíz del runtime (donde está VERSION)
+        return (root / "VERSION").read_text(encoding="utf-8").strip()
+    except Exception:
+        return "0.0.0"
+
+APP_VERSION = _read_version()
+
+def _auto_check_updates_once(root):
+    """
+    Comprueba si hay una versión nueva usando updater.py y ofrece aplicar la actualización.
+    No bloquea la UI (usa un thread).
+    """
+    def _run():
+        try:
+            up = str(Path(__file__).resolve().parents[1] / "updater.py")
+            out = subprocess.check_output(
+                [sys.executable, up, "--check"],
+                stderr=subprocess.STDOUT,
+                timeout=300
+            )
+            res = json.loads(out.decode("utf-8", "ignore"))
+            if res.get("update_available"):
+                latest = res.get("latest") or "desconocida"
+                def _apply():
+                    try:
+                        subprocess.check_call([sys.executable, up, "--apply"])
+                        messagebox.showinfo(
+                            "Actualización",
+                            "Actualización instalada correctamente.\nReinicia el Panel para ver los cambios."
+                        )
+                    except Exception as e:
+                        messagebox.showerror("Actualización", f"No se pudo actualizar:\n{e}")
+
+                root.after(0, lambda: (
+                    messagebox.askyesno(
+                        "Actualización disponible",
+                        f"Hay una nueva versión {latest}.\n¿Quieres instalarla ahora?"
+                    ) and _apply()
+                ))
+        except Exception:
+            # Silencioso: no rompemos la UI si falla la comprobación
+            pass
+
+    threading.Thread(target=_run, daemon=True).start()
+
 # =============================================================================
 
 # --- AppUserModelID para que Windows use el icono de la app (barra de tareas) ---
@@ -264,7 +316,7 @@ class TutorApp(tk.Tk):
         left.grid(row=0, column=0, sticky="w", padx=(8, 0), pady=(0, 8))
         self._dirty_label = ttk.Label(left, text="", foreground="#cc0000")
         self._dirty_label.pack(side="left", padx=(0, 10))
-        ttk.Label(left, text="Control Parental © XiaoHack 2025").pack(side="left")
+        ttk.Label(left, text=f"Control Parental © XiaoHack — ver. {APP_VERSION}").pack(side="left")
 
         right = ttk.Frame(footer)
         right.grid(row=0, column=1, sticky="e", padx=(0, 8), pady=(0, 8))
@@ -979,6 +1031,8 @@ def run():
 
     try:
         app = TutorApp()
+        app.after(3000, lambda: _auto_check_updates_once(app))
+
         # (Opcional) adjunta logs al panel si tienes un widget de texto dedicado
         # attach_tk_text_logger(app.txt_log, logger_name="gui")  # si existe
         app.mainloop()
