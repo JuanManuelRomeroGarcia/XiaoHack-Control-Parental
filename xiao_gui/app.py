@@ -1,5 +1,5 @@
 # app.py — XiaoHack Control Parental — GUI Tutor (revisado)
-
+from __future__ import annotations
 import contextlib
 import json
 from pathlib import Path
@@ -10,71 +10,104 @@ import sys
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime
+import ctypes  # AppUserModelID
 from . import prof
-import ctypes  # admin
 
 from storage import load_state, save_state, now_epoch, load_config, save_config
 
-# Módulos propios
+# Tema / diálogos
 from .theme import apply_theme
 from .dialogs import ask_pin, check_pin, set_new_pin_hash
-from test_app.utils import ICON_APP, ASSETS
 
+# Logs
 from logs import (
     configure, install_exception_hooks, get_logger, get_log_file,
-    attach_tk_text_logger, set_level  # noqa: F401
 )
 
 log = get_logger("app")
 
-# Integración con scheduler (avisos/horarios)
+# ------------------- ICONOS / ASSETS con fallback robusto -------------------
+try:
+    # Preferencia: utilidades de tests si existen
+    from test_app.utils import ICON_APP, ASSETS  # type: ignore
+except Exception:
+    RUNTIME_ROOT = Path(__file__).resolve().parents[1]
+    ASSETS = RUNTIME_ROOT / "assets"
+    ICO = ASSETS / "app_icon.ico"
+    ICON_APP = ICO if ICO.exists() else Path()  # Path() => no existe
+
+# ---------------- Integración con scheduler / notifier ----------------------
 try:
     from scheduler import is_play_allowed, check_playtime_alerts
 except Exception:
     is_play_allowed = None
     check_playtime_alerts = None
 
-# Integración con notifier (toasts no bloqueantes)
 try:
-    from . import notifier as notifier_mod
+    import notifier as notifier_mod  # overlay + toasts
 except Exception:
-    try:
-        import notifier as notifier_mod  # type: ignore
-    except Exception:
-        notifier_mod = None
+    notifier_mod = None
 
-# TaskGate (si está fuera del paquete)
+# ---------------- AppUserModelID (icono correcto en la barra) ---------------
 try:
-    from utils.async_tasks import TaskGate
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("XiaoHack.Parental.Panel")
 except Exception:
+    pass
+
+# ---------------- Versión del runtime ---------------------------------------
+def _read_version():
     try:
-        from utils.async_tasks import TaskGate  # por si está bajo utils/
+        root = Path(__file__).resolve().parents[1]
+        return (root / "VERSION").read_text(encoding="utf-8").strip()
     except Exception:
-        class TaskGate:
-            def __init__(self): self._rev = 0
-            def next_rev(self): 
-                self._rev += 1 
-                return self._rev
-            def is_current(self, rev): return rev == self._rev
+        return "0.0.0"
 
+APP_VERSION = _read_version()
 
-def ensure_admin():
-    try:
-        is_admin = ctypes.windll.shell32.IsUserAnAdmin()
-    except Exception:
-        is_admin = False
-    if not is_admin:
-        params = " ".join(f'"{a}"' for a in sys.argv)
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
-        sys.exit(0)
+# ---------------- Auto-check de updates (no bloqueante) ---------------------
+def _auto_check_updates_once(root_widget: tk.Tk):
+    """
+    Lanza updater.py para consultar si hay update. Si lo hay, ofrece aplicar.
+    No bloquea la UI; usa un thread daemon.
+    """
+    def _run():
+        try:
+            up = str(Path(__file__).resolve().parents[1] / "updater.py")
+            # El updater imprime JSON sin flags; ignorará flags desconocidos si los hubiera.
+            out = subprocess.check_output([sys.executable, up], stderr=subprocess.STDOUT, timeout=300)
+            res = json.loads(out.decode("utf-8", "ignore"))
+            if res.get("update_available"):
+                latest = res.get("latest") or "desconocida"
 
+                def _apply():
+                    try:
+                        subprocess.check_call([sys.executable, up, "--apply"])
+                        messagebox.showinfo(
+                            "Actualización",
+                            "Actualización instalada correctamente.\nReinicia el Panel para ver los cambios.",
+                            parent=root_widget
+                        )
+                    except Exception as e:
+                        messagebox.showerror("Actualización", f"No se pudo actualizar:\n{e}", parent=root_widget)
 
-# ===== Enforcement helper ======================================================
+                def _ask():
+                    if messagebox.askyesno(
+                        "Actualización disponible",
+                        f"Hay una nueva versión {latest}.\n¿Quieres instalarla ahora?",
+                        parent=root_widget
+                    ):
+                        _apply()
+
+                root_widget.after(0, _ask)
+        except Exception:
+            # Silencioso: nunca romper la UI por el updater
+            pass
+
+    t = threading.Thread(target=_run, daemon=True, name="UpdaterCheck")
+    t.start()
+
+# ---------------- Enforcement helper ----------------------------------------
 def _compute_enforcement(cfg, st, *, allowed: bool):
-    """
-    Calcula las reglas efectivas de enforcement y las deja en state["enforcement"].
-    Devuelve (rules, changed) para saber si cambió respecto a lo que había.
-    """
     prev = st.get("enforcement", {})
     wl = list(cfg.get("game_whitelist") or [])
     bl = list(cfg.get("blocked_apps") or [])
@@ -92,74 +125,19 @@ def _compute_enforcement(cfg, st, *, allowed: bool):
     st["enforcement"] = rules
     return rules, changed
 
-def _read_version():
-    try:
-        root = Path(__file__).resolve().parents[1]  # raíz del runtime (donde está VERSION)
-        return (root / "VERSION").read_text(encoding="utf-8").strip()
-    except Exception:
-        return "0.0.0"
-
-APP_VERSION = _read_version()
-
-def _auto_check_updates_once(root):
-    """
-    Comprueba si hay una versión nueva usando updater.py y ofrece aplicar la actualización.
-    No bloquea la UI (usa un thread).
-    """
-    def _run():
-        try:
-            up = str(Path(__file__).resolve().parents[1] / "updater.py")
-            out = subprocess.check_output(
-                [sys.executable, up, "--check"],
-                stderr=subprocess.STDOUT,
-                timeout=300
-            )
-            res = json.loads(out.decode("utf-8", "ignore"))
-            if res.get("update_available"):
-                latest = res.get("latest") or "desconocida"
-                def _apply():
-                    try:
-                        subprocess.check_call([sys.executable, up, "--apply"])
-                        messagebox.showinfo(
-                            "Actualización",
-                            "Actualización instalada correctamente.\nReinicia el Panel para ver los cambios."
-                        )
-                    except Exception as e:
-                        messagebox.showerror("Actualización", f"No se pudo actualizar:\n{e}")
-
-                root.after(0, lambda: (
-                    messagebox.askyesno(
-                        "Actualización disponible",
-                        f"Hay una nueva versión {latest}.\n¿Quieres instalarla ahora?"
-                    ) and _apply()
-                ))
-        except Exception:
-            # Silencioso: no rompemos la UI si falla la comprobación
-            pass
-
-    threading.Thread(target=_run, daemon=True).start()
-
-# =============================================================================
-
-# --- AppUserModelID para que Windows use el icono de la app (barra de tareas) ---
-try:
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("XiaoHack.Parental.Panel")
-except Exception:
-    pass
-
-
+# ----------------------------------------------------------------------------
 
 class TutorApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("XiaoHack Control Parental — Tutor")
-        self.geometry("1000x800")
-        self.minsize(900, 600)
+        self.geometry("1024x900")
+        self.minsize(1024, 720)
         self.resizable(True, True)
 
-         # Icono
+        # Icono
         try:
-            if ICON_APP.exists():
+            if ICON_APP and ICON_APP.exists():
                 self.iconbitmap(str(ICON_APP))  # .ico
             else:
                 _png = ASSETS / "app_icon.png"
@@ -188,13 +166,12 @@ class TutorApp(tk.Tk):
         except Exception:
             pass
 
-        # ====== CONTENEDOR CENTRAL con grid (Notebook + Footer fijo) ======
+        # ===== Contenedor central (Notebook + Footer fijo) =====
         body = ttk.Frame(self)
-        body.pack(fill="both", expand=True)  # único pack en el root para el bloque central
-        body.grid_rowconfigure(0, weight=1)  # fila 0 se expande
+        body.pack(fill="both", expand=True)
+        body.grid_rowconfigure(0, weight=1)
         body.grid_columnconfigure(0, weight=1)
 
-        # Notebook
         self.nb = ttk.Notebook(body)
         self.nb.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
 
@@ -263,6 +240,7 @@ class TutorApp(tk.Tk):
         # Web
         if WebPage:
             try:
+                # Nota: WebPage debe llamar a webfilter.ensure_hosts_rules_or_elevate() cuando aplique
                 self.page_web = WebPage(self.nb, self.cfg, self._save_cfg)
                 self.nb.add(self.page_web, text="Web/SafeSearch")
             except Exception as e:
@@ -306,11 +284,11 @@ class TutorApp(tk.Tk):
         else:
             self._add_missing_tab(self.nb, "Opciones")
 
-        # ===== Footer fijo (fila 1 de body) =====
+        # ===== Footer fijo =====
         self.style = ttk.Style(self)
         footer = ttk.Frame(body)
         footer.grid(row=1, column=0, sticky="ew")
-        footer.grid_columnconfigure(0, weight=1)  # espacio entre izq y der
+        footer.grid_columnconfigure(0, weight=1)
 
         left = ttk.Frame(footer)
         left.grid(row=0, column=0, sticky="w", padx=(8, 0), pady=(0, 8))
@@ -326,7 +304,6 @@ class TutorApp(tk.Tk):
         self._btn_save_apps = ttk.Button(right, text="Guardar reglas de Apps/Juegos",
                                          command=self._save_apps_rules, width=28)
         self._btn_save_apps_base_text = "Guardar reglas de Apps/Juegos"
-
 
         # Eventos notebook y cierre
         self._active_tab_index = self.nb.index("current")
@@ -469,15 +446,13 @@ class TutorApp(tk.Tk):
         except Exception as e:
             messagebox.showerror("Error", f"No se pudieron guardar las reglas:\n{e}")
 
-
     def _save_current_tab(self):
-        """Guarda según la pestaña visible."""
         active_widget = self.nb.nametowidget(self.nb.select())
         if active_widget is getattr(self, "page_apps", None):
             self._save_apps_rules()
         elif active_widget is getattr(self, "page_wl", None):
             self._save_whitelist_rules()
-            
+
     def _save_whitelist_rules(self):
         if getattr(self, "page_wl", None) is None:
             return
@@ -567,9 +542,9 @@ class TutorApp(tk.Tk):
 
     def _update_dirty_bar(self, apps_dirty: bool, wl_dirty: bool):
         parts = []
-        if apps_dirty:
+        if apps_dirty: 
             parts.append("Aplicaciones/Juegos")
-        if wl_dirty:
+        if wl_dirty: 
             parts.append("Lista blanca")
         self._dirty_label.configure(text=("• Cambios sin guardar: " + ", ".join(parts)) if parts else "")
         active_widget = self.nb.nametowidget(self.nb.select()) if self.nb.tabs() else None
@@ -624,7 +599,7 @@ class TutorApp(tk.Tk):
     def _handle_dirty_for_page(self, page_widget) -> bool:
         if page_widget is getattr(self, "page_apps", None) and self._is_apps_dirty():
             resp = self._ask_save_discard_cancel("Aplicaciones/Juegos")
-            if resp is None:
+            if resp is None: 
                 return False
             if resp is True:
                 self._save_apps_rules()
@@ -645,8 +620,7 @@ class TutorApp(tk.Tk):
             pass
 
     def _on_nb_tab_changed(self, event):
-        # Debounce duro
-        if self._switch_guard:
+        if self._switch_guard: 
             return
         self._switch_guard = True
         self._switch_seq += 1
@@ -666,15 +640,12 @@ class TutorApp(tk.Tk):
 
             new_widget = self.nb.nametowidget(tabs[new_index])
 
-            # Cancela on_show previo si existía
             if self._pending_onshow:
                 with contextlib.suppress(Exception):
                     self.after_cancel(self._pending_onshow)
                 self._pending_onshow = None
 
-            # Refresh-lite
             self._refresh_if_needed_on_enter(new_widget)
-
             with contextlib.suppress(Exception):
                 self.update_idletasks()
 
@@ -717,30 +688,26 @@ class TutorApp(tk.Tk):
             self.after(0, _safe_call)
 
     def _on_close(self):
-        # Check “dirty” en pestañas relevantes
         for page in (getattr(self, "page_apps", None), getattr(self, "page_wl", None)):
             if page is None:
                 continue
             if page is getattr(self, "page_apps", None) and self._is_apps_dirty():
                 resp = self._ask_save_discard_cancel("Aplicaciones/Juegos")
-                if resp is None:
+                if resp is None: 
                     return
                 if resp is True:
                     self._save_apps_rules()
             elif page is getattr(self, "page_wl", None) and self._is_wl_dirty():
                 resp = self._ask_save_discard_cancel("Lista blanca")
-                if resp is None: 
+                if resp is None:
                     return
                 if resp is True:
                     self._save_whitelist_rules()
 
-        # Cerrar profiler si está activo
         probe = getattr(self, "_probe", None)
         if probe:
-            try:
+            with contextlib.suppress(Exception):
                 probe.stop()
-            except Exception:
-                pass
 
         self.destroy()
 
@@ -755,7 +722,8 @@ class TutorApp(tk.Tk):
         tk.Label(frame, text=f"La página '{name}' no está disponible (archivo faltante).",
                  justify="left").pack(anchor="w", padx=10, pady=10)
 
-    # -------- Ventana persistente de cuenta atrás (overlay) --------
+    # -------- Ventana persistente de cuenta atrás (overlay local) --------
+    # Nota: el overlay real sobre juegos en pantalla completa lo gestiona notifier (Win32 layered).
     def _show_countdown_window(self, seconds: int):
         try:
             if self._countdown_win is None or not self._countdown_win.winfo_exists():
@@ -807,14 +775,12 @@ class TutorApp(tk.Tk):
             enabled = bool(cfg.get("playtime_enabled", True))
             log.debug("tick enabled=%s", enabled)
 
-            # Modo desactivado → limpieza suave
             if not enabled:
                 self._hide_countdown_window()
                 st.setdefault("play_alerts", {})
                 st["play_alerts"]["countdown_started"] = False
                 st["play_countdown"] = 0
-                st["play_end_notified"] = False  # reset suave
-                # No tocamos play_until
+                st["play_end_notified"] = False
                 _, enf_changed = _compute_enforcement(cfg, st, allowed=False)
                 wl_changed = bool(st.get("play_whitelist"))
                 if wl_changed:
@@ -830,18 +796,15 @@ class TutorApp(tk.Tk):
                 log.debug("disabled-branch → blocklist-only")
                 return
 
-            # Avisos + cuenta atrás
             msgs, countdown = (check_playtime_alerts(st, now, cfg) if check_playtime_alerts else ([], 0))
             log.debug("alerts msgs=%d countdown=%d", len(msgs), countdown)
 
-            # Overlay countdown
             if countdown > 0:
                 self._show_countdown_window(countdown)
                 self._subtitle.configure(text="")
             else:
                 self._hide_countdown_window()
 
-            # Toasts 10/5/1
             if msgs:
                 for m in msgs:
                     title = "Tiempo de juego"
@@ -872,7 +835,6 @@ class TutorApp(tk.Tk):
                             print("[ALERTA]", m)
                     self._show_hint_window(key, m, ttl_sec=10)
 
-            # Fin de sesión (avisar una sola vez)
             play_until = int(st.get("play_until") or 0)
             ended_flag = bool(st.get("play_end_notified", False))
             state_changed = False
@@ -898,10 +860,7 @@ class TutorApp(tk.Tk):
                     st["play_end_notified"] = False
                     state_changed = True
 
-            # ¿Permitido por horario o sesión?
-            allowed = True
-            if is_play_allowed is not None:
-                allowed = is_play_allowed(cfg, st, now)
+            allowed = is_play_allowed(cfg, st, now) if is_play_allowed else True
 
             desired_wl = cfg.get("game_whitelist", []) or []
             current_wl = st.get("play_whitelist", []) or []
@@ -914,7 +873,6 @@ class TutorApp(tk.Tk):
                     st["play_whitelist"] = []
                     state_changed = True
 
-            # Enforcement efectivo
             _, enf_changed = _compute_enforcement(cfg, st, allowed=allowed)
             log.debug("policy allowed=%s wl=%s mode=%s block=%s",
                       allowed, len(desired_wl), st["enforcement"].get("mode"),
@@ -922,14 +880,12 @@ class TutorApp(tk.Tk):
             if enf_changed:
                 state_changed = True
 
-            # ¿Hubo cambios por avisos (countdown/flags)?
             if st.get("play_countdown", 0) or msgs:
                 state_changed = True
 
             if state_changed:
                 save_state(st)
 
-            # Refrescar label de la pestaña
             try:
                 if getattr(self, "page_time", None) and hasattr(self.page_time, "_refresh_status_label"):
                     self.page_time._refresh_status_label()
@@ -946,7 +902,6 @@ class TutorApp(tk.Tk):
         import time
         now_ts = time.time()
 
-        # Si ya existe esta burbuja, refrescar mensaje y renovar "vida"
         if key in self._hint_windows:
             win, _ = self._hint_windows[key]
             try:
@@ -959,7 +914,6 @@ class TutorApp(tk.Tk):
             except Exception:
                 pass
 
-        # Crear nueva ventana
         w = tk.Toplevel(self)
         w.withdraw()
         w.overrideredirect(1)
@@ -1024,7 +978,6 @@ def run():
 
     # Alta-DPI (Windows)
     try:
-        import ctypes
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
@@ -1032,9 +985,6 @@ def run():
     try:
         app = TutorApp()
         app.after(3000, lambda: _auto_check_updates_once(app))
-
-        # (Opcional) adjunta logs al panel si tienes un widget de texto dedicado
-        # attach_tk_text_logger(app.txt_log, logger_name="gui")  # si existe
         app.mainloop()
     except Exception as e:
         err = traceback.format_exc()

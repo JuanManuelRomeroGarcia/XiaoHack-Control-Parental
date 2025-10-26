@@ -15,10 +15,10 @@ import urllib
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-import psutil # type: ignore
+import psutil  # type: ignore
 
 from notifier import WM_CLOSE
-from webfilter import ensure_hosts_rules,remove_parental_block
+from webfilter import ensure_hosts_rules, remove_parental_block
 from logger import AuditLogger
 from logs import get_logger, install_exception_hooks
 # ⚠️ Usamos ProgramData (rutas compartidas) desde storage:
@@ -30,13 +30,13 @@ from storage import (
 from scheduler import check_playtime_alerts, remaining_play_seconds, is_within_allowed_hours  # ← nuevo
 # == Opcionales (pywin32). Si faltan, seguimos en modo polling.
 try:
-    import pythoncom # type: ignore
-    import win32com.client  # type: ignore # WMI
-    import win32gui # type: ignore
-    import win32process # type: ignore
+    import pythoncom  # type: ignore
+    import win32com.client  # type: ignore  # WMI
+    import win32gui  # type: ignore
+    import win32process  # type: ignore
 except Exception:
     pythoncom = win32com = win32gui = win32process = None
-    
+
 # --- Identidad de proceso XiaoHack -------------------------------------------
 import sys
 XH_ROLE = None
@@ -50,9 +50,9 @@ except Exception:
 
 # Nombre “bonito” del proceso (si está disponible setproctitle)
 try:
-    from setproctitle import setproctitle # type: ignore
+    import setproctitle  # type: ignore
     title = f"XiaoHack-{XH_ROLE}" if XH_ROLE else "XiaoHack"
-    setproctitle(title)
+    setproctitle.setproctitle(title)
 except Exception:
     pass
 
@@ -131,7 +131,7 @@ def _log_event(kind: str, value: str, meta: str = ""):
 # Notificaciones de tiempo de juego (avisos 10/5/1 min + cuenta atrás)
 # =============================================================================
 _last_allowed_flag = None
-_last_play_rem_sent = {"m10": False, "m5": False, "m1": False}
+_last_play_rem_sent = {"m10": False, "m5": False, "m1": False}  # reservado
 def _emit_notify(title: str, body: str = ""):
     # Usamos la misma tabla de eventos para notifier: type="notify"
     _log_event("notify", title, body)
@@ -164,11 +164,7 @@ def _playtime_tick(cfg: dict, st: dict, now_sec: int, now_dt):
         persisted = True
 
     # 3) Persistir countdown si cambió
-    # (guardamos siempre que check_playtime_alerts lo haya actualizado)
-    if st.get("play_countdown", 0) == countdown:
-        # nada
-        pass
-    else:
+    if st.get("play_countdown", 0) != countdown:
         persisted = True
 
     if persisted:
@@ -181,7 +177,6 @@ def _playtime_tick(cfg: dict, st: dict, now_sec: int, now_dt):
     rem, mode = remaining_play_seconds(st, now_dt, cfg)
     if rem <= 0 and st.get("play_alert_mode") in ("manual", "schedule"):
         _emit_notify("Tiempo terminado", "El tiempo de juego ha finalizado.")
-        # reset ya lo hace internamente check_playtime_alerts cuando rem<=0
         try:
             save_state(st)
         except Exception:
@@ -434,7 +429,13 @@ def _acquire_singleton() -> bool:
             except Exception:
                 pass
         fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_RDWR)
-        os.write(fd, str(os.getpid()).encode("ascii", "ignore"))
+        try:
+            os.write(fd, str(os.getpid()).encode("ascii", "ignore"))
+        finally:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
         return True
     except FileExistsError:
         return False
@@ -504,18 +505,20 @@ def main():
     last_reload = 0
     log.info("Servicio XiaoHack Parental iniciado correctamente.")
     recently_blocked: dict[int, float] = {}
-    
-    _last_play_tick = 0  # marca en segundos
+
+    _last_play_tick = 0      # marca en segundos
+    _last_hb_sec = -1        # último segundo en que se emitió heartbeat (múltiplo de 30)
+    _last_tel_sec = -1       # último segundo de telemetría (múltiplo de 5)
 
     while True:
         now = time.time()
-        
+        now_i = int(now)
+
         # --- TICK de tiempo de juego (cada 1 s) ---
         try:
-            if int(now) != _last_play_tick:
-                _last_play_tick = int(now)
-                # recarga rápida de cfg/state reciente
-                # (ya los refrescamos cada ~10s abajo, pero aquí tomamos snapshot actual)
+            if now_i != _last_play_tick:
+                _last_play_tick = now_i
+                # recarga rápida de cfg/state reciente (snapshot)
                 cfg = load_config()
                 st  = load_state()
                 _playtime_tick(cfg, st, _last_play_tick, datetime.datetime.fromtimestamp(_last_play_tick))
@@ -550,7 +553,7 @@ def main():
                 time.sleep(0.03)
 
         # 2) Escaneo de respaldo
-        if int(now) % 2 == 0:
+        if now_i % 2 == 0:
             for p in psutil.process_iter(attrs=["pid", "name"]):
                 try:
                     pid = p.info.get("pid")
@@ -567,8 +570,9 @@ def main():
                 except Exception:
                     continue
 
-        # 3) Telemetría opcional
-        if cfg.get("log_process_activity", True) and int(now) % 5 == 0:
+        # 3) Telemetría opcional (throttle 1 vez cada 5 s)
+        if cfg.get("log_process_activity", True) and (now_i % 5 == 0) and (_last_tel_sec != now_i):
+            _last_tel_sec = now_i
             for p in psutil.process_iter(attrs=["name"]):
                 try:
                     audit.log_seen(p.info["name"])
@@ -586,8 +590,8 @@ def main():
             log.debug("reload cfg: names=%s", ",".join(sorted(blocked_names)))
             log.debug("reload cfg: execs=%s", ",".join(sorted(blocked_execs)))
             log.debug("reload cfg: dirs=%s", ",".join(blocked_dirs + self_dirs))
-            
-       # reaccionar a cambios de applied
+
+        # reaccionar a cambios de applied
         try:
             new_applied = bool(st.get("applied", False))
             if new_applied != _applied_last:
@@ -603,7 +607,7 @@ def main():
                     try:
                         removed = remove_parental_block()
                         log.info("Bloque parental %s por applied=False.",
-                                "eliminado" if removed else "no presente")
+                                 "eliminado" if removed else "no presente")
                     except PermissionError:
                         log.warning("Sin permisos para limpiar hosts (applied=False).")
                 _applied_last = new_applied
@@ -612,10 +616,11 @@ def main():
         except Exception as e:
             log.warning("Error aplicando/limpiando reglas tras cambio de applied: %s", e)
 
-
-        # Heartbeat cada ~30 s
-        if int(now) % 30 == 0:
+        # Heartbeat cada ~30 s (una sola vez por segundo múltiplo de 30)
+        if (now_i % 30 == 0) and (_last_hb_sec != now_i):
+            _last_hb_sec = now_i
             log.debug("heartbeat")
+
         time.sleep(0.05)
 
 # =============================================================================

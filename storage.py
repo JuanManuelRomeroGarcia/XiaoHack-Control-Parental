@@ -1,5 +1,6 @@
 # storage.py — XiaoHack Parental
-# Persistencia compartida (GUI/servicio/notifier) con IO atómica, fallback seguro y LOG centralizado.
+# Persistencia compartida (GUI/servicio/notifier) con IO atómica, fallback seguro
+# y LOG/rutas centralizados (ProgramFiles + ProgramData/LocalAppData compliant)
 
 from __future__ import annotations
 import json
@@ -8,51 +9,71 @@ import tempfile
 import time
 import threading
 from pathlib import Path
-from logs import get_logger
+from typing import Dict
+
+# Importamos utilidades del logger central para unificar el "data dir"
+from logs import get_logger, get_data_dir as _logs_get_data_dir, set_data_dir as _logs_set_data_dir  # noqa: F401
 
 log = get_logger("storage")
 
-# -----------------------------------------------------------------------------
-# Selección de directorio de datos
-# -----------------------------------------------------------------------------
+# ==============================================================================
+# Selección de directorio de datos (fuente única: logs.get_data_dir)
+# ==============================================================================
 def _get_data_dir() -> Path:
-    """Devuelve la carpeta de datos preferida (ProgramData o AppData fallback)."""
-    base = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "XiaoHackParental"
+    """
+    Devuelve la carpeta de datos activa de la app.
+    Se apoya en logs.get_data_dir(), que decide:
+      - XH_DATA_DIR (override)
+      - XH_ROLE=guardian o cuenta SYSTEM -> %ProgramData%\XiaoHackParental
+      - Usuario -> %LOCALAPPDATA%\XiaoHackParental (fallback: %APPDATA%)
+      - Último recurso: .\.xh_data
+    """
+    base = Path(_logs_get_data_dir())
     try:
         base.mkdir(parents=True, exist_ok=True)
+        # Verificar escritura
         test = base / ".write_test"
         test.write_text("ok", encoding="utf-8")
         test.unlink(missing_ok=True)
-        log.debug("Usando directorio de datos principal: %s", base)
+        log.debug("Usando directorio de datos: %s", base)
         return base
     except Exception as e:
-        log.warning("Fallo en ProgramData (%s), usando AppData fallback", e)
-        alt = Path(os.environ.get("APPDATA", str(Path.home()))) / "XiaoHackParental"
+        # Último fallback muy defensivo (no debería ocurrir si logs.py resolvió bien)
+        log.warning("No se pudo asegurar escritura en %s (%s). Usando cwd/.xh_data", base, e)
+        alt = Path.cwd() / ".xh_data"
         alt.mkdir(parents=True, exist_ok=True)
-        log.debug("Usando fallback de datos: %s", alt)
         return alt
+
 
 DATA_DIR = _get_data_dir()
 CONFIG_PATH = DATA_DIR / "config.json"
 STATE_PATH  = DATA_DIR / "state.json"
 DB_PATH     = DATA_DIR / "guardian.db"
 LOGS_DIR    = DATA_DIR / "logs"
-LOGS_DIR.mkdir(exist_ok=True)
+try:
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
 
-# Para migrar los ficheros antiguos (junto al código)
-LEGACY_DIR = Path(__file__).resolve().parent
+# Posibles rutas legacy (versiones antiguas que guardaban junto al código)
+LEGACY_DIRS = [
+    # Junto al archivo actual (instalaciones antiguas en la carpeta del programa)
+    Path(__file__).resolve().parent,
+    # AppData clásico (por si existiera de builds previas)
+    Path(os.environ.get("APPDATA", str(Path.home()))) / "XiaoHackParental",
+]
 
-# -----------------------------------------------------------------------------
+# ==============================================================================
 # Defaults
-# -----------------------------------------------------------------------------
-_DEFAULT_CFG = {
+# ==============================================================================
+_DEFAULT_CFG: Dict = {
     "parent_password_hash": "",
-    # No aplicar nada por defecto:
+    # Por defecto NO aplicar nada:
     "safesearch": False,
     "blocked_apps": [],
     "blocked_paths": [],
     "blocked_executables": [],
-    "blocked_domains": [],              # <- vacío: no toca hosts/dns si se aplicara
+    "blocked_domains": [],              # vacío -> no tocar hosts/dns hasta que el usuario lo habilite
     "game_whitelist": [],
     "schedules": [
         {"days": ["mon","tue","wed","thu","fri"], "from": "12:00", "to": "13:00"},
@@ -63,26 +84,27 @@ _DEFAULT_CFG = {
     "strict_mode_after": "22:00",
     "log_process_activity": False,
     # Flag opcional por si la app quiere control explícito:
-    "apply_on_start": False
+    "apply_on_start": False,
 }
 
-_DEFAULT_STATE = {
+_DEFAULT_STATE: Dict = {
     "play_until": 0,
     "play_whitelist": [],
     # Flag para indicar si el usuario ya aprobó aplicar reglas a nivel sistema
-    "applied": False
+    "applied": False,
 }
 
 def now_epoch() -> int:
     return int(time.time())
 
-# -----------------------------------------------------------------------------
+# ==============================================================================
 # IO atómica y thread-safe
-# -----------------------------------------------------------------------------
+# ==============================================================================
 _LOCK = threading.Lock()
 
 def _atomic_write(path: Path, data: dict):
-    """Escritura atómica con lock, flush y replace seguro."""
+    """Escritura atómica con lock, flush y replace seguro (NTFS)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp_fd, tmp_name = tempfile.mkstemp(prefix=path.name, dir=str(path.parent))
     tmp_path = Path(tmp_name)
     with _LOCK:
@@ -95,10 +117,16 @@ def _atomic_write(path: Path, data: dict):
             log.debug("Archivo guardado correctamente: %s", path)
         except Exception as e:
             log.error("Error al escribir %s: %s", path, e, exc_info=True)
-            tmp_path.unlink(missing_ok=True)
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             raise
         finally:
-            tmp_path.unlink(missing_ok=True)
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 def _read_json(path: Path, defaults: dict) -> dict:
     """Lee JSON; si no existe o hay error, lo crea con defaults y devuelve una copia."""
@@ -117,24 +145,40 @@ def _read_json(path: Path, defaults: dict) -> dict:
         _atomic_write(path, defaults)
         return defaults.copy()
 
-# -----------------------------------------------------------------------------
+# ==============================================================================
 # Migración inicial (una sola vez)
-# -----------------------------------------------------------------------------
+# ==============================================================================
 def _migrate_if_needed():
-    legacy_cfg = LEGACY_DIR / "config.json"
-    legacy_st  = LEGACY_DIR / "state.json"
+    """
+    Si no existen config/state en DATA_DIR, intenta migrar desde ubicaciones legacy:
+      - Directorio del código (instalaciones antiguas).
+      - %AppData%\XiaoHackParental (builds previas).
+    """
     try:
-        if legacy_cfg.exists() and not CONFIG_PATH.exists():
-            CONFIG_PATH.write_text(legacy_cfg.read_text(encoding="utf-8"), encoding="utf-8")
-            log.info("Migrado config.json desde directorio legacy")
-        if legacy_st.exists() and not STATE_PATH.exists():
-            STATE_PATH.write_text(legacy_st.read_text(encoding="utf-8"), encoding="utf-8")
-            log.info("Migrado state.json desde directorio legacy")
+        migrated = False
+        for legacy in LEGACY_DIRS:
+            legacy_cfg = legacy / "config.json"
+            legacy_st  = legacy / "state.json"
+
+            if legacy_cfg.exists() and not CONFIG_PATH.exists():
+                CONFIG_PATH.write_text(legacy_cfg.read_text(encoding="utf-8"), encoding="utf-8")
+                log.info("Migrado config.json desde: %s", legacy_cfg)
+                migrated = True
+
+            if legacy_st.exists() and not STATE_PATH.exists():
+                STATE_PATH.write_text(legacy_st.read_text(encoding="utf-8"), encoding="utf-8")
+                log.info("Migrado state.json desde: %s", legacy_st)
+                migrated = True
+
+            if migrated:
+                break
     except Exception as e:
         log.error("Error en migración inicial: %s", e, exc_info=True)
 
 def _ensure_present():
-    """Crea config/state con defaults NO-OP si faltan (evita aplicar nada al instalar)."""
+    """
+    Crea config/state con defaults NO-OP si faltan (evita aplicar nada al instalar).
+    """
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         if not CONFIG_PATH.exists():
@@ -149,9 +193,9 @@ def _ensure_present():
 _migrate_if_needed()
 _ensure_present()
 
-# -----------------------------------------------------------------------------
+# ==============================================================================
 # API pública
-# -----------------------------------------------------------------------------
+# ==============================================================================
 def load_config() -> dict:
     cfg = _read_json(CONFIG_PATH, _DEFAULT_CFG)
     # Normalización básica
@@ -170,14 +214,39 @@ def load_state() -> dict:
     log.debug("Cargando estado desde %s", STATE_PATH)
     st = _read_json(STATE_PATH, _DEFAULT_STATE)
     st.setdefault("applied", False)
+    st.setdefault("play_until", st.get("play_until", 0))
+    st.setdefault("play_whitelist", st.get("play_whitelist", []))
     return st
 
 def save_state(st: dict):
     log.debug("Guardando estado (%s claves)", len(st))
     _atomic_write(STATE_PATH, st)
 
-# -----------------------------------------------------------------------------
+# Utilidades opcionales (para tests o herramientas)
+def data_dir() -> str:
+    """Ruta del directorio de datos activo."""
+    return str(DATA_DIR)
+
+def set_data_dir_forced(path: str) -> None:
+    """
+    Fuerza el data_dir para esta sesión (tests). Debe llamarse muy temprano.
+    También ajusta el de logs para mantener coherencia.
+    """
+    global DATA_DIR, CONFIG_PATH, STATE_PATH, DB_PATH, LOGS_DIR
+    _logs_set_data_dir(path)
+    DATA_DIR = _get_data_dir()
+    CONFIG_PATH = DATA_DIR / "config.json"
+    STATE_PATH  = DATA_DIR / "state.json"
+    DB_PATH     = DATA_DIR / "guardian.db"
+    LOGS_DIR    = DATA_DIR / "logs"
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    log.info("Data dir forzado a: %s", DATA_DIR)
+
+# ==============================================================================
 # Log resumen de entorno
-# -----------------------------------------------------------------------------
+# ==============================================================================
 log.info("Directorio de datos: %s", DATA_DIR)
 log.info("Archivos: config=%s, state=%s, db=%s", CONFIG_PATH, STATE_PATH, DB_PATH)

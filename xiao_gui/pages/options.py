@@ -15,7 +15,7 @@ from xiao_gui.services import restart_guardian
 # Conservamos los imports pero ya no dependemos de ellos para lo crítico;
 # dejamos el fallback interno con schtasks por robustez.
 try:
-    from ..services import (
+    from xiao_gui.services import (
         query_task_state, start_service, stop_service, open_task_scheduler,
         query_notifier_state, start_notifier, stop_notifier, restart_notifier, open_notifier_log
     )
@@ -70,9 +70,11 @@ def _venv_python(cfg: dict) -> str:
 def _run_guardian_bat(cfg: dict) -> str:
     return os.path.join(_install_dir(cfg), "run_guardian.bat")
 
-def _xh_root() -> Path:
-    # raíz del runtime (donde está updater.py y VERSION)
-    return Path(__file__).resolve().parents[2]
+def _xh_root():
+    # ..\xiao_gui\pages\options.py  →  runtime root
+    import inspect
+    here = Path(inspect.getfile(sys.modules[__name__])).resolve()
+    return here.parents[3] if "xiao_gui" in str(here) else here.parents[1]
 
 def _read_version() -> str:
     try:
@@ -81,23 +83,39 @@ def _read_version() -> str:
         return "0.0.0"
 
 def _python_exe() -> str:
-    # usa el mismo intérprete que corre la app (pythonw.exe/ python.exe del venv)
-    return sys.executable or str(_xh_root() / "venv" / "Scripts" / "python.exe")
+    exe = sys.executable or str(_xh_root() / "venv" / "Scripts" / "python.exe")
+    # Si estamos en pythonw.exe, preferimos el .\python.exe del venv si existe
+    low = exe.lower()
+    if low.endswith("pythonw.exe"):
+        cand = exe[:-5]  # quita la 'w'
+        if os.path.exists(cand):
+            return cand
+    return exe
+
+def _updater_path() -> str:
+    return str(_xh_root() / "updater.py")
 
 def _run_updater(args):
-    """Ejecuta updater.py y devuelve el JSON como dict."""
+    """Ejecuta updater.py y devuelve el JSON como dict (robusto)."""
     up = str(_xh_root() / "updater.py")
-    cmd = [_python_exe(), up] + args
+    cmd = [_python_exe(), up] + list(args or [])
+    cp = subprocess.run(cmd, capture_output=True, text=True)
+    out = (cp.stdout or "").strip()
+    err = (cp.stderr or "").strip()
+
+    if not out:
+        return {"error": f"Updater sin salida (rc={cp.returncode}). {err}"}
+
     try:
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=300)
-        return json.loads(out.decode("utf-8", "ignore"))
-    except subprocess.CalledProcessError as e:
-        try:
-            return json.loads(e.output.decode("utf-8", "ignore"))
-        except Exception:
-            return {"error": f"Updater fallo: {e}"}
+        data = json.loads(out)
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"Salida no JSON (rc={cp.returncode}). {type(e).__name__}: {e}. out={out[:400]} err={err[:200]}"}
+
+    # Si por cualquier motivo rc≠0, reflejamos el error si no venía en el JSON
+    if cp.returncode != 0 and "error" not in data:
+        data["error"] = f"rc={cp.returncode}. {err}"
+    return data
+
 
 # ---------- Guardian: consultas/acciones de tarea ----------
 def _query_task_state_local() -> str:
@@ -358,7 +376,7 @@ class OptionsPage(ttk.Frame):
     def _on_check_updates(self):
         def work():
             self._set_upd_busy(True, "Comprobando…")
-            res = _run_updater(["--check"])
+            res = _run_updater([])
             self.after(0, self._after_check_updates, res)
         threading.Thread(target=work, daemon=True).start()
 

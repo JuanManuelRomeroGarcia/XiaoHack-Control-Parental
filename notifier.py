@@ -1,6 +1,7 @@
 # notifier.py — XiaoHack (usuario)
-# Integra logging centralizado y mejora la trazabilidad de notificaciones, bloqueos y Explorer.
-# No altera la lógica original.
+# Overlay nativo Win32 (Layered + TopMost + NoActivate) per-monitor para countdown
+# Lectura de estado y eventos desde %ProgramData%\XiaoHackParental (mismo que guardian)
+# Toasters WinRT/winotify/win10toast + ExplorerWatch (como antes)
 
 import os
 import sys
@@ -10,54 +11,22 @@ import threading
 import sqlite3
 import html
 from pathlib import Path
-from logs import get_logger, install_exception_hooks
 
+from storage import (
+    set_data_dir_forced as _storage_set_data_dir_forced,
+    load_config as _storage_load_config,  # noqa: F401
+    load_state as _storage_load_state,
+    data_dir as _storage_data_dir,
+    DB_PATH as _STORAGE_DB_PATH,
+)
+
+from logs import get_logger, install_exception_hooks
 log = get_logger("notifier")
 install_exception_hooks("notifier-crash")
 
-BASE = Path(__file__).resolve().parent
-DB   = BASE / "guardian.db"
-
-APPDATA = Path(os.getenv("APPDATA", str(BASE)))
-STATE_DIR = APPDATA / "XiaoHackParental"
-STATE_DIR.mkdir(parents=True, exist_ok=True)
-STATE_FILE = STATE_DIR / "notifier_state.json"
-
-PROGRAMDATA_DIR = Path(os.getenv("PROGRAMDATA", r"C:\ProgramData")) / "XiaoHackParental"
-CONFIG_PATH_PD  = PROGRAMDATA_DIR / "config.json"
-
-try:
-    from storage import load_config
-except Exception as e:
-    load_config = None
-    log.warning("No se pudo importar storage.py: %s", e)
-
-APP_ID       = "XiaoHack.Parental"
-APP_DISPLAY  = "XiaoHack Control Parental"
-
-# --- librerías opcionales ---
-WINRT_OK = WINOTIFY_OK = False
-TOASTER = None
-try:
-    from winsdk.windows.ui.notifications import ToastNotificationManager, ToastNotification
-    from winsdk.windows.data.xml.dom import XmlDocument
-    WINRT_OK = True
-except Exception:
-    pass
-try:
-    from winotify import Notification as WNotify, audio as wnaudio
-    WINOTIFY_OK = True
-except Exception:
-    pass
-if not WINOTIFY_OK:
-    try:
-        from win10toast import ToastNotifier
-        TOASTER = ToastNotifier()
-    except Exception:
-        pass
-    
-# --- Identidad de proceso XiaoHack -------------------------------------------
-
+# --------------------------------------------------------------------
+# Identidad XiaoHack y setproctitle (opcional)
+# --------------------------------------------------------------------
 XH_ROLE = None
 try:
     if "--xh-role" in sys.argv:
@@ -67,43 +36,63 @@ try:
 except Exception:
     XH_ROLE = None
 
-# Nombre “bonito” del proceso (si está disponible setproctitle)
 try:
-    from setproctitle import setproctitle
+    import setproctitle  # type: ignore
     title = f"XiaoHack-{XH_ROLE}" if XH_ROLE else "XiaoHack"
-    setproctitle(title)
+    setproctitle.setproctitle(title)
 except Exception:
     pass
 
-# Log útil al arrancar
 try:
     import logging
     logging.getLogger().info("XiaoHack process started (role=%s)", XH_ROLE)
 except Exception:
     pass
 
+# --------------------------------------------------------------------
+# Forzar data_dir a ProgramData (mismo que guardian)
+# --------------------------------------------------------------------
+
+PROGRAMDATA_DIR = Path(os.getenv("PROGRAMDATA", r"C:\ProgramData")) / "XiaoHackParental"
+try:
+    _storage_set_data_dir_forced(str(PROGRAMDATA_DIR))
+    log.info("Notifier data_dir forzado a ProgramData: %s", _storage_data_dir())
+except Exception as e:
+    log.warning("No se pudo forzar data_dir a ProgramData: %s", e)
+DB = _STORAGE_DB_PATH
+
+BASE = Path(__file__).resolve().parent
+APPDATA = Path(os.getenv("APPDATA", str(BASE)))
+STATE_DIR = APPDATA / "XiaoHackParental"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+STATE_FILE = STATE_DIR / "notifier_state.json"
+
+CONFIG_PATH_PD = PROGRAMDATA_DIR / "config.json"
+
+APP_ID      = "XiaoHack.Parental"
+APP_DISPLAY = "XiaoHack Control Parental"
 
 # --------------------------------------------------------------------
-# Estado persistente
+# Estado local del notifier
 # --------------------------------------------------------------------
-def load_state():
+def load_state_local():
     try:
         if STATE_FILE.exists():
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except Exception as e:
-        log.warning("Error al leer estado: %s", e)
+        log.warning("Error al leer notifier_state: %s", e)
     return {"last_id": 0}
 
-def save_state(st):
+def save_state_local(st):
     try:
         tmp = STATE_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(STATE_FILE)
     except Exception as e:
-        log.error("Error al guardar estado: %s", e)
+        log.error("Error al guardar notifier_state: %s", e)
 
 # --------------------------------------------------------------------
-# Registro AppID y shortcut
+# Registro AppID y acceso a toasts
 # --------------------------------------------------------------------
 def register_appid_in_registry(app_id: str, display_name: str, icon_path: str | None):
     try:
@@ -118,21 +107,18 @@ def register_appid_in_registry(app_id: str, display_name: str, icon_path: str | 
         log.warning("Fallo al registrar AppID: %s", e)
 
 def ensure_appid_shortcut(app_id: str, icon_path: str | None = None):
-    """Crea/actualiza un .lnk en el Menú Inicio con AUMID (branding)."""
     try:
         import pythoncom
-        from win32com.shell import shell # type: ignore
-        from win32com.propsys import propsys, pscon # type: ignore
+        from win32com.shell import shell  # type: ignore
+        from win32com.propsys import propsys, pscon  # type: ignore
 
         pythoncom.CoInitialize()
         start_menu = APPDATA / "Microsoft" / "Windows" / "Start Menu" / "Programs"
         start_menu.mkdir(parents=True, exist_ok=True)
         lnk_path = str((start_menu / "XiaoHack Parental.lnk").resolve())
 
-        pyw = (BASE / "venv" / "Scripts" / "pythonw.exe")
-        if not pyw.exists():
-            pyw = Path(sys.executable).with_name("pythonw.exe")
-        args = f"\"{(BASE / 'notifier.py').resolve()}\""
+        pyw = Path(sys.executable).with_name("pythonw.exe")
+        args = f"\"{(BASE / 'notifier.py').resolve()}\" --xh-role notifier"
         workdir = str(BASE)
 
         link = pythoncom.CoCreateInstance(shell.CLSID_ShellLink, None,
@@ -142,7 +128,7 @@ def ensure_appid_shortcut(app_id: str, icon_path: str | None = None):
         link.SetArguments(args)
         link.SetWorkingDirectory(workdir)
         if icon_path:
-            try: 
+            try:
                 link.SetIconLocation(icon_path, 0)
             except Exception:
                 pass
@@ -164,9 +150,27 @@ def ensure_appid_shortcut(app_id: str, icon_path: str | None = None):
         except Exception:
             pass
 
-# --------------------------------------------------------------------
-# Toasts (WinRT / winotify / win10toast)
-# --------------------------------------------------------------------
+# Toasts
+WINRT_OK = WINOTIFY_OK = False
+TOASTER = None
+try:
+    from winsdk.windows.ui.notifications import ToastNotificationManager, ToastNotification # type: ignore
+    from winsdk.windows.data.xml.dom import XmlDocument # type: ignore
+    WINRT_OK = True
+except Exception:
+    pass
+try:
+    from winotify import Notification as WNotify, audio as wnaudio # type: ignore
+    WINOTIFY_OK = True
+except Exception:
+    pass
+if not WINOTIFY_OK:
+    try:
+        from win10toast import ToastNotifier # type: ignore
+        TOASTER = ToastNotifier()
+    except Exception:
+        pass
+
 def _show_winrt_toast(title: str, msg: str, icon_path: str | None = None):
     safe_title, safe_msg = html.escape(title or ""), html.escape(msg or "")
     img_xml = f"<image placement='appLogoOverride' src='{html.escape(icon_path)}'/>" if icon_path else ""
@@ -183,18 +187,16 @@ def notify(title: str, msg: str, duration=5):
             icon = str(p)
             break
     log.info("Notificación: %s | %s", title, msg[:80])
-    # WinRT
     if WINRT_OK:
         try:
             _show_winrt_toast(title, msg, icon)
             return True
         except Exception as e:
             log.warning("WinRT toast error: %s", e)
-    # winotify
     if WINOTIFY_OK:
         try:
             n = WNotify(app_id=APP_ID, title=title, msg=msg, icon=icon)
-            try: 
+            try:
                 n.set_audio(wnaudio.Reminder, loop=False)
             except Exception:
                 pass
@@ -202,7 +204,6 @@ def notify(title: str, msg: str, duration=5):
             return True
         except Exception as e:
             log.warning("winotify error: %s", e)
-    # win10toast
     if TOASTER:
         try:
             TOASTER.show_toast(title, msg, duration=duration, threaded=True)
@@ -221,7 +222,7 @@ def notify_once(key: str, title: str, msg: str, min_interval: float = 5.0):
     return notify(title, msg, duration=5)
 
 # --------------------------------------------------------------------
-# SQLite y eventos
+# SQLite: leer eventos nuevos (desde guardian.db)
 # --------------------------------------------------------------------
 def query_new_blocks(since_id: int):
     try:
@@ -239,7 +240,7 @@ def query_new_blocks(since_id: int):
         return []
 
 # --------------------------------------------------------------------
-# Monitor de Explorer
+# Explorer Watch (como antes)
 # --------------------------------------------------------------------
 try:
     import pythoncom
@@ -251,7 +252,6 @@ except Exception:
     WM_CLOSE = 0
 
 def explorer_watch_loop(stop_ev: threading.Event):
-    """Supervisa ventanas del Explorador y cierra carpetas bloqueadas."""
     if not (pythoncom and win32com and win32gui):
         log.warning("ExplorerWatch: COM/Win32 no disponible.")
         return
@@ -260,7 +260,7 @@ def explorer_watch_loop(stop_ev: threading.Event):
     last_closed = {}
     backoff = 0.3
 
-    try: 
+    try:
         pythoncom.CoInitialize()
     except Exception:
         pass
@@ -304,17 +304,328 @@ def explorer_watch_loop(stop_ev: threading.Event):
             log.error("ExplorerWatch loop error: %s", e)
             shell = None
         time.sleep(backoff)
-    try: 
+    try:
         pythoncom.CoUninitialize()
     except Exception:
         pass
     log.info("ExplorerWatch detenido.")
 
 # --------------------------------------------------------------------
+# Overlay TopMost nativo — per monitor (cubre fullscreen "exclusive" en la mayoría de casos)
+# --------------------------------------------------------------------
+WIN32_OVERLAY_OK = False
+_OVERLAY_IMPL = "none"
+
+try:
+    import ctypes
+    from ctypes import wintypes
+    import win32con
+    import win32api
+    import win32gui  # type: ignore
+
+    # Constantes
+    WS_EX_LAYERED      = 0x00080000
+    WS_EX_TRANSPARENT  = 0x00000020
+    WS_EX_TOOLWINDOW   = 0x00000080
+    WS_EX_TOPMOST      = 0x00000008
+    WS_EX_NOACTIVATE   = 0x08000000
+
+    WS_POPUP           = 0x80000000
+
+    LWA_ALPHA          = 0x00000002
+
+    GWL_EXSTYLE        = -20
+
+    # GDI
+    SRCCOPY            = 0x00CC0020
+
+    # Estructuras para UpdateLayeredWindow
+    class POINT(ctypes.Structure):
+        _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+    class SIZE(ctypes.Structure):
+        _fields_ = [("cx", wintypes.LONG), ("cy", wintypes.LONG)]
+
+    class BLENDFUNCTION(ctypes.Structure):
+        _fields_ = [("BlendOp", ctypes.c_byte),
+                    ("BlendFlags", ctypes.c_byte),
+                    ("SourceConstantAlpha", ctypes.c_byte),
+                    ("AlphaFormat", ctypes.c_byte)]
+
+    AC_SRC_OVER = 0x00
+    AC_SRC_ALPHA = 0x01
+
+    user32 = ctypes.windll.user32
+    gdi32  = ctypes.windll.gdi32
+
+    # HBITMAP por DIBSection con alpha
+    def _create_text_bitmap(w, h, text: str, subtitle: str | None = None):
+        # Creamos un DC y DIBSection ARGB
+        hdc = win32gui.CreateCompatibleDC(0)
+        bmi = win32gui.BITMAPINFO()
+        bmi['bmiHeader']['biSize'] = ctypes.sizeof(win32gui.BITMAPINFOHEADER)
+        bmi['bmiHeader']['biWidth'] = w
+        bmi['bmiHeader']['biHeight'] = -h  # top-down
+        bmi['bmiHeader']['biPlanes'] = 1
+        bmi['bmiHeader']['biBitCount'] = 32
+        bmi['bmiHeader']['biCompression'] = win32con.BI_RGB
+        hbitmap, bits = win32gui.CreateDIBSection(hdc, bmi, win32con.DIB_RGB_COLORS)
+        old = win32gui.SelectObject(hdc, hbitmap)
+
+        # Fondo semitransparente (negro)
+        import struct
+        bg = (0, 0, 0, int(0.92*255))  # ARGB
+        px = struct.pack("BBBB", bg[2], bg[1], bg[0], bg[3])  # noqa: F841
+        # Rellenar
+        ctypes.memset(bits, 0, w * h * 4)
+        # (memset negro con alpha 0; para alpha global lo hacemos con blend)
+
+        # Render del texto (blanco)
+        # Elegimos tamaños relativos a la diagonal
+        import math
+        diag = int(math.hypot(w, h))
+        size_main = max(72, diag // 18)
+        size_sub  = max(18, diag // 60)
+
+        # Crear fuentes
+        lf = win32gui.LOGFONT()
+        lf.lfFaceName = "Segoe UI"
+        lf.lfHeight = -size_main
+        lf.lfWeight = 700
+        hfont_main = win32gui.CreateFontIndirect(lf)
+
+        lf2 = win32gui.LOGFONT()
+        lf2.lfFaceName = "Segoe UI"
+        lf2.lfHeight = -size_sub
+        lf2.lfWeight = 400
+        hfont_sub = win32gui.CreateFontIndirect(lf2)
+
+        win32gui.SetBkMode(hdc, win32con.TRANSPARENT)
+        win32gui.SetTextColor(hdc, win32api.RGB(255, 255, 255))
+
+        # Medir y centrar
+        rect = (0, 0, w, h)
+        flags = win32con.DT_CENTER | win32con.DT_VCENTER | win32con.DT_SINGLELINE
+        win32gui.SelectObject(hdc, hfont_main)
+        win32gui.DrawText(hdc, text, -1, rect, flags)
+
+        if subtitle:
+            win32gui.SelectObject(hdc, hfont_sub)
+            rect_sub = (0, int(h*0.60), w, h)
+            win32gui.SetTextColor(hdc, win32api.RGB(220, 220, 220))
+            win32gui.DrawText(hdc, subtitle, -1, rect_sub, win32con.DT_CENTER | win32con.DT_TOP)
+
+        # Limpieza
+        win32gui.SelectObject(hdc, old)
+        win32gui.DeleteObject(hfont_main)
+        win32gui.DeleteObject(hfont_sub)
+        win32gui.DeleteDC(hdc)
+        return hbitmap
+
+    class _Win32OverlayWindow:
+        def __init__(self, x, y, w, h, subtitle: str):
+            self.x, self.y, self.w, self.h = x, y, w, h
+            self.subtitle = subtitle
+            self.hwnd = win32gui.CreateWindowEx(
+                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                "Static",  # clase simple
+                None,
+                WS_POPUP,
+                x, y, w, h,
+                0, 0, 0, None
+            )
+            win32gui.SetWindowPos(self.hwnd, win32con.HWND_TOPMOST, x, y, w, h,
+                                  win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW)
+            self.visible = False
+            self._current_bitmap = None
+
+        def _blit_text(self, text: str):
+            # Crear bitmap con texto y hacer UpdateLayeredWindow
+            hbmp = _create_text_bitmap(self.w, self.h, text, self.subtitle)
+            hdc_screen = win32gui.GetDC(0)
+            hdc_mem = win32gui.CreateCompatibleDC(hdc_screen)
+            old = win32gui.SelectObject(hdc_mem, hbmp)
+
+            size = SIZE(self.w, self.h)
+            pos = POINT(self.x, self.y)
+            src = POINT(0, 0)
+            blend = BLENDFUNCTION(AC_SRC_OVER, 0, int(0.92*255), 0)  # alpha global ~0.92
+
+            user32.UpdateLayeredWindow(self.hwnd, hdc_screen, ctypes.byref(pos),
+                                       ctypes.byref(size), hdc_mem, ctypes.byref(src),
+                                       0, ctypes.byref(blend), 0x02)  # ULW_ALPHA
+
+            win32gui.SelectObject(hdc_mem, old)
+            win32gui.DeleteDC(hdc_mem)
+            win32gui.ReleaseDC(0, hdc_screen)
+
+            if self._current_bitmap:
+                win32gui.DeleteObject(self._current_bitmap)
+            self._current_bitmap = hbmp
+
+        def show(self, text: str):
+            if not self.visible:
+                win32gui.ShowWindow(self.hwnd, win32con.SW_SHOWNA)
+                self.visible = True
+            self._blit_text(text)
+
+        def hide(self):
+            if self.visible:
+                win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
+                self.visible = False
+
+        def destroy(self):
+            try:
+                self.hide()
+            except Exception:
+                pass
+            if self._current_bitmap:
+                try:
+                    win32gui.DeleteObject(self._current_bitmap)
+                except Exception:
+                    pass
+            try:
+                win32gui.DestroyWindow(self.hwnd)
+            except Exception:
+                pass
+
+    class Win32OverlayManager:
+        def __init__(self):
+            self.windows: list[_Win32OverlayWindow] = []
+            self.subtitle = "Último minuto • Guarda tu partida"
+            self._init_monitors()
+
+        def _init_monitors(self):
+            self.windows.clear()
+            def _cb(hMon, hdc, rc, data):
+                left, top, right, bottom = rc
+                w, h = right - left, bottom - top
+                self.windows.append(_Win32OverlayWindow(left, top, w, h, self.subtitle))
+                return True
+            win32gui.EnumDisplayMonitors(0, None, _cb, None)
+
+        def render(self, n: int):
+            text = str(n)
+            for w in self.windows:
+                w.show(text)
+
+        def hide(self):
+            for w in self.windows:
+                w.hide()
+
+        def destroy(self):
+            for w in self.windows:
+                w.destroy()
+            self.windows.clear()
+
+    WIN32_OVERLAY_OK = True
+    _OVERLAY_IMPL = "win32"
+except Exception as e:
+    WIN32_OVERLAY_OK = False
+    _OVERLAY_IMPL = "tk-fallback"
+    log.warning("Overlay Win32 no disponible: %s", e)
+
+# Fallback Tkinter (solo si Win32 no está operativo)
+try:
+    import tkinter as tk
+    from tkinter import ttk
+except Exception:
+    tk = None
+    ttk = None
+
+def tk_overlay_loop(stop_ev: threading.Event):
+    if tk is None:
+        log.warning("Overlay deshabilitado: tkinter no disponible.")
+        return
+    from scheduler import get_overlay_countdown
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.overrideredirect(True)
+        root.attributes("-topmost", True)
+        try:
+            root.attributes("-alpha", 0.92)
+        except Exception:
+            pass
+        sw = root.winfo_screenwidth()
+        sh = root.winfo_screenheight()
+        root.geometry(f"{sw}x{sh}+0+0")
+        frame = tk.Frame(root, bg="#000000")
+        frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+        label = tk.Label(frame, text="60", font=("Segoe UI", 140, "bold"), fg="#FFFFFF", bg="#000000")
+        label.place(relx=0.5, rely=0.45, anchor="center")
+        sub = tk.Label(frame, text="Último minuto • Guarda tu partida", font=("Segoe UI", 24), fg="#DDDDDD", bg="#000000")
+        sub.place(relx=0.5, rely=0.62, anchor="center")
+        visible = False
+        last_n = -1
+        while not stop_ev.is_set():
+            st = _storage_load_state()
+            n = get_overlay_countdown(st)
+            if n > 0:
+                if not visible:
+                    root.deiconify()
+                    visible = True
+                if n != last_n:
+                    label.config(text=str(n))
+                    last_n = n
+                root.update_idletasks()
+                root.update()
+            else:
+                if visible:
+                    root.withdraw()
+                    visible = False
+                time.sleep(0.2)
+    except Exception as e:
+        log.warning("tk overlay error: %s", e)
+
+def overlay_loop(stop_ev: threading.Event):
+    from scheduler import get_overlay_countdown
+    if WIN32_OVERLAY_OK:
+        log.info("Overlay usando implementación Win32 Layered (TopMost, NoActivate).")
+        mgr = Win32OverlayManager()
+        last_n = -1
+        visible = False
+        try:
+            while not stop_ev.is_set():
+                n = 0
+                try:
+                    st = _storage_load_state()
+                    n = get_overlay_countdown(st)
+                except Exception:
+                    n = 0
+                if n > 0:
+                    if not visible:
+                        visible = True
+                    if n != last_n:
+                        mgr.render(n)
+                        last_n = n
+                else:
+                    if visible:
+                        mgr.hide()
+                        visible = False
+                    time.sleep(0.2)
+        except Exception as e:
+            log.warning("Overlay Win32 error: %s (cambiando a fallback Tkinter)", e)
+            try:
+                mgr.destroy()
+            except Exception:
+                pass
+            # fallback
+            tk_overlay_loop(stop_ev)
+        finally:
+            try:
+                mgr.destroy()
+            except Exception:
+                pass
+    else:
+        log.info("Overlay usando fallback Tkinter.")
+        tk_overlay_loop(stop_ev)
+
+# --------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------
 def main():
-    log.info("Notifier iniciado.")
+    log.info("Notifier iniciado. Overlay=%s", _OVERLAY_IMPL)
     icon_path = None
     for cand in ("app_icon.ico", "app_icon.png"):
         p = BASE / "assets" / cand
@@ -333,15 +644,17 @@ def main():
 
     stop_ev = threading.Event()
     threading.Thread(target=explorer_watch_loop, args=(stop_ev,), name="ExplorerWatch", daemon=True).start()
+    threading.Thread(target=overlay_loop, args=(stop_ev,), name="Overlay", daemon=True).start()
 
-    st = load_state()
-    last = int(st.get("last_id", 0))
+    # Saltar histórico de bloqueos
+    st_local = load_state_local()
+    last = int(st_local.get("last_id", 0))
     if last == 0:
         rows = query_new_blocks(0)
         if rows:
             last = rows[-1][0]
-            st["last_id"] = last
-            save_state(st)
+            st_local["last_id"] = last
+            save_state_local(st_local)
             log.info("Saltado histórico hasta id=%s", last)
 
     while True:
@@ -356,8 +669,8 @@ def main():
                 else:
                     notify_once(f"app:{app.lower()}", "Aplicación bloqueada", f"{app}\nNecesitas permiso del tutor para usarla.", 3.0)
                 last = rid
-                st["last_id"] = last
-                save_state(st)
+                st_local["last_id"] = last
+                save_state_local(st_local)
         except Exception as e:
             log.error("Error en loop principal: %s", e)
         time.sleep(0.3)

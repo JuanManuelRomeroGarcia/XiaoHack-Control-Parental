@@ -1,4 +1,4 @@
-# logs.py — Logger centralizado XiaoHack (final plus)
+# logs.py — Logger centralizado XiaoHack (ProgramFiles + ProgramData/LocalAppData compliant)
 from __future__ import annotations
 import logging
 from logging.handlers import RotatingFileHandler
@@ -9,10 +9,15 @@ import threading
 import traceback
 from contextlib import contextmanager
 from typing import Optional, Dict, Union
+from pathlib import Path
 
-# =========================
-# Estado global del logger
-# =========================
+# ==============================================================================
+# Config base y estado global
+# ==============================================================================
+APP_VENDOR = "XiaoHackParental"
+_DEFAULT_MAX_BYTES = 1_048_576  # 1 MiB
+_DEFAULT_BACKUP_COUNT = 5
+
 _LOGGERS: Dict[str, logging.Logger] = {}
 _LOG_FILE: Optional[str] = None
 _LOG_LEVEL = logging.INFO
@@ -20,73 +25,169 @@ _HANDLER: Optional[logging.Handler] = None
 _CONSOLE_HANDLER: Optional[logging.Handler] = None
 _INITIALIZED = False
 
-# Tamaño y retención por defecto
-_DEFAULT_MAX_BYTES = 1_048_576  # 1 MiB
-_DEFAULT_BACKUP_COUNT = 5
+# Si se llama set_data_dir(), se guarda aquí para forzar rutas
+_OVERRIDE_DATA_DIR: Optional[Path] = None
 
-# =========================
-# Resolución de rutas
-# =========================
-def _resolve_log_path() -> str:
+
+# ==============================================================================
+# Resolución robusta de rutas (SYSTEM vs usuario)
+# ==============================================================================
+def _is_system_account() -> bool:
     """
-    Devuelve la ruta del archivo de log asegurando que es escribible.
-    Preferencias:
-      0) ENV XIAOHACK_LOG_FILE
-      1) C:\ProgramData\XiaoHackParental\logs\Control.log
-      2) %APPDATA%\XiaoHackParental\logs\Control.log
-      3) %LOCALAPPDATA%\XiaoHackParental\logs\Control.log
-      4) .\logs\Control.log
-      5) .\Control.log
+    Devuelve True si el proceso parece estar corriendo como cuenta SYSTEM
+    (tareas programadas / servicios). En Windows USERNAME suele ser 'SYSTEM'.
     """
-    env = os.getenv("XIAOHACK_LOG_FILE")
-    if env:
+    user = (os.getenv("USERNAME") or "").strip().upper()
+    if user == "SYSTEM":
+        return True
+    # pista adicional: muchas tareas de servicio tienen SESSIONNAME=Services
+    sess = (os.getenv("SESSIONNAME") or "").strip().upper()
+    return sess == "SERVICES"
+
+
+def _get_env_flag(name: str) -> bool:
+    val = (os.getenv(name) or "").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
+def _resolve_data_dir() -> Path:
+    """
+    Determina el directorio base de datos/logs para la app.
+    Prioridad:
+      0) _OVERRIDE_DATA_DIR (si se llamó set_data_dir)
+      1) ENV XH_DATA_DIR
+      2) Si XH_ROLE=guardian o cuenta SYSTEM -> %ProgramData%\XiaoHackParental
+      3) Usuario: %LOCALAPPDATA%\XiaoHackParental  (fallback: %APPDATA%)
+      4) Último recurso: .\.xh_data
+    """
+    # 0) Override manual
+    if _OVERRIDE_DATA_DIR:
+        return _OVERRIDE_DATA_DIR
+
+    # 1) ENV forzado
+    env_dir = os.getenv("XH_DATA_DIR")
+    if env_dir:
+        p = Path(env_dir).expanduser()
         try:
-            os.makedirs(os.path.dirname(env), exist_ok=True)
-            with open(env, "a", encoding="utf-8-sig") as f:
-                f.write(time.strftime("%Y-%m-%d %H:%M:%S") + " [logs] logger-init(env)\n")
-            return env
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        except Exception:
+            pass  # caer a siguientes
+
+    # 2) Guardian / SYSTEM
+    role = (os.getenv("XH_ROLE") or "").strip().lower()
+    if role == "guardian" or _is_system_account():
+        programdata = os.getenv("PROGRAMDATA")
+        if programdata:
+            base = Path(programdata) / APP_VENDOR
+            try:
+                base.mkdir(parents=True, exist_ok=True)
+                return base
+            except Exception:
+                pass
+
+    # 3) Usuario normal
+    local_appdata = os.getenv("LOCALAPPDATA")
+    if local_appdata:
+        base = Path(local_appdata) / APP_VENDOR
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            return base
         except Exception:
             pass
 
-    candidates = []
-    programdata = os.getenv("PROGRAMDATA")
-    if programdata:
-        candidates.append(os.path.join(programdata, "XiaoHackParental", "logs", "Control.log"))
-
     appdata = os.getenv("APPDATA")
     if appdata:
-        candidates.append(os.path.join(appdata, "XiaoHackParental", "logs", "Control.log"))
-
-    local_appdata = os.getenv("LOCALAPPDATA")
-    if local_appdata:
-        candidates.append(os.path.join(local_appdata, "XiaoHackParental", "logs", "Control.log"))
-
-    cwd = os.getcwd()
-    candidates.append(os.path.join(cwd, "logs", "Control.log"))
-    candidates.append(os.path.join(cwd, "Control.log"))
-
-    for p in candidates:
+        base = Path(appdata) / APP_VENDOR
         try:
-            os.makedirs(os.path.dirname(p), exist_ok=True)
-            with open(p, "a", encoding="utf-8-sig") as f:
-                f.write(time.strftime("%Y-%m-%d %H:%M:%S") + " [logs] logger-init\n")
-            return p
+            base.mkdir(parents=True, exist_ok=True)
+            return base
+        except Exception:
+            pass
+
+    # 4) Último recurso relativo
+    base = Path.cwd() / ".xh_data"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return base
+
+
+def get_data_dir() -> str:
+    """Devuelve el directorio base de datos/config/logs que está usando la app."""
+    return str(_resolve_data_dir())
+
+
+def set_data_dir(path: Union[str, Path]) -> None:
+    """
+    Fuerza el data_dir (útil para tests o entornos embebidos).
+    Debe llamarse antes de configure()/get_logger() para influir en el log.
+    """
+    global _OVERRIDE_DATA_DIR
+    _OVERRIDE_DATA_DIR = Path(path).expanduser()
+
+
+def get_logs_dir() -> str:
+    """Devuelve el directorio de logs dentro del data_dir."""
+    base = _resolve_data_dir()
+    logs = base / "logs"
+    try:
+        logs.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return str(logs)
+
+
+def _resolve_log_path() -> str:
+    """
+    Devuelve la ruta del archivo de log asegurando que es escribible.
+    Prioridad:
+      0) ENV XIAOHACK_LOG_FILE (ruta absoluta)
+      1) <data_dir>/logs/Control.log   (data_dir según reglas de arriba)
+      2) .\logs\Control.log
+      3) .\Control.log
+    """
+    # 0) Ruta directa por ENV
+    env = os.getenv("XIAOHACK_LOG_FILE")
+    if env:
+        p = Path(env).expanduser()
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            # prueba de apertura
+            with p.open("a", encoding="utf-8-sig") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S") + " [logs] logger-init(env)\n")
+            return str(p)
+        except Exception:
+            pass
+
+    # 1) Data dir deducido
+    try:
+        p = Path(get_logs_dir()) / "Control.log"
+        with p.open("a", encoding="utf-8-sig") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S") + " [logs] logger-init\n")
+        return str(p)
+    except Exception:
+        pass
+
+    # 2) y 3) fallback locales
+    cwd = Path.cwd()
+    for p in (cwd / "logs" / "Control.log", cwd / "Control.log"):
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with p.open("a", encoding="utf-8-sig") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S") + " [logs] logger-init(fallback)\n")
+            return str(p)
         except Exception:
             continue
 
-    # Último recurso
-    fallback = os.path.join(cwd, "Control.log")
-    try:
-        with open(fallback, "a", encoding="utf-8-sig") as f:
-            f.write(time.strftime("%Y-%m-%d %H:%M:%S") + " [logs] logger-init(fallback)\n")
-    except Exception:
-        pass
-    return fallback
+    # Si todo falla… último recurso:
+    return str(cwd / "Control.log")
 
 
-# =========================
+# ==============================================================================
 # Construcción de handlers
-# =========================
+# ==============================================================================
 def _build_file_handler(path: str,
                         max_bytes: int = _DEFAULT_MAX_BYTES,
                         backup_count: int = _DEFAULT_BACKUP_COUNT) -> RotatingFileHandler:
@@ -108,6 +209,7 @@ def _build_file_handler(path: str,
     handler.setFormatter(fmt)
     return handler
 
+
 def _build_console_handler() -> logging.Handler:
     handler = logging.StreamHandler(stream=sys.stdout)
     fmt = logging.Formatter(
@@ -117,9 +219,23 @@ def _build_console_handler() -> logging.Handler:
     handler.setFormatter(fmt)
     return handler
 
-# =========================
+
+# ==============================================================================
 # Inicialización / Config
-# =========================
+# ==============================================================================
+def _toggle_console(enabled: bool) -> None:
+    global _CONSOLE_HANDLER
+    base = logging.getLogger("xh")
+    if enabled and _CONSOLE_HANDLER is None:
+        _CONSOLE_HANDLER = _build_console_handler()
+        base.addHandler(_CONSOLE_HANDLER)
+    elif not enabled and _CONSOLE_HANDLER is not None:
+        try:
+            base.removeHandler(_CONSOLE_HANDLER)
+        finally:
+            _CONSOLE_HANDLER = None
+
+
 def _ensure_initialized(level: Optional[Union[int, str]] = None,
                         log_path: Optional[str] = None,
                         console: Optional[bool] = None,
@@ -169,17 +285,6 @@ def _ensure_initialized(level: Optional[Union[int, str]] = None,
     _INITIALIZED = True
     base.info("Logger inicializado → %s", _LOG_FILE)
 
-def _toggle_console(enabled: bool) -> None:
-    global _CONSOLE_HANDLER
-    base = logging.getLogger("xh")
-    if enabled and _CONSOLE_HANDLER is None:
-        _CONSOLE_HANDLER = _build_console_handler()
-        base.addHandler(_CONSOLE_HANDLER)
-    elif not enabled and _CONSOLE_HANDLER is not None:
-        try:
-            base.removeHandler(_CONSOLE_HANDLER)
-        finally:
-            _CONSOLE_HANDLER = None
 
 def close_all() -> None:
     """
@@ -205,9 +310,10 @@ def close_all() -> None:
         _LOGGERS.clear()
         _INITIALIZED = False
 
-# =========================
+
+# ==============================================================================
 # API pública principal
-# =========================
+# ==============================================================================
 def configure(*,
               level: Optional[Union[int, str]] = None,
               log_path: Optional[str] = None,
@@ -217,12 +323,14 @@ def configure(*,
     """
     Configura el logger global (idempotente).
     Úsalo temprano en el arranque si quieres ajustar valores por defecto.
+    Puedes forzar el directorio con set_data_dir() o XH_DATA_DIR.
     """
     _ensure_initialized(level=level,
                         log_path=log_path,
                         console=console,
                         max_bytes=max_bytes,
                         backup_count=backup_count)
+
 
 def get_logger(name: str = "app", level: Optional[int] = None) -> logging.Logger:
     """
@@ -247,25 +355,30 @@ def get_logger(name: str = "app", level: Optional[int] = None) -> logging.Logger
     _LOGGERS[full_name] = logger
     return logger
 
+
 def get_log_file() -> str:
     """Devuelve la ruta actual del archivo de log."""
     _ensure_initialized()
     assert _LOG_FILE is not None
     return _LOG_FILE
 
+
 def set_level(level: Union[int, str]) -> None:
     """Cambia el nivel global en caliente (acepta int o 'DEBUG'/'INFO'/...)."""
     _ensure_initialized(level=level)
+
 
 def enable_console(enabled: bool = True) -> None:
     """Activa/desactiva salida a consola en caliente."""
     _ensure_initialized()
     _toggle_console(enabled)
 
+
 def log_debug(msg: str, *args, **kwargs) -> None:
     """Conveniencia: escribe directamente en el log global."""
     log = get_logger("global")
     log.debug(msg, *args, **kwargs)
+
 
 @contextmanager
 def log_timing(name: str, logger: Optional[logging.Logger] = None, level: int = logging.INFO):
@@ -274,7 +387,6 @@ def log_timing(name: str, logger: Optional[logging.Logger] = None, level: int = 
 
         with log_timing("cargar_config", get_logger("app")):
             load_config()
-
     """
     lg = logger or get_logger("perf")
     t0 = time.perf_counter()
@@ -284,9 +396,10 @@ def log_timing(name: str, logger: Optional[logging.Logger] = None, level: int = 
         dt = (time.perf_counter() - t0) * 1000.0
         lg.log(level, "%s: %.2f ms", name, dt)
 
-# =========================
+
+# ==============================================================================
 # Hooks de excepciones
-# =========================
+# ==============================================================================
 def install_exception_hooks(logger_name: str = "crash") -> None:
     """
     Redirige excepciones no capturadas (main thread + hilos) al log.
@@ -313,9 +426,10 @@ def install_exception_hooks(logger_name: str = "crash") -> None:
         threading.excepthook = _thread_excepthook  # type: ignore[attr-defined]
     lg.info("exception-hooks-installed")
 
-# =========================
+
+# ==============================================================================
 # Tkinter helper opcional
-# =========================
+# ==============================================================================
 class _TkTextHandler(logging.Handler):
     """
     Envía los logs a un tk.Text de forma segura (via widget.after).
@@ -340,6 +454,7 @@ class _TkTextHandler(logging.Handler):
         except Exception:
             pass
 
+
 def attach_tk_text_logger(text_widget, logger_name: str = "ui", level: int = logging.INFO) -> logging.Handler:
     """
     Adjunta un handler al logger indicado que escribe en un tk.Text.
@@ -350,9 +465,10 @@ def attach_tk_text_logger(text_widget, logger_name: str = "ui", level: int = log
     lg.addHandler(handler)
     return handler
 
-# =========================
+
+# ==============================================================================
 # Auto-config por defecto
-# =========================
+# ==============================================================================
 # Si alguien importa logs.py y usa get_logger() sin llamar configure(),
 # _ensure_initialized() aplicará los valores por defecto y ENV.
 # No imprimimos nada aquí para evitar ruido en import.

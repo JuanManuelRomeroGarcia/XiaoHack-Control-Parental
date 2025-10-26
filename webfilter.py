@@ -19,10 +19,6 @@ END_MARK   = "# === PARENTAL_END ==="
 
 
 def _block_pattern(begin: str = BEGIN_MARK, end: str = END_MARK) -> re.Pattern:
-    # (?m)=MULTILINE, (?s)=DOTALL
-    # - línea begin: ^[ \t]*BEGIN[ \t]*\r?\n
-    # - cuerpo: .*? (no codicioso)
-    # - línea end: ^[ \t]*END[ \t]* (y capturamos opcionalmente un \r?\n final)
     pat = rf"(?ms)^[ \t]*{re.escape(begin)}[ \t]*\r?\n.*?^[ \t]*{re.escape(end)}[ \t]*(?:\r?\n)?"
     return re.compile(pat)
 
@@ -34,8 +30,8 @@ YOUTUBE_HOSTS: List[str] = [
 ]
 YANDEX_HOSTS: List[str] = ["yandex.com", "www.yandex.com", "yandex.ru", "www.yandex.ru"]
 
-GOOGLE_SAFE_IP = "216.239.38.120"
-BING_STRICT_IP = "150.171.28.16"
+GOOGLE_SAFE_IP   = "216.239.38.120"
+BING_STRICT_IP   = "150.171.28.16"
 YANDEX_FAMILY_IP = "213.180.204.242"
 
 # ---------- Ruta/backup ----------
@@ -51,6 +47,28 @@ def set_hosts_path(path: str) -> None:
     log.debug("Ruta de hosts personalizada: %s", HOSTS)
 
 _recalc_backup()
+
+# ---------- Permisos ----------
+def can_write_hosts() -> bool:
+    """
+    Devuelve True si parece posible escribir el archivo hosts.
+    No modifica nada; útil para diagnosticar antes de intentar aplicar reglas.
+    """
+    try:
+        if not os.path.exists(HOSTS):
+            return False
+        if not os.access(HOSTS, os.W_OK):
+            return False
+        dir_ = os.path.dirname(HOSTS) or "."
+        fd, tmp = tempfile.mkstemp(prefix=".hosts_perm_test_", dir=dir_)
+        os.close(fd)
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
 
 # ---------- IO texto ----------
 def _read_hosts() -> str:
@@ -70,20 +88,19 @@ def _read_hosts() -> str:
         except Exception as e2:
             log.error("Error leyendo hosts (fallback): %s", e2)
             return ""
-        
+
 def _atomic_write(path: str, text: str) -> None:
     """
     Escribe en binario normalizando EOL a CRLF, permitiendo UNA sola línea en blanco.
-    - Normaliza todo a '\n'
-    - Colapsa 3+ saltos a exactamente 2 ('\n\n')  → conserva una línea en blanco
-    - Convierte '\n' → '\r\n'
+    Si el sistema deniega el acceso, propaga un PermissionError.
     """
     try:
         # 1) Normaliza EOL a '\n'
-        txt = re.sub(r'\r\n?|\n', '\n', text)
-        # 2) Colapsa secuencias largas (3 o más) a 2 saltos (una línea en blanco)
-        txt = re.sub(r'\n{3,}', '\n\n', txt)
-        # 3) Asegura que termina en salto
+        import re as _re
+        txt = _re.sub(r'\r\n?|\n', '\n', text)
+        # 2) Colapsa secuencias largas (3+ saltos) a 2 (una línea en blanco)
+        txt = _re.sub(r'\n{3,}', '\n\n', txt)
+        # 3) Asegura salto final
         if not txt.endswith('\n'):
             txt += '\n'
         # 4) Convierte a CRLF
@@ -97,17 +114,28 @@ def _atomic_write(path: str, text: str) -> None:
             try:
                 os.replace(tmp, path)
                 log.debug("Archivo hosts escrito (atomic replace, binario).")
+            except PermissionError as e:
+                log.warning("Permiso denegado al escribir hosts (atomic replace): %s", e)
+                raise
             except Exception:
-                shutil.copyfile(tmp, path)
-                log.debug("Archivo hosts copiado (fallback, binario).")
+                try:
+                    shutil.copyfile(tmp, path)
+                    log.debug("Archivo hosts copiado (fallback, binario).")
+                except PermissionError as e:
+                    log.warning("Permiso denegado al copiar hosts (fallback): %s", e)
+                    raise
         finally:
             try:
                 if os.path.exists(tmp):
                     os.remove(tmp)
             except Exception:
                 pass
+    except PermissionError as e:
+        log.warning("Permiso denegado al escribir hosts: %s", e)
+        raise
     except Exception as e:
         log.error("Error escribiendo hosts: %s", e)
+        raise
 
 def _write_hosts(text: str) -> None:
     _atomic_write(HOSTS, text)
@@ -120,7 +148,6 @@ def _ensure_backup() -> None:
             log.info("Backup creado: %s", backup)
         except Exception as e:
             log.warning("No se pudo crear backup: %s", e)
-            
 
 # ---------- Helpers ----------
 def _dedup_and_clean(lines: List[str]) -> List[str]:
@@ -181,72 +208,71 @@ def _build_safe_rules(enable_safe: bool,
 
 def _merge_block(original_text: str, new_block: str) -> str:
     """
-    Inserta/reemplaza el bloque parental garantizando:
-    - **Una línea en blanco** antes del BEGIN (== "\r\n\r\n" si hay contenido previo).
-    - Después del END: añade "\r\n" solo si el tail no empieza con salto.
-    'new_block' debe venir SIN CRLF final (lo recortamos por seguridad).
+    Inserta/reemplaza el bloque parental garantizando una línea en blanco antes del BEGIN.
     """
     rx = _block_pattern()
     m = rx.search(original_text)
     block = new_block.rstrip("\r\n")
-    SEP_BEFORE = "\r\n\r\n"  # <-- exactamente un salto en blanco
+    SEP_BEFORE = "\r\n\r\n"
 
     if m:
         head = original_text[:m.start()]
         tail = original_text[m.end():]
 
-        # aplasta salvos previos y deja exactamente una línea en blanco
-        head = head
-        out = (head + SEP_BEFORE) if head else ""  # si estaba vacío, no metas la línea en blanco
+        out = (head + SEP_BEFORE) if head else ""
         out += block
 
-        # entre bloque y tail: añade CRLF sólo si el tail NO arranca con salto
         if tail and not tail.startswith(("\r", "\n")):
             out += "\r\n"
         out += tail
         return out
 
-    # no había bloque: pega al final con una línea en blanco si hay contenido previo
     base = original_text.rstrip("\r\n")
     if base:
         return base + SEP_BEFORE + block
     else:
         return block
 
-    
-# ---------- API pública ----------
+# ---------- API pública (núcleo: SIN CAMBIOS DE COMPORTAMIENTO) ----------
 def ensure_hosts_rules(cfg: dict) -> None:
     """
     Aplica bloque parental (con backup y flush DNS).
     - Respeta cfg['safesearch'] (por defecto: False)
     - Respeta cfg['domains_enabled'] (si es False, no escribe dominios)
+    - Si no hay cambios efectivos, NO reescribe el archivo
     """
     log.info("Aplicando reglas de filtrado parental...")
     _ensure_backup()
     content = _read_hosts()
 
-    # SafeSearch SOLO si el usuario lo marcó
     enable_safe = bool(cfg.get("safesearch", False))
-
-    # Dominios sólo si domains_enabled=True
     blocked = list(cfg.get("blocked_domains", []))
     if not cfg.get("domains_enabled", True):
         blocked = []
 
-    # TLDs: usa los del cfg si vienen, o el default
     google_tlds = list(cfg.get("google_tlds", GOOGLE_TLDS)) if cfg.get("google_tlds") else None
     block_www = bool(cfg.get("block_www", True))
 
     new_block = _build_safe_rules(enable_safe, blocked, google_tlds, block_www)
     merged = _merge_block(content, new_block)
-    _write_hosts(merged)
+
+    if merged == content:
+        log.info("Reglas ya aplicadas: no hay cambios en hosts.")
+        return
+
+    try:
+        _write_hosts(merged)
+    except PermissionError:
+        log.warning("Sin permisos para escribir hosts (ejecuta como Administrador si quieres aplicar cambios).")
+        raise
+
     _flush_dns()
     log.info("Bloque parental aplicado correctamente (%d dominios bloqueados).", len(blocked))
-
 
 def remove_parental_block() -> bool:
     """
     Elimina SOLO el bloque parental usando el patrón regex.
+    Propaga PermissionError si no hay permisos al escribir.
     """
     log.info("Eliminando bloque parental de hosts...")
     text = _read_hosts()
@@ -256,15 +282,22 @@ def remove_parental_block() -> bool:
         log.info("No se encontró bloque parental en hosts.")
         return False
 
-    # Cortamos el bloque y normalizamos espacios (evitar dobles saltos)
     head = text[:m.start()]
     tail = text[m.end():]
-    # Si ambos lados tienen salto contiguo, elimina uno
     if head.endswith(("\r\n\r\n", "\n\n")) and tail.startswith(("\r\n", "\n")):
         tail = tail[2:] if tail.startswith("\r\n") else tail[1:]
-
     new_text = head + tail
-    _write_hosts(new_text)
+
+    if new_text == text:
+        log.info("Nada que eliminar; hosts ya sin bloque.")
+        return False
+
+    try:
+        _write_hosts(new_text)
+    except PermissionError:
+        log.warning("Sin permisos para escribir hosts (ejecuta como Administrador si quieres eliminar el bloque).")
+        raise
+
     _flush_dns()
     log.info("Bloque parental eliminado correctamente.")
     return True
@@ -272,9 +305,13 @@ def remove_parental_block() -> bool:
 def rollback_hosts() -> None:
     backup = _recalc_backup()
     if os.path.exists(backup):
-        shutil.copyfile(backup, HOSTS)
-        _flush_dns()
-        log.info("Hosts restaurado desde backup: %s", backup)
+        try:
+            shutil.copyfile(backup, HOSTS)
+            _flush_dns()
+            log.info("Hosts restaurado desde backup: %s", backup)
+        except PermissionError:
+            log.warning("Sin permisos para restaurar hosts desde backup.")
+            raise
     else:
         log.warning("No se encontró backup para restaurar: %s", backup)
 
@@ -289,3 +326,138 @@ def safesearch_effective(text: Optional[str] = None) -> bool:
         return False
     chunk = m.group(0)
     return any(ip in chunk for ip in (GOOGLE_SAFE_IP, BING_STRICT_IP, YANDEX_FAMILY_IP))
+
+
+# ======================================================================
+# ENVOLTORIOS CON ELEVACIÓN (UAC) — para panel/tutor
+# ======================================================================
+def _is_admin() -> bool:
+    try:
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+def _powershell_elevated_wait(args: list[str]) -> int:
+    """
+    Lanza un proceso elevado con UAC y espera a que termine, devolviendo su exit code.
+    """
+    py = os.path.normpath(os.path.abspath(os.environ.get("PYTHONW_EXE", sys.executable)))
+    # Construimos: Start-Process -Verb RunAs -FilePath "<python>" -ArgumentList "-m","webfilter",<args...> -Wait -PassThru
+    # y salimos con su ExitCode
+    ps = [
+        "PowerShell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+        "-Command",
+        r"$p=Start-Process -Verb RunAs -FilePath '{}' -ArgumentList {} -WindowStyle Hidden -PassThru -Wait; exit $p.ExitCode".format(
+            py.replace("'", "''"),
+            "'" + "','".join(["-m","webfilter"] + args).replace("'", "''") + "'"
+        )
+    ]
+    try:
+        cp = subprocess.run(ps, capture_output=True, text=True)
+        if cp.stdout:
+            log.debug("PS STDOUT: %s", cp.stdout.strip())
+        if cp.stderr:
+            log.debug("PS STDERR: %s", cp.stderr.strip())
+        return cp.returncode
+    except Exception as e:
+        log.error("Fallo lanzando elevación PowerShell: %s", e)
+        return 1
+
+def ensure_hosts_rules_or_elevate(cfg: dict) -> None:
+    """
+    Intenta aplicar reglas; si no hay permisos, pide elevación UAC y reintenta
+    ejecutando este módulo en modo '--apply-tmp'.
+    """
+    try:
+        ensure_hosts_rules(cfg)
+        return
+    except PermissionError:
+        pass
+
+    # Guardamos cfg en un JSON temporal para el proceso elevado
+    import json
+    import sys  # noqa: F401
+    fd, tmp = tempfile.mkstemp(prefix="xh_apply_", suffix=".json")
+    os.close(fd)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+    code = _powershell_elevated_wait(["--apply-tmp", tmp])
+    try:
+        os.remove(tmp)
+    except Exception:
+        pass
+    if code != 0:
+        raise PermissionError("No se pudo aplicar el bloque parental (se canceló UAC o falló el proceso elevado).")
+
+def remove_parental_block_or_elevate() -> bool:
+    """
+    Intenta eliminar el bloque; si no hay permisos, pide elevación UAC y reintenta
+    ejecutando este módulo en modo '--remove'.
+    """
+    try:
+        return remove_parental_block()
+    except PermissionError:
+        pass
+    code = _powershell_elevated_wait(["--remove"])
+    if code != 0:
+        raise PermissionError("No se pudo eliminar el bloque parental (se canceló UAC o falló el proceso elevado).")
+    return True
+
+def rollback_hosts_or_elevate() -> None:
+    """
+    Intenta restaurar el backup; si no hay permisos, pide elevación UAC y reintenta
+    ejecutando este módulo en modo '--rollback'.
+    """
+    try:
+        rollback_hosts()
+        return
+    except PermissionError:
+        pass
+    code = _powershell_elevated_wait(["--rollback"])
+    if code != 0:
+        raise PermissionError("No se pudo restaurar el backup (UAC cancelado o fallo en proceso elevado).")
+
+
+# ======================================================================
+# CLI de servicio para el proceso elevado
+# ======================================================================
+if __name__ == "__main__":
+    import sys
+    import json
+    args = sys.argv[1:]
+    if not args:
+        sys.exit(0)
+
+    if args[0] == "--apply-tmp" and len(args) >= 2:
+        tmp = args[1]
+        try:
+            with open(tmp, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            ensure_hosts_rules(cfg)
+            sys.exit(0)
+        except PermissionError:
+            sys.exit(5)
+        except Exception:
+            sys.exit(2)
+
+    if args[0] == "--remove":
+        try:
+            ok = remove_parental_block()
+            sys.exit(0 if ok else 0)
+        except PermissionError:
+            sys.exit(5)
+        except Exception:
+            sys.exit(2)
+            
+    if args[0] == "--rollback":
+        try:
+            rollback_hosts()
+            sys.exit(0)
+        except PermissionError:
+            sys.exit(5)
+        except Exception:
+            sys.exit(2)
+
+    sys.exit(0)

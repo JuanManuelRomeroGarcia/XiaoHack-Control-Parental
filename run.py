@@ -1,11 +1,11 @@
-# run.py — lanzador con auto-elevación UAC y logging centralizado
+# run.py — lanzador con elevación opcional (UAC) y logging centralizado
+from __future__ import annotations
 import sys
 import ctypes
 import traceback
 
 # --- Inicializar logger muy pronto ---
 from logs import configure, get_logger, install_exception_hooks
-
 
 # --- AppUserModelID para icono en barra de tareas (Windows) ---
 try:
@@ -25,63 +25,90 @@ except Exception:
 
 # Nombre “bonito” del proceso (si está disponible setproctitle)
 try:
-    from setproctitle import setproctitle
+    import setproctitle  # type: ignore
     title = f"XiaoHack-{XH_ROLE}" if XH_ROLE else "XiaoHack"
-    setproctitle(title)
+    setproctitle.setproctitle(title)
 except Exception:
     pass
 
-# Log útil al arrancar
+# Log útil al arrancar (root)
 try:
     import logging
     logging.getLogger().info("XiaoHack process started (role=%s)", XH_ROLE)
 except Exception:
     pass
 
-
-configure(level="debug")  # Se puede cambiar a DEBUG para ver más detalle
-install_exception_hooks()
+# --- Config de logs del lanzador ---
+configure(level="INFO")  # cambia a "DEBUG" si necesitas más detalle
+install_exception_hooks("launcher-crash")
 log = get_logger("launcher")
 
-def _ensure_admin_or_relaunch():
-    """
-    Comprueba si la app tiene privilegios de administrador.
-    Si no, relanza con elevación (UAC). Evita relanzar en bucle usando el flag --elevated.
-    """
+# -----------------------------------------------------------------------------
+# Elevación UAC (opcional)
+# -----------------------------------------------------------------------------
+def _is_admin() -> bool:
     try:
-        is_admin = ctypes.windll.shell32.IsUserAnAdmin()
-    except Exception as e:
-        log.warning("No se pudo com permisos de administrador: %s", e)
-        is_admin = False
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
 
-    # Evitar bucle infinito
-    if "--elevated" in sys.argv:
-        log.info("Ejecutando ya en modo elevado (flag detectado).")
+def _relaunch_elevated(extra_args: list[str] | None = None):
+    """
+    Relanza el proceso con elevación UAC, añadiendo --elevated para evitar bucles.
+    """
+    extra_args = extra_args or []
+    if "--elevated" not in extra_args:
+        extra_args = extra_args + ["--elevated"]
+    params = " ".join(f'"{a}"' for a in (sys.argv + extra_args))
+    exe = sys.executable
+    log.info("Requiere privilegios admin, relanzando con UAC…")
+    log.debug("Exe: %s", exe)
+    log.debug("Params: %s", params)
+    try:
+        ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+        log.info("ShellExecuteW retornó: %s", ret)
+    except Exception:
+        log.error("Error al relanzar con elevación:\n%s", traceback.format_exc())
+    sys.exit(0)
+
+def _maybe_elevate(require_admin: bool):
+    """
+    Si require_admin=True y no somos admin, relanza con UAC.
+    Evita bucles si ya venimos con --elevated.
+    """
+    if not require_admin:
         return
-
-    if not is_admin:
-        params = " ".join(f'"{a}"' for a in sys.argv + ["--elevated"])
-        exe = sys.executable
-        log.info("Requiere privilegios admin, relanzando con UAC...")
-        log.debug("Ejecutable: %s", exe)
-        log.debug("Parámetros: %s", params)
-        try:
-            ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
-            log.info("ShellExecuteW devuelto: %s", ret)
-        except Exception:
-            log.error("Error al relanzar con elevación:\n%s", traceback.format_exc())
-        sys.exit(0)
-    else:
+    if "--elevated" in sys.argv:
+        log.info("Ejecutando ya en modo elevado (flag --elevated detectado).")
+        return
+    if _is_admin():
         log.info("Permisos de administrador confirmados.")
+        return
+    _relaunch_elevated([])
 
-# --- Ejecución principal ---
+# -----------------------------------------------------------------------------
+# Ejecución principal
+# -----------------------------------------------------------------------------
 def main():
-    log.info("Iniciando lanzador XiaoHack Control Parental...")
-    _ensure_admin_or_relaunch()
+    # Flags de control:
+    #   --require-admin : fuerza elevación al inicio (escenario mantenimiento/instalación)
+    #   --no-elevate    : ignora cualquier intento de elevación (útil para debugging)
+    #   --xh-role       : rol (panel/guardian/notifier/etc.) — no obligatorio aquí
+    require_admin = "--require-admin" in {a.lower() for a in sys.argv[1:]}
+    no_elevate    = "--no-elevate" in {a.lower() for a in sys.argv[1:]}
+
+    log.info("Iniciando lanzador XiaoHack Control Parental… (role=%s)", XH_ROLE or "panel")
+
+    if require_admin and not no_elevate:
+        _maybe_elevate(require_admin=True)
+    else:
+        log.info("Ejecución sin elevación inicial (se elevará SOLO cuando haga falta).")
 
     try:
         from xiao_gui.app import run
         log.info("Ejecutando aplicación principal (xiao_gui.app.run)")
+        # Nota: cualquier operación que requiera admin (p. ej. hosts) debe usar
+        # webfilter.ensure_hosts_rules_or_elevate / remove_parental_block_or_elevate
         run()
     except Exception:
         log.error("Error durante la ejecución principal:\n%s", traceback.format_exc())

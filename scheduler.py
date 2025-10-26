@@ -17,6 +17,11 @@ _DAY_ALIASES = {
     "jue": "thu", "vie": "fri", "sab": "sat", "sáb": "sat", "dom": "sun",
 }
 
+# Umbrales (segundos)
+M10 = 10 * 60
+M5  = 5 * 60
+M1  = 60
+
 def _parse_time(s: str) -> dtime:
     try:
         h, m = map(int, s.split(":"))
@@ -169,10 +174,6 @@ def check_playtime_alerts(state: dict, now: datetime, cfg: Optional[dict] = None
     log.debug("Tiempo restante=%s mode=%s flags=%s", remaining, mode, pa)
 
     # Umbrales
-    M10 = 10 * 60
-    M5  = 5 * 60
-    M1  = 60
-
     if remaining <= M10 and not pa["m10"]:
         pa["m10"] = True
         messages.append("⏳ Quedan 10 minutos de juego.")
@@ -198,6 +199,44 @@ def check_playtime_alerts(state: dict, now: datetime, cfg: Optional[dict] = None
 
     state["play_countdown"] = 0
     return messages, 0
+
+# =========================
+# Helpers para OVERLAY
+# =========================
+
+def get_overlay_countdown(state: dict) -> int:
+    """
+    Segundos (0..60) que debe mostrar el overlay gigante. 0 = no mostrar.
+    El guardian actualiza 'play_countdown' cada segundo cuando restan <= 60s.
+    """
+    try:
+        n = int(state.get("play_countdown", 0) or 0)
+    except Exception:
+        n = 0
+    return max(0, min(60, n))
+
+def should_show_overlay(state: dict) -> bool:
+    """
+    True si hay que mostrar overlay (esto no abre panel; lo usará notifier).
+    Estrategia: mostrar overlay solo durante la cuenta atrás del último minuto.
+    """
+    return get_overlay_countdown(state) > 0
+
+def alerts_snapshot(state: dict, now: datetime, cfg: Optional[dict] = None) -> Dict:
+    """
+    Snapshot útil para el notifier/overlay (no guarda nada).
+    Incluye flags de m10/m5/m1, segundos restantes y modo.
+    """
+    pa = state.get("play_alerts") or {}
+    rem, mode = remaining_play_seconds(state, now, cfg)
+    return {
+        "remaining": max(0, rem),
+        "mode": mode,  # "manual" | "schedule" | None
+        "m10": bool(pa.get("m10")),
+        "m5": bool(pa.get("m5")),
+        "m1": bool(pa.get("m1")),
+        "countdown": get_overlay_countdown(state),
+    }
 
 
 if __name__ == "__main__":

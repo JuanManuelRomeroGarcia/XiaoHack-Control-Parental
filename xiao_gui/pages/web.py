@@ -18,6 +18,17 @@ from webfilter import (
     GOOGLE_SAFE_IP, BING_STRICT_IP, YANDEX_FAMILY_IP,
 )
 
+try:
+    from webfilter import (
+        ensure_hosts_rules_or_elevate,
+        remove_parental_block_or_elevate,
+        rollback_hosts_or_elevate,
+    )
+except Exception:
+    ensure_hosts_rules_or_elevate = ensure_hosts_rules
+    remove_parental_block_or_elevate = remove_parental_block
+    rollback_hosts_or_elevate = rollback_hosts
+    
 from logs import get_logger
 log = get_logger("gui.web")
 
@@ -174,50 +185,93 @@ class WebPage(ttk.Frame):
         # --- (5) Dominios bloqueados ---
         lf_blk = ttk.LabelFrame(self, text="Dominios bloqueados (hosts → 0.0.0.0)")
         lf_blk.grid(row=5, column=0, sticky="nsew", **pad)
+        # Este frame crece tanto a lo ancho como a lo alto en pantallas grandes,
+        # y en pantallas pequeñas muestra siempre la barra inferior.
         self.rowconfigure(5, weight=1)
         lf_blk.columnconfigure(0, weight=1)
-        lf_blk.rowconfigure(1, weight=1)
+        lf_blk.rowconfigure(1, weight=1)  # la lista crece
 
-        # NUEVO: switch maestro
+        # NUEVO: switch maestro (fila 0)
         self.var_domains_enabled = tk.BooleanVar(value=bool(self.cfg.get("domains_enabled", True)))
         ttk.Checkbutton(
             lf_blk,
             text="Activar bloqueo de dominios (hosts → 0.0.0.0)",
             variable=self.var_domains_enabled,
             command=self._mark_dirty
-        ).grid(row=0, column=0, sticky="w", pady=(6, 6), columnspan=2)
+        ).grid(row=0, column=0, sticky="w", pady=(6, 6))
 
+        # Contenedor de lista (fila 1)
         wrap = ttk.Frame(lf_blk)
         wrap.grid(row=1, column=0, sticky="nsew")
         wrap.columnconfigure(0, weight=1)
         wrap.rowconfigure(0, weight=1)
 
-        self.lst_domains = tk.Listbox(wrap, height=10, activestyle="dotbox",
-                                      selectmode="extended", exportselection=False)
+        self.lst_domains = tk.Listbox(
+            wrap, height=10, activestyle="dotbox",
+            selectmode="extended", exportselection=False
+        )
         self.lst_domains.grid(row=0, column=0, sticky="nsew")
         vsb = ttk.Scrollbar(wrap, orient="vertical", command=self.lst_domains.yview)
         vsb.grid(row=0, column=1, sticky="ns")
         self.lst_domains.configure(yscrollcommand=vsb.set)
 
+        # Rellena lista
         for d in self.cfg.get("blocked_domains", []):
             self.lst_domains.insert("end", d)
 
-        right = ttk.Frame(lf_blk)
-        right.grid(row=1, column=1, sticky="n", padx=8)
-        right.columnconfigure(0, weight=1)
+        # Barra inferior SIEMPRE visible (fila 2)
+        bar = ttk.Frame(lf_blk)
+        bar.grid(row=2, column=0, sticky="ew", pady=(6, 4))
+        bar.columnconfigure(0, weight=1)
 
-        self.ent_d = ttk.Entry(right, width=28)
-        self.ent_d.grid(row=0, column=0, sticky="ew")
+        # Campo de entrada + acciones compactas
+        self.ent_d = ttk.Entry(bar)
+        self.ent_d.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         self.ent_d.bind("<Return>", lambda e: self._add_domain())
 
-        ttk.Button(right, text="Añadir", command=self._add_domain).grid(row=1, column=0, sticky="ew", pady=(6, 0))
-        ttk.Button(right, text="Editar seleccionado", command=self._edit_selected).grid(row=2, column=0, sticky="ew", pady=(6, 0))
-        ttk.Button(right, text="Eliminar seleccionado(s)", command=self._del_selected).grid(row=3, column=0, sticky="ew", pady=(6, 0))
-        ttk.Button(right, text="Importar (TXT)", command=self._import_domains).grid(row=4, column=0, sticky="ew", pady=(12, 0))
-        ttk.Button(right, text="Exportar (TXT)", command=self._export_domains).grid(row=5, column=0, sticky="ew", pady=(6, 0))
+        btn_add = ttk.Button(bar, text="Añadir", width=10, command=self._add_domain)
+        btn_edit = ttk.Button(bar, text="Editar", width=10, command=self._edit_selected)
+        btn_del = ttk.Button(bar, text="Eliminar", width=10, command=self._del_selected)
 
-        self.lbl_count = ttk.Label(right, text="0 dominios")
-        self.lbl_count.grid(row=6, column=0, sticky="w", pady=(8, 0))
+        btn_add.grid(row=0, column=1, padx=(0, 4))
+        btn_edit.grid(row=0, column=2, padx=(0, 4))
+        btn_del.grid(row=0, column=3, padx=(0, 8))
+
+        # Menú “Más…” para importar/exportar
+        more = ttk.Menubutton(bar, text="Más…", width=8, direction="below")
+        m = tk.Menu(more, tearoff=False)
+        m.add_command(label="Importar (TXT)…", command=self._import_domains, accelerator="Ctrl+I")
+        m.add_command(label="Exportar (TXT)…", command=self._export_domains, accelerator="Ctrl+E")
+        more["menu"] = m
+        more.grid(row=0, column=4)
+
+        # Contador (fila 3)
+        bottom = ttk.Frame(lf_blk)
+        bottom.grid(row=3, column=0, sticky="w")
+        self.lbl_count = ttk.Label(bottom, text="0 dominios")
+        self.lbl_count.pack(side="left")
+
+        # Accesibilidad/atajos y señales de “dirty”
+        self.lst_domains.bind("<<ListboxSelect>>", lambda e: self._preview_dirty())
+        self.ent_d.bind("<FocusOut>", lambda e: self._mark_dirty() if self.ent_d.get().strip() else None)
+
+        # Atajos de teclado
+        self.bind_all("<Delete>", lambda e: self._del_selected())
+        self.bind_all("<Return>", lambda e: self._edit_selected() if self.lst_domains.curselection() else None)
+        self.bind_all("<Control-i>", lambda e: self._import_domains())
+        self.bind_all("<Control-e>", lambda e: self._export_domains())
+
+        # Scroll con rueda del ratón en la lista
+        def _wheel(event):
+            try:
+                delta = event.delta if event.delta else (-120 if event.num == 5 else 120)
+                self.lst_domains.yview_scroll(-1 if delta > 0 else 1, "units")
+                return "break"
+            except Exception:
+                return None
+        self.lst_domains.bind("<MouseWheel>", _wheel)        # Windows
+        self.lst_domains.bind("<Button-4>", _wheel)          # Linux wheel up
+        self.lst_domains.bind("<Button-5>", _wheel)          # Linux wheel down
 
         self._mk_context_menu()
         self.lst_domains.bind("<<ListboxSelect>>", lambda e: self._preview_dirty())
@@ -472,24 +526,44 @@ class WebPage(ttk.Frame):
 
         def _work():
             local_ok, local_err = True, None
-            if is_admin():
-                # IMPORTANTe: aplicar con cfg "efectiva" (si domains_enabled=False, vaciar lista)
-                cfg_eff = dict(self.cfg)
-                if not cfg_eff.get("domains_enabled", True):
-                    cfg_eff["blocked_domains"] = []
 
-                try:
-                    if will_apply:
-                        ensure_hosts_rules(cfg_eff)
-                        log.info("Hosts actualizado localmente (aplicación inmediata, admin).")
+            # Config efectiva (si domains_enabled=False, vaciamos lista)
+            cfg_eff = dict(self.cfg)
+            if not cfg_eff.get("domains_enabled", True):
+                cfg_eff["blocked_domains"] = []
+
+            try:
+                if will_apply:
+                    ensure_hosts_rules_or_elevate(cfg_eff)
+                    log.info("Hosts aplicado (local o elevado).")
+                else:
+                    remove_parental_block_or_elevate()
+                    log.info("Bloque parental eliminado (local o elevado).")
+            except PermissionError as e:
+                local_ok, local_err = False, ("PERM", e)
+            except Exception as e:
+                local_ok, local_err = False, ("ERR", e)
+                log.error("Error aplicar/limpiar hosts: %s", e, exc_info=True)
+
+            def _post():
+                if not self._gate.is_current(rev) or not self.winfo_exists():
+                    return
+                self._reload_state_async()
+                if local_ok:
+                    messagebox.showinfo("OK",
+                        ("Aplicado. El servicio lo mantendrá." if will_apply
+                         else "Desactivado. Bloque eliminado; el servicio lo mantendrá limpio."))
+                else:
+                    if local_err and local_err[0] == "PERM":
+                        messagebox.showwarning(
+                            "Permisos",
+                            "Se canceló la elevación o no se concedió permiso.\n"
+                            "Puedes reintentar con ‘Reiniciar como Administrador’."
+                        )
                     else:
-                        removed = remove_parental_block()
-                        log.info("Bloque parental %s localmente.", "eliminado" if removed else "no presente")
-                except PermissionError as e:
-                    local_ok, local_err = False, ("PERM", e)
-                except Exception as e:
-                    local_ok, local_err = False, ("ERR", e)
-                    log.error("Error local aplicar/limpiar hosts: %s", e, exc_info=True)
+                        messagebox.showerror("Error",
+                            f"Guardado, pero fallo al tocar el hosts:\n{type(local_err[1]).__name__}: {local_err[1]}")
+            self.after(0, _post)
 
             def _post():
                 if not self._gate.is_current(rev) or not self.winfo_exists(): 
@@ -564,8 +638,8 @@ class WebPage(ttk.Frame):
 
         def _work():
             try:
-                changed = remove_parental_block()
-                ok, ch, err = True, changed, None
+                changed = remove_parental_block_or_elevate()
+                ok, ch, err = True, bool(changed), None
                 # desactivar aplicación automática
                 try:
                     st = load_state()
@@ -614,7 +688,7 @@ class WebPage(ttk.Frame):
 
         def _work():
             try:
-                rollback_hosts()
+                rollback_hosts_or_elevate()
                 ok, err = True, None
                 # desactivar aplicación automática
                 try:
