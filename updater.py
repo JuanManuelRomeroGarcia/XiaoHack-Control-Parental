@@ -15,7 +15,13 @@ import subprocess
 import time
 from pathlib import Path
 from urllib.request import urlopen, Request
-from urllib.error import URLError, HTTPError
+
+try:
+    import sys
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 from logs import get_logger
 log = get_logger("gui.Updater")
@@ -100,14 +106,6 @@ def get_latest_release():
     except Exception as e:
         log.error("Error obteniendo última versión desde GitHub: %s", e, exc_info=True)
         return None, None  # señal de error controlado
-
-def _safe_http(url: str) -> str:
-    try:
-        return _http_get(url).decode("utf-8")
-    except (URLError, HTTPError) as e:
-        raise RuntimeError(f"HTTP error: {e}") from e
-    except Exception as e:
-        raise RuntimeError(f"Network error: {e}") from e
 
 def _should_skip(path: str, is_dir: bool) -> bool:
     name = os.path.basename(path)

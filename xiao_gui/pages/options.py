@@ -58,8 +58,32 @@ def _run(*cmd):
     return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
 
 def _install_dir(cfg: dict) -> str:
-    # Usamos el valor de config si viene; si no, ProgramData fijo
+    """
+    Devuelve la carpeta de instalación (donde están updater.py, uninstall.py, venv, etc).
+    Prioridad:
+      1) cfg["install_path"]
+      2) variable de entorno XH_INSTALL_DIR (la fija el instalador en los .bat)
+      3) raíz del runtime inferida desde este paquete (padres de xiao_gui)
+    """
     d = (cfg or {}).get("install_path")
+    if d and os.path.isdir(d):
+        return d
+
+    env = os.environ.get("XH_INSTALL_DIR", "").strip()
+    if env and os.path.isdir(env):
+        return env
+
+    # fallback robusto: raíz donde viven VERSION/updater.py
+    return str(_xh_root())
+
+def _data_system_dir(cfg: dict) -> str:
+    """
+    Devuelve la carpeta de datos del sistema (donde escribimos logs: control.log, etc).
+    Prioridad:
+      1) cfg["data_system_path"]
+      2) %ProgramData%\XiaoHackParental
+    """
+    d = (cfg or {}).get("data_system_path")
     if d and os.path.isdir(d):
         return d
     return os.path.join(os.getenv("ProgramData", r"C:\ProgramData"), "XiaoHackParental")
@@ -71,10 +95,15 @@ def _run_guardian_bat(cfg: dict) -> str:
     return os.path.join(_install_dir(cfg), "run_guardian.bat")
 
 def _xh_root():
-    # ..\xiao_gui\pages\options.py  →  runtime root
+    # ..\xiao_gui\pages\options.py  →  runtime root (contiene VERSION, updater.py, uninstall.py)
     import inspect
     here = Path(inspect.getfile(sys.modules[__name__])).resolve()
-    return here.parents[3] if "xiao_gui" in str(here) else here.parents[1]
+    # si estamos en ...\xiao_gui\pages\options.py -> root es parents[3]
+    if "xiao_gui" in str(here):
+        return here.parents[3]
+    # si se empaqueta distinto, intenta 1 nivel arriba del paquete
+    return here.parents[1]
+
 
 def _read_version() -> str:
     try:
@@ -219,25 +248,27 @@ def _open_task_scheduler_local():
         return 1, "", str(e)
 
 def _open_control_log(cfg: dict):
-    log_path = os.path.join(_install_dir(cfg), "logs", "control.log")
+    # control.log lo escribe el guardian en la carpeta de datos del sistema
+    log_path = os.path.join(_data_system_dir(cfg), "logs", "control.log")
     if os.path.exists(log_path):
         try:
             os.startfile(log_path)
             return 0, "", ""
         except Exception as e:
             return 1, "", str(e)
-    return 1, "", "control.log no encontrado"
+    return 1, "", f"control.log no encontrado en: {log_path}"
 
 def _launch_uninstaller(cfg: dict):
     py = _venv_python(cfg)
     uni = os.path.join(_install_dir(cfg), "uninstall.py")
     if not os.path.exists(uni):
-        return 1, "", "uninstall.py no encontrado"
+        return 1, "", f"uninstall.py no encontrado en: {uni}"
     try:
         subprocess.Popen([py, uni], creationflags=0x08000000)
         return 0, "", ""
     except Exception as e:
         return 1, "", str(e)
+
 
 
 class OptionsPage(ttk.Frame):

@@ -267,7 +267,7 @@ def kill_related(install_path: str, list_only=False):
 
 # ----------------------- borrado en dos fases ---------------------------------
 def _write_post_cleanup_bat(install_path: str):
-    """
+    r"""
     Crea el BAT de post-limpieza que remata:
       - venv, uninstall.* y la carpeta de instalación
       - %ProgramData%\XiaoHackParental

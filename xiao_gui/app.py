@@ -1,9 +1,7 @@
 # app.py — XiaoHack Control Parental — GUI Tutor (revisado)
 from __future__ import annotations
 import contextlib
-import json
 from pathlib import Path
-import subprocess
 import threading
 import traceback
 import sys
@@ -84,91 +82,99 @@ def _auto_check_updates_once(root):
     Comprueba si hay una versión nueva usando updater.py y ofrece aplicar la actualización.
     No bloquea la UI (usa un thread).
     """
-    def _find_install_and_updater():
-        from pathlib import Path
+    def _find_install():
         import os
-        import sys  # noqa: F401
-        # 1) Preferir lo que nos diga el instalador
+        from pathlib import Path
+        # 1) variable del instalador
         inst = os.environ.get("XH_INSTALL_DIR", "").strip()
         if inst:
             base = Path(inst)
-            up = base / "updater.py"
-            pyw = base / "venv" / "Scripts" / "pythonw.exe"
-            if up.exists():
-                return base, up, (pyw if pyw.exists() else None)
-
-        # 2) Relativo al paquete (xiao_gui/app.py -> …/updater.py)
+            if (base / "updater.py").exists():
+                return base
+        # 2) relativo al paquete ( …/xiao_gui/app.py -> …/ )
         try:
             base = Path(__file__).resolve().parents[1]
-            up = base / "updater.py"
-            pyw = base / "venv" / "Scripts" / "pythonw.exe"
-            if up.exists():
-                return base, up, (pyw if pyw.exists() else None)
+            if (base / "updater.py").exists():
+                return base
         except Exception:
             pass
-
-        # 3) Último intento: cwd
+        # 3) último intento: cwd
         base = Path.cwd()
-        up = base / "updater.py"
-        pyw = base / "venv" / "Scripts" / "pythonw.exe"
-        return base, up, (pyw if pyw.exists() else None)
+        return base
 
     def _run():
+        import json  # noqa: F811
+        import subprocess  # noqa: F811
+        import os
+        import sys
+        base = _find_install()
+        up = base / "updater.py"
+        if not up.exists():
+            log.warning("Updater no encontrado en: %s", up)
+            return
+
+        # Localiza intérpretes del venv (preferidos)
+        py_console = base / "venv" / "Scripts" / "python.exe"
+        py_window  = base / "venv" / "Scripts" / "pythonw.exe"
+        exe_check  = str(py_console if py_console.exists() else sys.executable)
+        exe_apply  = str(py_window  if py_window.exists()  else sys.executable)
+
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+
+
         try:
-            base, up, pyw = _find_install_and_updater()
-            if not up.exists():
-                log.warning("Updater no encontrado en: %s", up)
-                return
-
-            # Elegir intérprete: el actual o el del venv si detectamos que no estamos en él
-            exe = sys.executable
-            try:
-                # Si el actual no es nuestro venv y tenemos pythonw del venv, úsalo
-                if ("\\XiaoHackParental\\venv\\Scripts\\" not in exe.replace("/", "\\")
-                    and pyw and pyw.exists()):
-                    exe = str(pyw)
-            except Exception:
-                pass
-
-            log.info("Lanzando updater: exe=%s, script=%s", exe, up)
-            out = subprocess.check_output([exe, str(up), "--check"],
-                                          stderr=subprocess.STDOUT, timeout=300)
+            log.info("Updater --check: exe=%s, script=%s, cwd=%s", exe_check, up, base)
+            out = subprocess.check_output(
+                [exe_check, str(up), "--check"],
+                stderr=subprocess.STDOUT,
+                cwd=str(base),
+                env=env,
+                timeout=300
+            )
             res = json.loads(out.decode("utf-8", "ignore"))
             if res.get("update_available"):
                 latest = res.get("latest") or "desconocida"
+
                 def _apply():
                     try:
-                        subprocess.check_call([exe, str(up), "--apply"])
+                        log.info("Updater --apply: exe=%s, script=%s", exe_apply, up)
+                        subprocess.check_call(
+                            [exe_apply, str(up), "--apply"],
+                            cwd=str(base),
+                            env=env
+                        )
                         messagebox.showinfo(
                             "Actualización",
                             "Actualización instalada correctamente.\nReinicia el Panel para ver los cambios."
                         )
                     except Exception as e:
                         messagebox.showerror("Actualización", f"No se pudo actualizar:\n{e}")
+
                 root.after(0, lambda: (
-                    messagebox.askyesno(
-                        "Actualización disponible",
-                        f"Hay una nueva versión {latest}.\n¿Quieres instalarla ahora?"
-                    ) and _apply()
+                    messagebox.askyesno("Actualización disponible",
+                                        f"Hay una nueva versión {latest}.\n¿Quieres instalarla ahora?")
+                    and _apply()
                 ))
+
         except subprocess.CalledProcessError as e:
             msg = (e.output or b"").decode("utf-8", "ignore")
-            log.error("Updater fallo: rc=%s out=%s", e.returncode, msg)
+            log.error("Updater falló: rc=%s out=%s", e.returncode, msg)
             try:
                 messagebox.showerror("Actualizaciones",
-                    f"Error: Updater falló (rc={e.returncode}).\n{msg}")
+                                     f"Error: Updater falló (rc={e.returncode}).\n{msg}")
             except Exception:
                 pass
         except Exception as e:
             log.error("Updater sin salida: %s", e, exc_info=True)
             try:
                 messagebox.showerror("Actualizaciones",
-                    f"Error: Updater sin salida ({type(e).__name__}: {e}).")
+                                     f"Error: Updater sin salida ({type(e).__name__}: {e}).")
             except Exception:
                 pass
 
     threading.Thread(target=_run, daemon=True).start()
-
 
 
 # ---------------- Enforcement helper ----------------------------------------
