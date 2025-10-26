@@ -1,10 +1,10 @@
-psutil==5.9.8
-bcrypt==4.1.3
-Pillow>=10.3
-setproctitle==1.3.7
+psutil
+bcrypt
+Pillow
+setproctitle
 
 # Solo Windows:
-winsdk==1.0.0b10; platform_system == "Windows"
-pywin32==311; platform_system == "Windows"
-win10toast==0.9; platform_system == "Windows"
-winotify==1.1.0; platform_system == "Windows"
+winsdk; platform_system == "Windows"
+pywin32; platform_system == "Windows"
+win10toast; platform_system == "Windows"
+winotify; platform_system == "Windows"

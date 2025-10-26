@@ -65,46 +65,111 @@ def _read_version():
 APP_VERSION = _read_version()
 
 # ---------------- Auto-check de updates (no bloqueante) ---------------------
-def _auto_check_updates_once(root_widget: tk.Tk):
+def _find_install_root_from(here: Path) -> Path | None:
     """
-    Lanza updater.py para consultar si hay update. Si lo hay, ofrece aplicar.
-    No bloquea la UI; usa un thread daemon.
+    Sube hasta 5 niveles buscando una carpeta que contenga updater.py o VERSION.
+    Devuelve la ruta o None si no se encuentra.
     """
+    p = here
+    for _ in range(6):
+        if (p / "updater.py").exists() or (p / "VERSION").exists():
+            return p
+        if p.parent == p:
+            break
+        p = p.parent
+    return None
+
+def _auto_check_updates_once(root):
+    """
+    Comprueba si hay una versión nueva usando updater.py y ofrece aplicar la actualización.
+    No bloquea la UI (usa un thread).
+    """
+    def _find_install_and_updater():
+        from pathlib import Path
+        import os
+        import sys  # noqa: F401
+        # 1) Preferir lo que nos diga el instalador
+        inst = os.environ.get("XH_INSTALL_DIR", "").strip()
+        if inst:
+            base = Path(inst)
+            up = base / "updater.py"
+            pyw = base / "venv" / "Scripts" / "pythonw.exe"
+            if up.exists():
+                return base, up, (pyw if pyw.exists() else None)
+
+        # 2) Relativo al paquete (xiao_gui/app.py -> …/updater.py)
+        try:
+            base = Path(__file__).resolve().parents[1]
+            up = base / "updater.py"
+            pyw = base / "venv" / "Scripts" / "pythonw.exe"
+            if up.exists():
+                return base, up, (pyw if pyw.exists() else None)
+        except Exception:
+            pass
+
+        # 3) Último intento: cwd
+        base = Path.cwd()
+        up = base / "updater.py"
+        pyw = base / "venv" / "Scripts" / "pythonw.exe"
+        return base, up, (pyw if pyw.exists() else None)
+
     def _run():
         try:
-            up = str(Path(__file__).resolve().parents[1] / "updater.py")
-            # El updater imprime JSON sin flags; ignorará flags desconocidos si los hubiera.
-            out = subprocess.check_output([sys.executable, up], stderr=subprocess.STDOUT, timeout=300)
+            base, up, pyw = _find_install_and_updater()
+            if not up.exists():
+                log.warning("Updater no encontrado en: %s", up)
+                return
+
+            # Elegir intérprete: el actual o el del venv si detectamos que no estamos en él
+            exe = sys.executable
+            try:
+                # Si el actual no es nuestro venv y tenemos pythonw del venv, úsalo
+                if ("\\XiaoHackParental\\venv\\Scripts\\" not in exe.replace("/", "\\")
+                    and pyw and pyw.exists()):
+                    exe = str(pyw)
+            except Exception:
+                pass
+
+            log.info("Lanzando updater: exe=%s, script=%s", exe, up)
+            out = subprocess.check_output([exe, str(up), "--check"],
+                                          stderr=subprocess.STDOUT, timeout=300)
             res = json.loads(out.decode("utf-8", "ignore"))
             if res.get("update_available"):
                 latest = res.get("latest") or "desconocida"
-
                 def _apply():
                     try:
-                        subprocess.check_call([sys.executable, up, "--apply"])
+                        subprocess.check_call([exe, str(up), "--apply"])
                         messagebox.showinfo(
                             "Actualización",
-                            "Actualización instalada correctamente.\nReinicia el Panel para ver los cambios.",
-                            parent=root_widget
+                            "Actualización instalada correctamente.\nReinicia el Panel para ver los cambios."
                         )
                     except Exception as e:
-                        messagebox.showerror("Actualización", f"No se pudo actualizar:\n{e}", parent=root_widget)
-
-                def _ask():
-                    if messagebox.askyesno(
+                        messagebox.showerror("Actualización", f"No se pudo actualizar:\n{e}")
+                root.after(0, lambda: (
+                    messagebox.askyesno(
                         "Actualización disponible",
-                        f"Hay una nueva versión {latest}.\n¿Quieres instalarla ahora?",
-                        parent=root_widget
-                    ):
-                        _apply()
+                        f"Hay una nueva versión {latest}.\n¿Quieres instalarla ahora?"
+                    ) and _apply()
+                ))
+        except subprocess.CalledProcessError as e:
+            msg = (e.output or b"").decode("utf-8", "ignore")
+            log.error("Updater fallo: rc=%s out=%s", e.returncode, msg)
+            try:
+                messagebox.showerror("Actualizaciones",
+                    f"Error: Updater falló (rc={e.returncode}).\n{msg}")
+            except Exception:
+                pass
+        except Exception as e:
+            log.error("Updater sin salida: %s", e, exc_info=True)
+            try:
+                messagebox.showerror("Actualizaciones",
+                    f"Error: Updater sin salida ({type(e).__name__}: {e}).")
+            except Exception:
+                pass
 
-                root_widget.after(0, _ask)
-        except Exception:
-            # Silencioso: nunca romper la UI por el updater
-            pass
+    threading.Thread(target=_run, daemon=True).start()
 
-    t = threading.Thread(target=_run, daemon=True, name="UpdaterCheck")
-    t.start()
+
 
 # ---------------- Enforcement helper ----------------------------------------
 def _compute_enforcement(cfg, st, *, allowed: bool):
