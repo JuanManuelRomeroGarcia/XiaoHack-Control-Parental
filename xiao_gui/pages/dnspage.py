@@ -5,7 +5,7 @@ import importlib
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from logs import get_logger
+from app.logs import get_logger
 from utils.async_tasks import TaskGate, submit_limited
 
 log = get_logger("gui.dns")
@@ -51,26 +51,19 @@ class DNSPage(ttk.Frame):
 
     # ----------------- Lazy imports -----------------
     def _lazy_dns(self):
-        """Importa dnsconfig cuando sea necesario (hilo worker)."""
         if self._dns_mod is None:
-            try:
-                self._dns_mod = importlib.import_module("dnsconfig")
-                log.debug("dnsconfig importado en diferido")
-            except Exception as e:
-                log.error("No se pudo importar dnsconfig: %s", e, exc_info=True)
-                raise
+            self._dns_mod = importlib.import_module("app.dnsconfig")
         return self._dns_mod
 
     def _lazy_brave(self):
-        """Importa braveconfig cuando sea necesario (hilo worker)."""
         if self._brave_mod is None:
-            try:
-                self._brave_mod = importlib.import_module("braveconfig")
-                log.debug("braveconfig importado en diferido")
-            except Exception as e:
-                log.error("No se pudo importar braveconfig: %s", e, exc_info=True)
-                raise
+            self._brave_mod = importlib.import_module("app.braveconfig")
         return self._brave_mod
+
+    def _lazy_chrome(self):
+        if not hasattr(self, "_chrome_mod"):
+            self._chrome_mod = importlib.import_module("app.chromeconfig")
+        return self._chrome_mod
 
     # ----------------- Hooks -----------------
     def on_show_async(self, rev=None):
@@ -83,6 +76,7 @@ class DNSPage(ttk.Frame):
                 self._task_reload_adapters(True, rev)
                 self._task_refresh_dns_status(rev)
                 self._task_refresh_brave_status(rev)
+                self._task_refresh_chrome_status(rev)
                 self._task_sync_mode_from_system(rev)
             except Exception as e:
                 log.error("Pipeline DNSPage falló: %s", e, exc_info=True)
@@ -193,6 +187,35 @@ class DNSPage(ttk.Frame):
 
         self.lbl_brave_status = ttk.Label(lf_brave, text="Estado DoH Brave: leyendo…", style="StatusMuted.TLabel")
         self.lbl_brave_status.grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        
+        # --- Chrome ---
+        lf_chr = ttk.LabelFrame(self, text="Google Chrome (DNS seguro / DoH)")
+        lf_chr.grid(row=6, column=0, sticky="ew", **pad)
+        lf_chr.columnconfigure(1, weight=1)
+
+        self.var_chrome_mode = tk.StringVar(value="off")
+        ttk.Radiobutton(lf_chr, text="Desactivar DoH", value="off", variable=self.var_chrome_mode).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(lf_chr, text="Usar DoH familiar", value="provider", variable=self.var_chrome_mode).grid(row=1, column=0, sticky="w")
+
+        self.cmb_doh_chrome = ttk.Combobox(lf_chr, values=list(DOH_TEMPLATES.keys()), state="readonly", width=40)
+        self.cmb_doh_chrome.set("CleanBrowsing Family (DoH)")
+        self.cmb_doh_chrome.grid(row=1, column=1, sticky="w", padx=(8, 0))
+
+        scf2 = ttk.Frame(lf_chr)
+        scf2.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(scf2, text="Ámbito:").grid(row=0, column=0, sticky="w")
+        self.cmb_scope_chrome = ttk.Combobox(scf2, values=["Usuario (HKCU)", "Equipo (HKLM)", "Ambos"], state="readonly", width=18)
+        self.cmb_scope_chrome.set("Ambos")
+        self.cmb_scope_chrome.grid(row=0, column=1, sticky="w", padx=(6, 0))
+
+        btn_chr = ttk.Frame(lf_chr)
+        btn_chr.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Button(btn_chr, text="Aplicar en Chrome", command=self._apply_chrome).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(btn_chr, text="Quitar política", command=self._clear_chrome).grid(row=0, column=1, padx=(0, 6))
+
+        self.lbl_chrome_status = ttk.Label(lf_chr, text="Estado DoH Chrome: leyendo…", style="StatusMuted.TLabel")
+        self.lbl_chrome_status.grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
 
 
     # --------------- Acciones DNS -----------------
@@ -221,7 +244,7 @@ class DNSPage(ttk.Frame):
     def _apply_brave_status_to_label(self, st: dict):
         """Pinta el estado en la etiqueta con texto claro y estilo (color)."""
         try:
-            from braveconfig import summarize_brave_status_plain
+            from app.braveconfig import summarize_brave_status_plain
             text, kind = summarize_brave_status_plain(st)  # ('Protección familiar activa (CleanBrowsing Family)', 'ok')
         except Exception:
             text, kind = "No configurado (sin política)", "unset"
@@ -357,7 +380,7 @@ class DNSPage(ttk.Frame):
                     
                 # 🔄 Actualiza estado DoH inmediatamente
                 try:
-                    from braveconfig import get_brave_doh_status
+                    from app.braveconfig import get_brave_doh_status
                     st = get_brave_doh_status(force=True)
                     self._apply_brave_status_to_label(st)
                 except Exception as e:
@@ -392,7 +415,7 @@ class DNSPage(ttk.Frame):
                 
                 # 🔄 Actualiza estado DoH inmediatamente
                 try:
-                    from braveconfig import get_brave_doh_status
+                    from app.braveconfig import get_brave_doh_status
                     st = get_brave_doh_status(force=True)
                     self._apply_brave_status_to_label(st)
                 except Exception as e:
@@ -402,6 +425,90 @@ class DNSPage(ttk.Frame):
 
             self.after(0, _post)
         submit_limited(_work)
+        
+        # --------------- Acciones Chrome -----------------
+        
+    def _apply_chrome_status_to_label(self, st: dict):
+        try:
+            from app.chromeconfig import summarize_chrome_status_plain
+            text, kind = summarize_chrome_status_plain(st)
+        except Exception:
+            text, kind = "No configurado (sin política)", "unset"
+        style_map = {
+            "ok": "StatusOk.TLabel",
+            "off": "StatusErr.TLabel",
+            "auto": "StatusWarn.TLabel",
+            "unset": "StatusMuted.TLabel",
+            "unknown": "StatusWarn.TLabel",
+        }
+        self.lbl_chrome_status.configure(
+            text=f"Estado DoH Chrome: {text}",
+            style=style_map.get(kind, "StatusMuted.TLabel"),
+        )
+
+    def _apply_chrome(self):
+        mode = self.var_chrome_mode.get()
+        scope_txt = self.cmb_scope_chrome.get()
+        scope = "BOTH" if "Ambos" in scope_txt else ("HKLM" if "Equipo" in scope_txt else "HKCU")
+        tmpl_key = self.cmb_doh_chrome.get()
+        log.info("Aplicando política Chrome (mode=%s, scope=%s, template=%s)", mode, scope, tmpl_key)
+
+        def _work():
+            try:
+                chrome = self._lazy_chrome()
+                ok, _ = (chrome.set_chrome_doh_off(scope) if mode == "off"
+                        else chrome.set_chrome_doh_provider(DOH_TEMPLATES.get(tmpl_key), scope))
+            except Exception as e:
+                ok = False
+                log.error("Error aplicando política Chrome: %s", e, exc_info=True)
+            def _post():
+                if not self.winfo_exists():
+                    return
+                if ok:
+                    messagebox.showinfo("Chrome", "Política aplicada. Reinicia Chrome.")
+                else:
+                    messagebox.showerror("Chrome", "Error al aplicar la política.")
+                # refrescar estado
+                try:
+                    from app.chromeconfig import get_chrome_doh_status
+                    st = get_chrome_doh_status(force=True)
+                    self._apply_chrome_status_to_label(st)
+                except Exception as e:
+                    log.error("Error actualizando estado Chrome: %s", e)
+                self._refresh_chrome_status_async()
+            self.after(0, _post)
+        submit_limited(_work)
+
+    def _clear_chrome(self):
+        scope_txt = self.cmb_scope_chrome.get()
+        scope = "BOTH" if "Ambos" in scope_txt else ("HKLM" if "Equipo" in scope_txt else "HKCU")
+        log.info("Eliminando política Chrome (%s)", scope)
+
+        def _work():
+            try:
+                chrome = self._lazy_chrome()
+                ok, _ = chrome.clear_chrome_policy(scope)
+            except Exception as e:
+                ok = False
+                log.error("Error eliminando política Chrome: %s", e, exc_info=True)
+            def _post():
+                if not self.winfo_exists():
+                    return
+                if ok:
+                    messagebox.showinfo("Chrome", "Política eliminada. Reinicia Chrome.")
+                else:
+                    messagebox.showerror("Chrome", "Error al eliminar la política.")
+                # refrescar estado
+                try:
+                    from app.chromeconfig import get_chrome_doh_status
+                    st = get_chrome_doh_status(force=True)
+                    self._apply_chrome_status_to_label(st)
+                except Exception as e:
+                    log.error("Error actualizando estado Chrome: %s", e)
+                self._refresh_chrome_status_async()
+            self.after(0, _post)
+        submit_limited(_work)
+
 
     # --------------- Tareas async (helpers) -----------------
     def _task_reload_adapters(self, include_all: bool, rev: int):
@@ -484,6 +591,39 @@ class DNSPage(ttk.Frame):
                 if self.winfo_exists():
                     self.lbl_brave_status.config(text="Estado DoH Brave: error al leer.")
             self.after(0, _post)
+            
+    def _task_refresh_chrome_status(self, rev: int):
+        try:
+            chrome = self._lazy_chrome()
+            st = chrome.get_chrome_doh_status() or {}
+            def _post():
+                if not self.winfo_exists() or not self._gate.is_current(rev):
+                    return
+                self._apply_chrome_status_to_label(st)
+                mode = (st.get("mode") or "unset").lower()
+                tmpl = (st.get("templates") or "")
+                if mode == "secure":
+                    self.var_chrome_mode.set("provider")
+                    for k, v in DOH_TEMPLATES.items():
+                        if v.lower() in tmpl.lower():
+                            try:
+                                self.cmb_doh_chrome.set(k)
+                            except Exception:
+                                pass
+                            break
+                elif mode == "off":
+                    self.var_chrome_mode.set("off")
+                else:
+                    self.var_chrome_mode.set("off")
+            self.after(0, _post)
+        except Exception as e:
+            log.error("Error leyendo estado Chrome: %s", e, exc_info=True)
+            self.after(0, lambda: self.lbl_chrome_status.config(text="Estado DoH Chrome: error al leer."))
+
+    def _refresh_chrome_status_async(self):
+        rev = self._gate.next_rev()
+        submit_limited(self._task_refresh_chrome_status, rev)
+
 
     def _task_sync_mode_from_system(self, rev: int):
         """

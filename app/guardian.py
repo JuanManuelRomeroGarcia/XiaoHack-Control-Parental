@@ -17,17 +17,17 @@ from urllib.request import url2pathname
 
 import psutil  # type: ignore
 
-from notifier import WM_CLOSE
-from webfilter import ensure_hosts_rules, remove_parental_block
-from logger import AuditLogger
-from logs import get_logger, install_exception_hooks
+from app.notifier import WM_CLOSE
+from app.webfilter import ensure_hosts_rules, remove_parental_block
+from app.audit import AuditLogger
+from app.logs import get_logger, install_exception_hooks
 # ⚠️ Usamos ProgramData (rutas compartidas) desde storage:
-from storage import (
+from app.storage import (
     load_config, load_state, now_epoch,
     DB_PATH, LOGS_DIR, save_state
 )
 
-from scheduler import check_playtime_alerts, remaining_play_seconds, is_within_allowed_hours  # ← nuevo
+from app.scheduler import check_playtime_alerts, remaining_play_seconds, is_within_allowed_hours  # ← nuevo
 # == Opcionales (pywin32). Si faltan, seguimos en modo polling.
 try:
     import pythoncom  # type: ignore
@@ -37,26 +37,15 @@ try:
 except Exception:
     pythoncom = win32com = win32gui = win32process = None
 
-# --- Identidad de proceso XiaoHack -------------------------------------------
+# --- Identidad de proceso XiaoHack (centralizado) ---
 import sys
-XH_ROLE = None
-try:
-    if "--xh-role" in sys.argv:
-        i = sys.argv.index("--xh-role")
-        if i + 1 < len(sys.argv):
-            XH_ROLE = sys.argv[i + 1]
-except Exception:
-    XH_ROLE = None
+from utils.runtime import parse_role, set_process_title, set_appusermodelid
 
-# Nombre “bonito” del proceso (si está disponible setproctitle)
-try:
-    import setproctitle  # type: ignore
-    title = f"XiaoHack-{XH_ROLE}" if XH_ROLE else "XiaoHack"
-    setproctitle.setproctitle(title)
-except Exception:
-    pass
+XH_ROLE = parse_role(sys.argv) or "guardian"
+set_appusermodelid("XiaoHack.Parental.Guardian")
+set_process_title(XH_ROLE)
 
-# Log útil al arrancar
+# Log útil al arrancar (root)
 try:
     import logging
     logging.getLogger().info("XiaoHack process started (role=%s)", XH_ROLE)

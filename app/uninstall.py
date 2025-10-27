@@ -19,7 +19,7 @@ except Exception:
 
 # --- logging básico (usa logs.py si está) ---
 try:
-    from logs import configure, get_logger, install_exception_hooks
+    from app.logs import configure, get_logger, install_exception_hooks
     configure(level="INFO")
     install_exception_hooks("uninstall-crash")
     log = get_logger("xh.uninstall")
@@ -171,7 +171,7 @@ def safe_rmtree(path: Path, retries=8, delay=0.8) -> bool:
 
 def revert_hosts_if_possible():
     try:
-        from webfilter import remove_parental_block
+        from app.webfilter import remove_parental_block
         removed = remove_parental_block()
         log.info("Bloque parental %s.", "eliminado" if removed else "no presente")
         return
@@ -201,6 +201,7 @@ def remove_shortcuts():
         PROGRAMS_COMMON / "XiaoHack" / "Desinstalar XiaoHack.lnk",
         # Startup (por compat)
         COMMON_START / "XiaoHack Notifier.lnk",
+        COMMON_START / "XiaoHackParental Notifier.lnk",
     ]:
         try:
             lnk.unlink(missing_ok=True)
@@ -212,6 +213,85 @@ def remove_shortcuts():
             LNK_MENU_DIR.rmdir()
     except Exception:
         pass
+    
+def restore_dns_auto():
+    """
+    Devuelve los DNS a automático (DHCP) para todas las interfaces.
+    Intenta vía app.dnsconfig; si no está disponible, usa PowerShell.
+    """
+    try:
+        from app.dnsconfig import set_dns_auto
+        ok, msg = set_dns_auto(interface_alias=None)  # None => todas (en nuestra impl)
+        log.info("[dns] Auto via app.dnsconfig: %s", msg or ("OK" if ok else ""))
+        return
+    except Exception as e:
+        log.info("[dns] app.dnsconfig no disponible (%s). Usando fallback PS…", e)
+
+    ps = r'''
+$ifaces = Get-DnsClient | Where-Object { $_.AddressFamily -in ('IPv4','IPv6') }
+foreach ($i in $ifaces) {
+  try {
+    Set-DnsClientServerAddress -InterfaceIndex $i.InterfaceIndex -ResetServerAddresses -ErrorAction Stop
+  } catch { }
+}
+"OK"
+'''
+    try:
+        cp = subprocess.run(["PowerShell","-NoProfile","-ExecutionPolicy","Bypass","-Command", ps],
+                            capture_output=True, text=True)
+        log.info("[dns] Auto (fallback PS) rc=%s out=%s err=%s", cp.returncode, (cp.stdout or "").strip(), (cp.stderr or "").strip())
+    except Exception as e:
+        log.warning("[dns] Fallback PS error: %s", e)
+
+
+def clear_doh_policies():
+    """
+    Quita políticas DoH de Brave y Chrome (HKCU/HKLM).
+    Primero intenta nuestras APIs; si no, hace fallback por registro.
+    """
+    # 1) APIs si están
+    tried_any = False
+    try:
+        from app.braveconfig import clear_brave_policy
+        ok, msg = clear_brave_policy(scope="BOTH")
+        log.info("[doh] Brave clear via API: %s", msg or ("OK" if ok else ""))
+        tried_any = True
+    except Exception as e:
+        log.info("[doh] braveconfig no disponible (%s).", e)
+
+    try:
+        from app.chromeconfig import clear_chrome_policy
+        ok, msg = clear_chrome_policy(scope="BOTH")
+        log.info("[doh] Chrome clear via API: %s", msg or ("OK" if ok else ""))
+        tried_any = True
+    except Exception as e:
+        log.info("[doh] chromeconfig no disponible (%s).", e)
+
+    if tried_any:
+        return
+
+    # 2) Fallback por registro (HKCU/HKLM)
+    ps = r'''
+$paths = @(
+ 'HKCU:\Software\Policies\Google\Chrome',
+ 'HKLM:\SOFTWARE\Policies\Google\Chrome',
+ 'HKCU:\Software\Policies\BraveSoftware\Brave',
+ 'HKLM:\SOFTWARE\Policies\BraveSoftware\Brave'
+)
+foreach ($p in $paths) {
+  try { New-Item -Path $p -Force | Out-Null } catch {}
+  foreach ($n in @('DnsOverHttpsMode','DnsOverHttpsTemplates','BuiltInDnsClientEnabled')) {
+    try { Remove-ItemProperty -Path $p -Name $n -ErrorAction SilentlyContinue } catch {}
+  }
+}
+"OK"
+'''
+    try:
+        cp = subprocess.run(["PowerShell","-NoProfile","-ExecutionPolicy","Bypass","-Command", ps],
+                            capture_output=True, text=True)
+        log.info("[doh] Fallback PS rc=%s out=%s err=%s", cp.returncode, (cp.stdout or "").strip(), (cp.stderr or "").strip())
+    except Exception as e:
+        log.warning("[doh] Fallback PS error: %s", e)  
 
 # --------- cierre de procesos con exclusión del propio desinstalador ----------
 SELF_PID = os.getpid()
@@ -401,6 +481,14 @@ def gui_main():
             "Se ha eliminado el contenido principal.\n"
             "Al cerrar esta ventana, se completará la limpieza final (incluye ProgramData y LocalAppData)."
         )
+        status.set("Limpiando políticas DoH (Brave/Chrome)…")
+        root.update_idletasks()
+        clear_doh_policies()
+
+        status.set("Restaurando DNS a automático…")
+        root.update_idletasks()
+        restore_dns_auto()
+
         status.set("Fase 1 lista. Al cerrar se completará la limpieza final.")
 
     def on_close():
@@ -466,6 +554,13 @@ def console_main():
 
     print("Eliminando accesos…")
     remove_shortcuts()
+    
+    print("Limpiando políticas DoH (Brave/Chrome)…")
+    clear_doh_policies()
+
+    print("Restaurando DNS a automático…")
+    restore_dns_auto()
+
 
     print("Borrando contenido (fase 1)…")
     root_dir = Path(install_path)

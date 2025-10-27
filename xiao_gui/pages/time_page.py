@@ -1,4 +1,4 @@
-# xiao_gui/pages/time_page.py — Pestaña "Tiempo de juego" (COMPLETO)
+# xiao_gui/pages/time_page.py — Pestaña "Tiempo de juego"
 from __future__ import annotations
 import re
 import tkinter as tk
@@ -6,12 +6,26 @@ from tkinter import ttk, messagebox
 from datetime import datetime
 from typing import List
 
-from storage import load_state, save_state, now_epoch, load_config, save_config
-from scheduler import is_play_allowed, build_example_schedules
-from logs import get_logger
-from utils.tk_safe import after_safe
+from app.logs import get_logger
+from app.storage import load_state, save_state, now_epoch, load_config, save_config
 
-# TaskGate: control de concurrencia (no bloquear UI)
+# --- scheduler: soporta app.scheduler y fallback a scheduler de raíz ---
+try:
+    from app.scheduler import is_play_allowed, build_example_schedules
+except Exception:
+    from scheduler import is_play_allowed, build_example_schedules  # type: ignore
+
+# --- after_safe fallback ---
+try:
+    from utils.tk_safe import after_safe  # asegura after() si el widget ya no existe
+except Exception:
+    def after_safe(widget, ms, fn):
+        try:
+            widget.after(ms, fn)
+        except Exception:
+            pass
+
+# --- TaskGate: control de concurrencia sin bloquear la UI ---
 try:
     from utils.async_tasks import TaskGate, submit_limited
 except Exception:
@@ -28,7 +42,8 @@ except Exception:
 log = get_logger("gui.time")
 
 DAYS_ORDER  = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-DAYS_LABELS = {"mon": "Lun", "tue": "Mar", "wed": "Mié", "thu": "Jue", "fri": "Vie", "sat": "Sáb", "sun": "Dom"}
+DAYS_LABELS = {"mon": "Lun", "tue": "Mar", "wed": "Mié", "thu": "Jue",
+               "fri": "Vie", "sat": "Sáb", "sun": "Dom"}
 TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 import weakref
 from typing import Optional, Callable
-from logs import get_logger
+from app.logs import get_logger
 
 log = get_logger("gui.prof")
 
@@ -40,6 +40,16 @@ class UILagProbe:
         self._ema = None
         self._max = 0.0
         self._running = False
+        
+                # Auto-stop si destruyen la raíz (evita after() sobre widget muerto)
+        try:
+            r = self._root_ref()
+            if r is not None:
+                # add='+' para no pisar otros handlers del caller
+                r.bind("<Destroy>", lambda e: self.stop(), add="+")
+        except Exception:
+            pass
+
 
     # --------------------------
     # API pública
@@ -116,6 +126,18 @@ class UILagProbe:
 
         # Reprogramar siguiente tick
         self._schedule_next()
+        
+    def get_metrics(self) -> tuple[float, float, float]:
+        """Devuelve (dt_ms_último, ema_ms, pico_ms)."""
+        last = (time.perf_counter() - self._last) * 1000.0  # aproximado al instante
+        ema = float(self._ema if self._ema is not None else 0.0)
+        return (max(0.0, last), ema, float(self._max))
+
+    def reset_metrics(self) -> None:
+        """Resetea EMA y pico (útil tras un spike inicial)."""
+        self._ema = None
+        self._max = 0.0
+  
 
 
 # ---------------------- Compat API (drop-in) ----------------------

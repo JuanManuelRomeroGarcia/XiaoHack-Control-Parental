@@ -1,18 +1,27 @@
-# xiao_gui/icon_manager.py — gestor de iconos (assets / heurística / EXE)
+# xiao_gui/icon_manager.py — gestor de iconos (assets / heurística / EXE / app.ico)
 from __future__ import annotations
 
 import os
 import math
 import base64
 import io
+from pathlib import Path
 import tkinter as tk
-from test_app.utils import ASSETS
-from logs import get_logger
+from app.logs import get_logger
 
 log = get_logger("gui.icons")
 
+# ---------------------------------------------------------------------
+# Rutas de assets (sin depender de test_app.utils)
+# ---------------------------------------------------------------------
+RUNTIME_ROOT = Path(__file__).resolve().parents[1]  # carpeta raíz del runtime (…/XiaoHackParental)
+ASSETS = RUNTIME_ROOT / "assets"
 ICONS_DIR = ASSETS / "icons"
+ICON_APP = ASSETS / "app_icon.ico"  # icono general de la app (fallback extra)
 
+# ---------------------------------------------------------------------
+# Heurística por nombre
+# ---------------------------------------------------------------------
 KNOWN_ICON_MAP = {
     "discord.exe": "discord",
     "steam.exe": "steam",
@@ -28,15 +37,16 @@ KNOWN_ICON_MAP = {
     "msedge.exe": "edge",
 }
 
-# Opcional: PIL para convertir el icono del .exe a PNG en memoria
+# ---------------------------------------------------------------------
+# Dependencias opcionales
+# ---------------------------------------------------------------------
 try:
     from PIL import Image
     _HAS_PIL = True
 except Exception:
     _HAS_PIL = False
-    log.debug("Pillow no disponible: no se extraerán iconos desde .exe")
+    log.debug("Pillow no disponible: no se extraerán/convertirán iconos .ico/.exe")
 
-# Windows APIs (solo si estamos en Windows)
 _IS_WIN = (os.name == "nt")
 if _IS_WIN:
     try:
@@ -56,7 +66,6 @@ if _IS_WIN:
                 ("szTypeName", wintypes.WCHAR * 80),
             ]
 
-        # GDI
         class BITMAP(ctypes.Structure):
             _fields_ = [
                 ("bmType", ctypes.c_long),
@@ -111,10 +120,9 @@ if _IS_WIN:
         _IS_WIN = False
         log.warning("APIs Win32 no disponibles: %s", e)
 
-
 class IconManager:
     def __init__(self):
-        # cache por clave: "<nombre|ruta>@<alto>"
+        # cache por clave: "<origen>@<alto>"
         self.cache: dict[str, tk.PhotoImage] = {}
 
     def clear_cache(self):
@@ -122,20 +130,11 @@ class IconManager:
         self.cache.clear()
         log.debug("Cache de iconos vaciada")
 
-    # -------------------- Carga desde assets (PNG) --------------------
-    def _load_scaled_png(self, name: str, max_h: int) -> tk.PhotoImage | None:
-        """
-        Carga assets/icons/<name>.png y lo reescala con subsample
-        para que NO supere max_h px de alto (evita iconos gigantes).
-        """
-        key = f"asset:{name.lower().strip()}@{int(max_h)}"
+    # -------------------- util: escalado PhotoImage desde PNG --------------------
+    def _load_scaled_png(self, path: Path, key: str, max_h: int) -> tk.PhotoImage | None:
         if key in self.cache:
-            log.debug("icon cache hit: %s", key)
             return self.cache[key]
-
-        path = ICONS_DIR / f"{name}.png"
         if not path.exists():
-            log.debug("asset no encontrado: %s", path)
             return None
         try:
             img = tk.PhotoImage(file=str(path))
@@ -143,38 +142,74 @@ class IconManager:
             if h > max_h:
                 factor = max(1, math.ceil(h / max_h))
                 img = img.subsample(factor, factor)
-                log.debug("scaled asset %s → factor=%d (h=%d→<=%d)", name, factor, h, max_h)
             self.cache[key] = img
             return img
         except Exception as e:
-            log.warning("Error cargando asset %s: %s", path, e)
+            log.warning("Error cargando PNG %s: %s", path, e)
             return None
 
-    # -------------------- Carga desde .exe (Windows) --------------------
+    # -------------------- assets/icons/<name>.png --------------------
+    def _asset_icon(self, name: str, max_h: int) -> tk.PhotoImage | None:
+        name = name.lower().strip()
+        key = f"asset:{name}@{int(max_h)}"
+        return self._load_scaled_png(ICONS_DIR / f"{name}.png", key, max_h)
+
+    # -------------------- assets/app_icon.ico (fallback global) --------------------
+    def _app_ico(self, max_h: int) -> tk.PhotoImage | None:
+        """
+        Carga assets/app_icon.ico como PhotoImage.
+        Tk no carga ICO directamente; si hay Pillow lo convertimos a PNG en memoria.
+        """
+        key = f"appico@{int(max_h)}"
+        if key in self.cache:
+            return self.cache[key]
+        if not ICON_APP.exists():
+            return None
+        if not _HAS_PIL:
+            # sin PIL no podemos convertir ICO → PNG, probamos un PNG genérico
+            return self._asset_icon("exe", max_h)
+        try:
+            im = Image.open(str(ICON_APP))
+            # Elegimos el tamaño más cercano <= max_h
+            if hasattr(im, "n_frames") and im.n_frames > 1:
+                # buscar frame con mayor altura <= max_h
+                best_idx, best_h = 0, 0
+                for i in range(im.n_frames):
+                    im.seek(i)
+                    h = im.size[1]
+                    if h <= max_h and h > best_h:
+                        best_idx, best_h = i, h
+                im.seek(best_idx)
+            if im.height > max_h:
+                ratio = max_h / float(im.height)
+                im = im.resize((max(1, int(im.width * ratio)), max_h), Image.LANCZOS)
+            b = io.BytesIO()
+            im.save(b, format="PNG")
+            b64 = base64.b64encode(b.getvalue()).decode("ascii")
+            img = tk.PhotoImage(data=b64)
+            self.cache[key] = img
+            return img
+        except Exception as e:
+            log.warning("No se pudo cargar app_icon.ico: %s", e)
+            return None
+
+    # -------------------- extracción desde .exe (Windows) --------------------
     def _photoimage_from_exe(self, exe_path: str, max_h: int) -> tk.PhotoImage | None:
-        """
-        Intenta extraer el icono del .exe en Windows y convertirlo a PhotoImage.
-        Requiere Pillow para convertir a PNG en memoria. Si no hay Pillow o algo falla, devuelve None.
-        """
         if not (_IS_WIN and _HAS_PIL):
             return None
         try:
-            # 1) Obtener HICON del archivo
+            # HICON del archivo
             sfi = SHFILEINFO()
             flags = SHGFI_ICON | (SHGFI_SMALLICON if max_h <= 24 else SHGFI_LARGEICON)
             r = SHGetFileInfoW(exe_path, 0, ctypes.byref(sfi), ctypes.sizeof(sfi), flags)
             if r == 0 or not sfi.hIcon:
                 return None
-
             hicon = sfi.hIcon
             try:
-                # 2) Obtener bitmaps del icono
                 ii = ICONINFO()
                 if not GetIconInfo(hicon, ctypes.byref(ii)):
                     return None
-
                 try:
-                    # 3) Leer el HBITMAP color (32bpp BGRA)
                     class BITMAPINFOHEADER(ctypes.Structure):
                         _fields_ = [
                             ("biSize", wintypes.DWORD),
@@ -189,15 +224,12 @@ class IconManager:
                             ("biClrUsed", wintypes.DWORD),
                             ("biClrImportant", wintypes.DWORD),
                         ]
-
                     class BITMAPINFO(ctypes.Structure):
                         _fields_ = [("bmiHeader", BITMAPINFOHEADER),
                                     ("bmiColors", wintypes.DWORD * 3)]
-
                     bm = BITMAP()
                     GetObject(ii.hbmColor, ctypes.sizeof(BITMAP), ctypes.byref(bm))
                     width, height = bm.bmWidth, bm.bmHeight
-
                     BI_RGB = 0
                     DIB_RGB_COLORS = 0
                     bmi = BITMAPINFO()
@@ -207,28 +239,22 @@ class IconManager:
                     bmi.bmiHeader.biPlanes = 1
                     bmi.bmiHeader.biBitCount = 32
                     bmi.bmiHeader.biCompression = BI_RGB
-
                     buf_size = width * height * 4
                     buf = (ctypes.c_ubyte * buf_size)()
-
-                    hdc = CreateCompatibleDC(0)
+                    hdc = gdi32.CreateCompatibleDC(0)
                     try:
                         res = GetDIBits(hdc, ii.hbmColor, 0, height, ctypes.byref(buf), ctypes.byref(bmi), DIB_RGB_COLORS)
                         if res == 0:
                             return None
                     finally:
                         DeleteDC(hdc)
-
                     im = Image.frombuffer("BGRA", (width, height), bytes(buf), "raw", "BGRA", 0, 1)
                     if im.height > max_h:
                         ratio = max_h / float(im.height)
-                        new_w = max(1, int(im.width * ratio))
-                        im = im.resize((new_w, max_h), Image.LANCZOS)
-
+                        im = im.resize((max(1, int(im.width * ratio)), max_h), Image.LANCZOS)
                     b = io.BytesIO()
                     im.save(b, format="PNG")
                     b64 = base64.b64encode(b.getvalue()).decode("ascii")
-                    log.debug("icono extraído de EXE: %s (%dx%d → <=%d)", exe_path, width, height, max_h)
                     return tk.PhotoImage(data=b64)
                 finally:
                     if ii.hbmColor:
@@ -243,35 +269,40 @@ class IconManager:
 
     # -------------------- API pública --------------------
     def icon_for_entry(self, tipo: str, valor: str, max_h: int = 22) -> tk.PhotoImage | None:
-        """Devuelve un PhotoImage adecuado (escalado a max_h)."""
-        # Carpeta → icono de carpeta si lo tienes, si no exe genérico
+        """
+        Devuelve un PhotoImage adecuado (escalado a max_h).
+        Prioridad:
+          1) Si es Ruta → icono real del .exe (Windows+Pillow)
+          2) PNG conocido en assets/icons
+          3) Heurística por nombre → assets/icons
+          4) app_icon.ico global
+          5) 'exe.png' genérico
+        """
+        # Carpeta → icono de carpeta o genérico
         if tipo == "Carpeta":
-            im = self._load_scaled_png("folder", max_h) or self._load_scaled_png("exe", max_h)
-            log.debug("icon Carpeta → %s", "folder" if im else "exe")
-            return im
+            return self._asset_icon("folder", max_h) or self._asset_icon("exe", max_h)
 
-        # Si tenemos RUTA al .exe, intentamos icono real del ejecutable (Windows + PIL)
+        # 1) Icono real del .exe si nos pasan una ruta válida
         if tipo == "Ruta":
             exe_path = os.path.normpath(valor)
             if exe_path.lower().endswith(".exe") and os.path.exists(exe_path):
                 key = f"exe:{exe_path}@{int(max_h)}"
                 if key in self.cache:
-                    log.debug("icon cache hit exe: %s", exe_path)
                     return self.cache[key]
                 img = self._photoimage_from_exe(exe_path, max_h)
                 if img:
                     self.cache[key] = img
                     return img
-            # si no hay ruta válida o falló, seguimos con la heurística por nombre
+            # si falla, seguimos con heurística
 
-        # Heurística por nombre (nombre de exe o cadena)
+        # 2) Mapa de nombres exactos
         base = (os.path.basename(valor) if tipo == "Ruta" else valor).strip().lower()
-
         if base in KNOWN_ICON_MAP:
-            img = self._load_scaled_png(KNOWN_ICON_MAP[base], max_h)
+            img = self._asset_icon(KNOWN_ICON_MAP[base], max_h)
             if img:
                 return img
 
+        # 3) Heurística por substring
         for key, icon in [
             ("discord", "discord"),
             ("steam", "steam"),
@@ -287,13 +318,17 @@ class IconManager:
             ("edge", "edge"),
         ]:
             if key in base:
-                img = self._load_scaled_png(icon, max_h)
+                img = self._asset_icon(icon, max_h)
                 if img:
                     return img
 
-        # Fallback final
-        log.debug("icon fallback 'exe' para: %s (%s)", valor, tipo)
-        return self._load_scaled_png("exe", max_h)
+        # 4) Fallback: icono global de la app (assets/app_icon.ico)
+        appico = self._app_ico(max_h)
+        if appico:
+            return appico
+
+        # 5) Fallback final genérico
+        return self._asset_icon("exe", max_h)
 
     @staticmethod
     def label_for_entry(tipo: str, valor: str) -> str:

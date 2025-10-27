@@ -2,7 +2,7 @@
 import sqlite3
 import time
 from pathlib import Path
-from logs import get_logger
+from app.logs import get_logger
 
 log = get_logger("gui.utils")
 

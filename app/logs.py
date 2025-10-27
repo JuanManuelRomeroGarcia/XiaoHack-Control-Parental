@@ -144,9 +144,9 @@ def _resolve_log_path() -> str:
     Devuelve la ruta del archivo de log asegurando que es escribible.
     Prioridad:
       0) ENV XIAOHACK_LOG_FILE (ruta absoluta)
-      1) <data_dir>/logs/Control.log   (data_dir según reglas de arriba)
-      2) .\logs\Control.log
-      3) .\Control.log
+      1) <data_dir>/logs/control.log   (data_dir según reglas de arriba)
+      2) .\logs\control.log
+      3) .\control.log
     """
     # 0) Ruta directa por ENV
     env = os.getenv("XIAOHACK_LOG_FILE")
@@ -154,7 +154,6 @@ def _resolve_log_path() -> str:
         p = Path(env).expanduser()
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
-            # prueba de apertura
             with p.open("a", encoding="utf-8-sig") as f:
                 f.write(time.strftime("%Y-%m-%d %H:%M:%S") + " [logs] logger-init(env)\n")
             return str(p)
@@ -163,7 +162,7 @@ def _resolve_log_path() -> str:
 
     # 1) Data dir deducido
     try:
-        p = Path(get_logs_dir()) / "Control.log"
+        p = Path(get_logs_dir()) / "control.log"
         with p.open("a", encoding="utf-8-sig") as f:
             f.write(time.strftime("%Y-%m-%d %H:%M:%S") + " [logs] logger-init\n")
         return str(p)
@@ -172,7 +171,7 @@ def _resolve_log_path() -> str:
 
     # 2) y 3) fallback locales
     cwd = Path.cwd()
-    for p in (cwd / "logs" / "Control.log", cwd / "Control.log"):
+    for p in (cwd / "logs" / "control.log", cwd / "control.log"):
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
             with p.open("a", encoding="utf-8-sig") as f:
@@ -181,8 +180,8 @@ def _resolve_log_path() -> str:
         except Exception:
             continue
 
-    # Si todo falla… último recurso:
-    return str(cwd / "Control.log")
+    return str(cwd / "control.log")
+
 
 
 # ==============================================================================
@@ -395,6 +394,14 @@ def log_timing(name: str, logger: Optional[logging.Logger] = None, level: int = 
     finally:
         dt = (time.perf_counter() - t0) * 1000.0
         lg.log(level, "%s: %.2f ms", name, dt)
+        
+# Helpers tipo Path (no rompen API existente de str)
+def get_logs_dir_path() -> Path:
+    return Path(get_logs_dir())
+
+def get_log_file_path() -> Path:
+    return Path(get_log_file())
+
 
 
 # ==============================================================================

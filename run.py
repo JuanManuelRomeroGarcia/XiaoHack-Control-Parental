@@ -1,90 +1,43 @@
 # run.py — lanzador con elevación opcional (UAC) y logging centralizado
 from __future__ import annotations
 import sys
-import ctypes
+import logging
 import traceback
 
 # --- Inicializar logger muy pronto ---
-from logs import configure, get_logger, install_exception_hooks
+from app.logs import configure, get_logger, install_exception_hooks
 
-# --- AppUserModelID para icono en barra de tareas (Windows) ---
+# --- Helpers reutilizables de runtime ---
+from utils.runtime import (
+    parse_role,
+    set_appusermodelid,
+    set_process_title,
+    maybe_elevate,
+)
+
+# --- AppUserModelID (icono barra de tareas) + título del proceso --------------
+XH_ROLE = parse_role(sys.argv) or "panel"
+set_appusermodelid("XiaoHack.Parental.Panel")
+set_process_title(XH_ROLE)
+
+# --- Config de logs del lanzador ----------------------------------------------
+# Permite ajustar nivel vía variable de entorno XH_LOGLEVEL (opcional)
+_log_level = "INFO"
 try:
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("XiaoHack.Parental.Panel")
+    import os
+    _log_level = os.getenv("XH_LOGLEVEL", "INFO").upper()
 except Exception:
     pass
 
-# --- Identidad de proceso XiaoHack -------------------------------------------
-XH_ROLE = None
-try:
-    if "--xh-role" in sys.argv:
-        i = sys.argv.index("--xh-role")
-        if i + 1 < len(sys.argv):
-            XH_ROLE = sys.argv[i + 1]
-except Exception:
-    XH_ROLE = None
-
-# Nombre “bonito” del proceso (si está disponible setproctitle)
-try:
-    import setproctitle  # type: ignore
-    title = f"XiaoHack-{XH_ROLE}" if XH_ROLE else "XiaoHack"
-    setproctitle.setproctitle(title)
-except Exception:
-    pass
-
-# Log útil al arrancar (root)
-try:
-    import logging
-    logging.getLogger().info("XiaoHack process started (role=%s)", XH_ROLE)
-except Exception:
-    pass
-
-# --- Config de logs del lanzador ---
-configure(level="INFO")  # cambia a "DEBUG" si necesitas más detalle
+configure(level=_log_level)  # "INFO" por defecto
 install_exception_hooks("launcher-crash")
 log = get_logger("launcher")
 
-# -----------------------------------------------------------------------------
-# Elevación UAC (opcional)
-# -----------------------------------------------------------------------------
-def _is_admin() -> bool:
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin() != 0
-    except Exception:
-        return False
-
-def _relaunch_elevated(extra_args: list[str] | None = None):
-    """
-    Relanza el proceso con elevación UAC, añadiendo --elevated para evitar bucles.
-    """
-    extra_args = extra_args or []
-    if "--elevated" not in extra_args:
-        extra_args = extra_args + ["--elevated"]
-    params = " ".join(f'"{a}"' for a in (sys.argv + extra_args))
-    exe = sys.executable
-    log.info("Requiere privilegios admin, relanzando con UAC…")
-    log.debug("Exe: %s", exe)
-    log.debug("Params: %s", params)
-    try:
-        ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
-        log.info("ShellExecuteW retornó: %s", ret)
-    except Exception:
-        log.error("Error al relanzar con elevación:\n%s", traceback.format_exc())
-    sys.exit(0)
-
-def _maybe_elevate(require_admin: bool):
-    """
-    Si require_admin=True y no somos admin, relanza con UAC.
-    Evita bucles si ya venimos con --elevated.
-    """
-    if not require_admin:
-        return
-    if "--elevated" in sys.argv:
-        log.info("Ejecutando ya en modo elevado (flag --elevated detectado).")
-        return
-    if _is_admin():
-        log.info("Permisos de administrador confirmados.")
-        return
-    _relaunch_elevated([])
+# Log útil al arrancar (root)
+try:
+    logging.getLogger().info("XiaoHack process started (role=%s)", XH_ROLE)
+except Exception:
+    pass
 
 # -----------------------------------------------------------------------------
 # Ejecución principal
@@ -94,13 +47,14 @@ def main():
     #   --require-admin : fuerza elevación al inicio (escenario mantenimiento/instalación)
     #   --no-elevate    : ignora cualquier intento de elevación (útil para debugging)
     #   --xh-role       : rol (panel/guardian/notifier/etc.) — no obligatorio aquí
-    require_admin = "--require-admin" in {a.lower() for a in sys.argv[1:]}
-    no_elevate    = "--no-elevate" in {a.lower() for a in sys.argv[1:]}
+    argv_lower = {a.lower() for a in sys.argv[1:]}
+    require_admin = "--require-admin" in argv_lower
+    no_elevate    = "--no-elevate" in argv_lower
 
-    log.info("Iniciando lanzador XiaoHack Control Parental… (role=%s)", XH_ROLE or "panel")
+    log.info("Iniciando lanzador XiaoHack Control Parental… (role=%s)", XH_ROLE)
 
     if require_admin and not no_elevate:
-        _maybe_elevate(require_admin=True)
+        maybe_elevate(require_admin=True, argv=sys.argv, logger=log)
     else:
         log.info("Ejecución sin elevación inicial (se elevará SOLO cuando haga falta).")
 
@@ -108,7 +62,7 @@ def main():
         from xiao_gui.app import run
         log.info("Ejecutando aplicación principal (xiao_gui.app.run)")
         # Nota: cualquier operación que requiera admin (p. ej. hosts) debe usar
-        # webfilter.ensure_hosts_rules_or_elevate / remove_parental_block_or_elevate
+        # servicios privilegiados (Guardian SYSTEM) o helpers elevados específicos.
         run()
     except Exception:
         log.error("Error durante la ejecución principal:\n%s", traceback.format_exc())

@@ -1,4 +1,5 @@
-# web.py — Pestaña Web/SafeSearch (tab-safe, sin bloqueos en UI)
+# xiao_gui/pages/web.py — Pestaña Web/SafeSearch (tab-safe, sin bloqueos en UI)
+from __future__ import annotations
 import re
 import sys
 import ctypes
@@ -6,10 +7,9 @@ import webbrowser
 import subprocess
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
-from storage import load_state, save_state
 
-from utils.tk_safe import after_safe
-from webfilter import (
+# webfilter: funciones locales + variantes elevadas si están disponibles
+from app.webfilter import (
     ensure_hosts_rules,
     rollback_hosts,
     remove_parental_block,
@@ -18,8 +18,23 @@ from webfilter import (
     GOOGLE_SAFE_IP, BING_STRICT_IP, YANDEX_FAMILY_IP,
 )
 
+from app.storage import load_state, save_state
+from app.logs import get_logger
+log = get_logger("gui.web")
+
+# after_safe robusto (con fallback)
 try:
-    from webfilter import (
+    from utils.tk_safe import after_safe
+except Exception:
+    def after_safe(widget, ms, fn):
+        try:
+            widget.after(ms, fn)
+        except Exception:
+            pass
+
+
+try:
+    from app.webfilter import (
         ensure_hosts_rules_or_elevate,
         remove_parental_block_or_elevate,
         rollback_hosts_or_elevate,
@@ -28,20 +43,16 @@ except Exception:
     ensure_hosts_rules_or_elevate = ensure_hosts_rules
     remove_parental_block_or_elevate = remove_parental_block
     rollback_hosts_or_elevate = rollback_hosts
-    
-from logs import get_logger
-log = get_logger("gui.web")
 
 # Gate + pool global limitado (evita avalanchas si cambias rápido de pestañas)
 try:
     from utils.async_tasks import TaskGate, submit_limited
 except Exception:
-    # Fallback mínimo por si el helper no está disponible
     from concurrent.futures import ThreadPoolExecutor
     _EXEC = ThreadPoolExecutor(max_workers=2)
     class TaskGate:
         def __init__(self): self._rev = 0
-        def next_rev(self): 
+        def next_rev(self):
             self._rev += 1
             return self._rev
         def is_current(self, rev): return rev == self._rev
@@ -64,13 +75,12 @@ def relaunch_as_admin():
 class WebPage(ttk.Frame):
     def __init__(self, master, cfg: dict, on_save_cfg):
         super().__init__(master)
-        # defaults nuevos:
-        self.cfg = cfg
+        # defaults:
+        self.cfg = cfg or {}
         self.cfg.setdefault("safesearch", False)
         self.cfg.setdefault("block_www", True)
         self.cfg.setdefault("google_tlds", GOOGLE_TLDS.copy())
-        self.cfg.setdefault("domains_enabled", True) 
-
+        self.cfg.setdefault("domains_enabled", True)
 
         self.on_save_cfg = on_save_cfg
         self._dirty = False
@@ -94,7 +104,6 @@ class WebPage(ttk.Frame):
 
     def refresh_lite(self):
         """Gancho ligero por si el app llama antes de on_show_async()."""
-        # Aquí no realizamos IO; mantenemos método por coherencia
         pass
 
     # ---------------- UI ----------------
@@ -133,7 +142,8 @@ class WebPage(ttk.Frame):
 
         ttk.Label(
             lf_safe,
-            text="Requiere ejecutar como Administrador (para escribir en hosts).\nSi el navegador usa DNS seguro/DoH, puede ignorar el hosts local."
+            text="Requiere ejecutar como Administrador (para escribir en hosts).\n"
+                 "Si el navegador usa DNS seguro/DoH, puede ignorar el hosts local."
         ).grid(row=1, column=0, sticky="w", pady=(0, 6))
 
         # --- (3) TLDs de Google ---
@@ -185,13 +195,11 @@ class WebPage(ttk.Frame):
         # --- (5) Dominios bloqueados ---
         lf_blk = ttk.LabelFrame(self, text="Dominios bloqueados (hosts → 0.0.0.0)")
         lf_blk.grid(row=5, column=0, sticky="nsew", **pad)
-        # Este frame crece tanto a lo ancho como a lo alto en pantallas grandes,
-        # y en pantallas pequeñas muestra siempre la barra inferior.
         self.rowconfigure(5, weight=1)
         lf_blk.columnconfigure(0, weight=1)
-        lf_blk.rowconfigure(1, weight=1)  # la lista crece
+        lf_blk.rowconfigure(1, weight=1)
 
-        # NUEVO: switch maestro (fila 0)
+        # Master switch
         self.var_domains_enabled = tk.BooleanVar(value=bool(self.cfg.get("domains_enabled", True)))
         ttk.Checkbutton(
             lf_blk,
@@ -200,7 +208,7 @@ class WebPage(ttk.Frame):
             command=self._mark_dirty
         ).grid(row=0, column=0, sticky="w", pady=(6, 6))
 
-        # Contenedor de lista (fila 1)
+        # Lista de dominios
         wrap = ttk.Frame(lf_blk)
         wrap.grid(row=1, column=0, sticky="nsew")
         wrap.columnconfigure(0, weight=1)
@@ -215,16 +223,14 @@ class WebPage(ttk.Frame):
         vsb.grid(row=0, column=1, sticky="ns")
         self.lst_domains.configure(yscrollcommand=vsb.set)
 
-        # Rellena lista
         for d in self.cfg.get("blocked_domains", []):
             self.lst_domains.insert("end", d)
 
-        # Barra inferior SIEMPRE visible (fila 2)
+        # Barra inferior
         bar = ttk.Frame(lf_blk)
         bar.grid(row=2, column=0, sticky="ew", pady=(6, 4))
         bar.columnconfigure(0, weight=1)
 
-        # Campo de entrada + acciones compactas
         self.ent_d = ttk.Entry(bar)
         self.ent_d.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         self.ent_d.bind("<Return>", lambda e: self._add_domain())
@@ -232,12 +238,10 @@ class WebPage(ttk.Frame):
         btn_add = ttk.Button(bar, text="Añadir", width=10, command=self._add_domain)
         btn_edit = ttk.Button(bar, text="Editar", width=10, command=self._edit_selected)
         btn_del = ttk.Button(bar, text="Eliminar", width=10, command=self._del_selected)
-
         btn_add.grid(row=0, column=1, padx=(0, 4))
         btn_edit.grid(row=0, column=2, padx=(0, 4))
         btn_del.grid(row=0, column=3, padx=(0, 8))
 
-        # Menú “Más…” para importar/exportar
         more = ttk.Menubutton(bar, text="Más…", width=8, direction="below")
         m = tk.Menu(more, tearoff=False)
         m.add_command(label="Importar (TXT)…", command=self._import_domains, accelerator="Ctrl+I")
@@ -245,23 +249,20 @@ class WebPage(ttk.Frame):
         more["menu"] = m
         more.grid(row=0, column=4)
 
-        # Contador (fila 3)
+        # Contador
         bottom = ttk.Frame(lf_blk)
         bottom.grid(row=3, column=0, sticky="w")
         self.lbl_count = ttk.Label(bottom, text="0 dominios")
         self.lbl_count.pack(side="left")
 
-        # Accesibilidad/atajos y señales de “dirty”
+        # Accesibilidad/atajos
         self.lst_domains.bind("<<ListboxSelect>>", lambda e: self._preview_dirty())
         self.ent_d.bind("<FocusOut>", lambda e: self._mark_dirty() if self.ent_d.get().strip() else None)
-
-        # Atajos de teclado
         self.bind_all("<Delete>", lambda e: self._del_selected())
         self.bind_all("<Return>", lambda e: self._edit_selected() if self.lst_domains.curselection() else None)
         self.bind_all("<Control-i>", lambda e: self._import_domains())
         self.bind_all("<Control-e>", lambda e: self._export_domains())
 
-        # Scroll con rueda del ratón en la lista
         def _wheel(event):
             try:
                 delta = event.delta if event.delta else (-120 if event.num == 5 else 120)
@@ -269,14 +270,13 @@ class WebPage(ttk.Frame):
                 return "break"
             except Exception:
                 return None
-        self.lst_domains.bind("<MouseWheel>", _wheel)        # Windows
-        self.lst_domains.bind("<Button-4>", _wheel)          # Linux wheel up
-        self.lst_domains.bind("<Button-5>", _wheel)          # Linux wheel down
+        self.lst_domains.bind("<MouseWheel>", _wheel)
+        self.lst_domains.bind("<Button-4>", _wheel)
+        self.lst_domains.bind("<Button-5>", _wheel)
 
         self._mk_context_menu()
-        self.lst_domains.bind("<<ListboxSelect>>", lambda e: self._preview_dirty())
 
-        # --- (6) Botonera inferior ---
+        # (6) Botonera inferior
         btns = ttk.Frame(self)
         btns.grid(row=6, column=0, sticky="ew", **pad)
         btns.columnconfigure(5, weight=1)
@@ -290,14 +290,13 @@ class WebPage(ttk.Frame):
 
         ttk.Separator(self).grid(row=7, column=0, sticky="ew", padx=10)
 
-        # --- (7) Pruebas rápidas ---
+        # (7) Pruebas rápidas
         test = ttk.Frame(self)
         test.grid(row=8, column=0, sticky="ew", **pad)
         ttk.Label(test, text="Pruebas rápidas:").grid(row=0, column=0, sticky="w")
         ttk.Button(test, text="Abrir Google",  command=lambda: webbrowser.open("https://www.google.com")).grid(row=0, column=1, padx=6)
         ttk.Button(test, text="Abrir YouTube", command=lambda: webbrowser.open("https://www.youtube.com")).grid(row=0, column=2, padx=6)
         ttk.Button(test, text="Abrir Bing",    command=lambda: webbrowser.open("https://www.bing.com")).grid(row=0, column=3, padx=6)
-
 
         self._refresh_count()
         self._refresh_tld_count()
@@ -409,7 +408,7 @@ class WebPage(ttk.Frame):
                             nb._xh_prev_tab = now
                             return
                         else:
-                            nb.select(my_id) 
+                            nb.select(my_id)
                             nb._xh_prev_tab = my_id
                             return
                     elif choice is False:
@@ -484,7 +483,8 @@ class WebPage(ttk.Frame):
         submit_limited(self._task_load_state, rev)
 
     def _save_async(self):
-        """Aplica exactamente lo seleccionado (switches + listas).
+        """
+        Aplica exactamente lo seleccionado (switches + listas).
         - Si ambos quedan desactivados ⇒ state.applied=False y se limpia el hosts (si hay admin).
         - Si alguno está activado ⇒ state.applied=True y se aplica.
         El servicio (SYSTEM) reafirma/limpia según el flag.
@@ -516,7 +516,7 @@ class WebPage(ttk.Frame):
             cp = subprocess.run(["schtasks", "/Run", "/TN", r"XiaoHackParental\Guardian"],
                                 capture_output=True, text=True)
             log.info("schtasks /Run Guardian rc=%s out=%s err=%s",
-                    cp.returncode, (cp.stdout or "").strip(), (cp.stderr or "").strip())
+                     cp.returncode, (cp.stdout or "").strip(), (cp.stderr or "").strip())
         except Exception as e:
             log.warning("No se pudo lanzar la tarea Guardian: %s", e)
 
@@ -545,54 +545,42 @@ class WebPage(ttk.Frame):
                 local_ok, local_err = False, ("ERR", e)
                 log.error("Error aplicar/limpiar hosts: %s", e, exc_info=True)
 
+            # ÚNICO post (el anterior duplicado se elimina)
             def _post():
                 if not self._gate.is_current(rev) or not self.winfo_exists():
                     return
                 self._reload_state_async()
-                if local_ok:
-                    messagebox.showinfo("OK",
-                        ("Aplicado. El servicio lo mantendrá." if will_apply
-                         else "Desactivado. Bloque eliminado; el servicio lo mantendrá limpio."))
-                else:
-                    if local_err and local_err[0] == "PERM":
-                        messagebox.showwarning(
-                            "Permisos",
-                            "Se canceló la elevación o no se concedió permiso.\n"
-                            "Puedes reintentar con ‘Reiniciar como Administrador’."
-                        )
-                    else:
-                        messagebox.showerror("Error",
-                            f"Guardado, pero fallo al tocar el hosts:\n{type(local_err[1]).__name__}: {local_err[1]}")
-            self.after(0, _post)
-
-            def _post():
-                if not self._gate.is_current(rev) or not self.winfo_exists(): 
-                    return
-                self._reload_state_async()
                 if is_admin():
                     if local_ok:
-                        messagebox.showinfo("OK",
-                            ("Aplicado. El servicio lo mantendrá." if will_apply
-                            else "Desactivado. Bloque eliminado; el servicio lo mantendrá limpio."))
+                        messagebox.showinfo(
+                            "OK",
+                            "Aplicado. El servicio lo mantendrá." if will_apply
+                            else "Desactivado. Bloque eliminado; el servicio lo mantendrá limpio."
+                        )
                     else:
                         if local_err and local_err[0] == "PERM":
-                            messagebox.showwarning("Permisos",
-                                "Guardado. El servicio (SYSTEM) aplicará/limpiará en segundos.")
+                            messagebox.showwarning(
+                                "Permisos",
+                                "Guardado. El servicio (SYSTEM) aplicará/limpiará en segundos."
+                            )
                         else:
-                            messagebox.showerror("Error",
-                                f"Guardado, pero fallo local: {type(local_err[1]).__name__}: {local_err[1]}")
+                            messagebox.showerror(
+                                "Error",
+                                f"Guardado, pero fallo local: {type(local_err[1]).__name__}: {local_err[1]}"
+                            )
                 else:
-                    messagebox.showinfo("OK",
-                        "Guardado. El servicio aplicará/limpiará en unos segundos según lo seleccionado.")
+                    messagebox.showinfo(
+                        "OK",
+                        "Guardado. El servicio aplicará/limpiará en unos segundos según lo seleccionado."
+                    )
             self.after(0, _post)
+
         submit_limited(_work)
 
-
-    # (Sincronía para el guard del Notebook: se usa solo en confirmación)
+    # (Sincronía para el guard del Notebook)
     def _save_sync_ui(self) -> bool:
         """Versión síncrona SOLO para el guard del Notebook. No la uses en handlers comunes."""
         try:
-            # Volcar UI → cfg
             self.cfg["safesearch"] = bool(self.var_safe.get())
             self.cfg["blocked_domains"] = list(self.lst_domains.get(0, "end"))
             self.cfg["google_tlds"] = list(self.lst_tlds.get(0, "end"))
@@ -650,7 +638,7 @@ class WebPage(ttk.Frame):
                 # avisar al servicio
                 try:
                     subprocess.run(["schtasks", "/Run", "/TN", r"XiaoHackParental\Guardian"],
-                                capture_output=True, text=True)
+                                   capture_output=True, text=True)
                 except Exception:
                     pass
             except PermissionError as e:
@@ -664,20 +652,22 @@ class WebPage(ttk.Frame):
                     return
                 self._reload_state_async()
                 if ok:
-                    messagebox.showinfo("Listo",
+                    messagebox.showinfo(
+                        "Listo",
                         "Bloque parental eliminado sin alterar el resto del archivo." if ch
-                        else "No se encontró el bloque parental en el hosts.")
+                        else "No se encontró el bloque parental en el hosts."
+                    )
                 else:
                     if err and err[0] == "PERM":
                         messagebox.showwarning("Permisos", "Ejecuta la aplicación como Administrador.")
                     else:
-                        messagebox.showerror("Error",
-                            f"No se pudo eliminar el bloque parental:\n{type(err[1]).__name__}: {err[1]}")
+                        messagebox.showerror(
+                            "Error",
+                            f"No se pudo eliminar el bloque parental:\n{type(err[1]).__name__}: {err[1]}"
+                        )
             self.after(0, _post)
 
         submit_limited(_work)
-
-
 
     def _restore_backup_async(self):
         log.info("Restaurando backup del archivo hosts…")
@@ -700,7 +690,7 @@ class WebPage(ttk.Frame):
                 # avisar al servicio
                 try:
                     subprocess.run(["schtasks", "/Run", "/TN", r"XiaoHackParental\Guardian"],
-                                capture_output=True, text=True)
+                                   capture_output=True, text=True)
                 except Exception:
                     pass
             except PermissionError as e:
@@ -719,12 +709,13 @@ class WebPage(ttk.Frame):
                     if err and err[0] == "PERM":
                         messagebox.showwarning("Permisos", "Ejecuta la aplicación como Administrador.")
                     else:
-                        messagebox.showerror("Error",
-                            f"No se pudo restaurar el backup:\n{type(err[1]).__name__}: {err[1]}")
+                        messagebox.showerror(
+                            "Error",
+                            f"No se pudo restaurar el backup:\n{type(err[1]).__name__}: {err[1]}"
+                        )
             self.after(0, _post)
 
         submit_limited(_work)
-
 
     def _set_applied(self, flag: bool):
         try:
@@ -742,10 +733,9 @@ class WebPage(ttk.Frame):
                 capture_output=True, text=True
             )
             log.info("schtasks /Run Guardian rc=%s out=%s err=%s",
-                    cp.returncode, (cp.stdout or "").strip(), (cp.stderr or "").strip())
+                     cp.returncode, (cp.stdout or "").strip(), (cp.stderr or "").strip())
         except Exception as e:
             log.warning("No se pudo lanzar la tarea Guardian: %s", e)
-
 
     def _flush_dns_async(self):
         log.info("Ejecutando ipconfig /flushdns…")
@@ -757,7 +747,6 @@ class WebPage(ttk.Frame):
                 cp = subprocess.run(["ipconfig", "/flushdns"], capture_output=True, text=True)
                 out = (cp.stdout or "") + (cp.stderr or "")
                 ok = (cp.returncode == 0)
-                log.debug("Resultado flushdns rc=%s", ok)
             except Exception as e:
                 ok = False
                 out = f"{type(e).__name__}: {e}"
@@ -768,9 +757,8 @@ class WebPage(ttk.Frame):
                 self._reload_state_async()
                 messagebox.showinfo("DNS", out.strip() or ("Hecho." if ok else "Comando ejecutado."))
             self.after(0, _post)
-            
+
         submit_limited(_work)
-        
 
     def _show_doh_help(self):
         messagebox.showinfo(

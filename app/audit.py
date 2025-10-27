@@ -5,8 +5,8 @@ import time
 import threading
 from pathlib import Path
 
-from logs import get_logger
-from storage import DB_PATH  # <- guardian.db ubicado en ProgramData/LocalAppData según rol
+from app.logs import get_logger
+from app.storage import DB_PATH  # <- guardian.db ubicado en ProgramData/LocalAppData según rol
 
 log = get_logger("audit")
 

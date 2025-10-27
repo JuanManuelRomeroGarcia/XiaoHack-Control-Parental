@@ -12,7 +12,7 @@ import sqlite3
 import html
 from pathlib import Path
 
-from storage import (
+from app.storage import (
     set_data_dir_forced as _storage_set_data_dir_forced,
     load_config as _storage_load_config,  # noqa: F401
     load_state as _storage_load_state,
@@ -20,28 +20,19 @@ from storage import (
     DB_PATH as _STORAGE_DB_PATH,
 )
 
-from logs import get_logger, install_exception_hooks
+from utils.runtime import parse_role, set_process_title, set_appusermodelid
+
+
+from app.logs import get_logger, install_exception_hooks
 log = get_logger("notifier")
 install_exception_hooks("notifier-crash")
 
 # --------------------------------------------------------------------
-# Identidad XiaoHack y setproctitle (opcional)
+# Identidad XiaoHack (centralizada)
 # --------------------------------------------------------------------
-XH_ROLE = None
-try:
-    if "--xh-role" in sys.argv:
-        i = sys.argv.index("--xh-role")
-        if i + 1 < len(sys.argv):
-            XH_ROLE = sys.argv[i + 1]
-except Exception:
-    XH_ROLE = None
-
-try:
-    import setproctitle  # type: ignore
-    title = f"XiaoHack-{XH_ROLE}" if XH_ROLE else "XiaoHack"
-    setproctitle.setproctitle(title)
-except Exception:
-    pass
+XH_ROLE = parse_role(sys.argv) or "notifier"
+set_appusermodelid("XiaoHack.Parental.Notifier")
+set_process_title(XH_ROLE)
 
 try:
     import logging
@@ -59,7 +50,8 @@ try:
     log.info("Notifier data_dir forzado a ProgramData: %s", _storage_data_dir())
 except Exception as e:
     log.warning("No se pudo forzar data_dir a ProgramData: %s", e)
-DB = _STORAGE_DB_PATH
+DB_PD = _STORAGE_DB_PATH
+
 
 BASE = Path(__file__).resolve().parent
 APPDATA = Path(os.getenv("APPDATA", str(BASE)))
@@ -226,7 +218,7 @@ def notify_once(key: str, title: str, msg: str, min_interval: float = 5.0):
 # --------------------------------------------------------------------
 def query_new_blocks(since_id: int):
     try:
-        con = sqlite3.connect(str(DB))
+        con = sqlite3.connect(str(DB_PD))
         cur = con.cursor()
         cur.execute("""CREATE TABLE IF NOT EXISTS events(
             id INTEGER PRIMARY KEY, ts INTEGER, type TEXT, value TEXT, meta TEXT
@@ -537,7 +529,7 @@ def tk_overlay_loop(stop_ev: threading.Event):
     if tk is None:
         log.warning("Overlay deshabilitado: tkinter no disponible.")
         return
-    from scheduler import get_overlay_countdown
+    from app.scheduler import get_overlay_countdown
     try:
         root = tk.Tk()
         root.withdraw()
@@ -579,7 +571,7 @@ def tk_overlay_loop(stop_ev: threading.Event):
         log.warning("tk overlay error: %s", e)
 
 def overlay_loop(stop_ev: threading.Event):
-    from scheduler import get_overlay_countdown
+    from app.scheduler import get_overlay_countdown
     if WIN32_OVERLAY_OK:
         log.info("Overlay usando implementación Win32 Layered (TopMost, NoActivate).")
         mgr = Win32OverlayManager()

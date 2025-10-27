@@ -1,5 +1,5 @@
 # utils/tk_safe.py — helpers seguros para Tkinter desde hilos
-from logs import get_logger
+from app.logs import get_logger
 log = get_logger("async")
 
 def after_safe(widget, ms, fn):

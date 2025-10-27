@@ -2,46 +2,14 @@
 from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk, simpledialog, messagebox
-from logs import get_logger
+
+from app.logs import get_logger
+from utils.security import hash_pin, check_pin, validate_pin
 
 log = get_logger("gui.dialogs")
 
-# ---------- Dependencia opcional ----------
-try:
-    import bcrypt
-except Exception:
-    bcrypt = None
-    log.warning("bcrypt no disponible: el PIN se comparará en texto plano (modo desarrollo).")
-    _warned_once = False
-else:
-    _warned_once = True
 
-
-# ---------- Utilidades de hash ----------
-def hash_pin(pin: str) -> str:
-    """Genera un hash seguro del PIN (usa bcrypt si está disponible)."""
-    if not bcrypt:
-        log.warning("Usando hash PIN inseguro (bcrypt no instalado).")
-        return pin
-    salt = bcrypt.gensalt(rounds=12)
-    return bcrypt.hashpw(pin.encode("utf-8"), salt).decode("utf-8")
-
-
-def check_pin(stored_hash: str, pin: str) -> bool:
-    """Verifica el PIN contra el hash almacenado."""
-    if not stored_hash:
-        return False
-    if not bcrypt:
-        log.warning("Comparando PIN en texto plano (bcrypt no disponible).")
-        return stored_hash == pin
-    try:
-        return bcrypt.checkpw(pin.encode("utf-8"), stored_hash.encode("utf-8"))
-    except Exception as e:
-        log.error("Error comprobando PIN: %s", e, exc_info=True)
-        return False
-
-
-# ---------- Diálogos ----------
+# ---------- Diálogo de entrada ----------
 class _PinDialog(simpledialog.Dialog):
     """Ventana de entrada de PIN con opción de mostrar/ocultar."""
 
@@ -84,17 +52,24 @@ def ask_pin(parent) -> str | None:
     return pin
 
 
-def set_new_pin_hash(parent) -> str | None:
-    """Pide dos veces el PIN, comprueba coincidencia y devuelve su hash."""
+# ---------- Alta/cambio de PIN ----------
+def set_new_pin_hash(parent, *, min_len=4, max_len=10, digits_only=True) -> str | None:
+    """
+    Pide dos veces el PIN, valida y devuelve su hash (o None si se cancela/valida mal).
+    """
     p1 = simpledialog.askstring("Nuevo PIN", "Introduce un nuevo PIN:", parent=parent, show="•")
     if p1 is None or p1.strip() == "":
         log.debug("Creación de nuevo PIN cancelada (vacío o None).")
         return None
 
+    ok, err = validate_pin(p1, min_len=min_len, max_len=max_len, digits_only=digits_only)
+    if not ok:
+        messagebox.showerror("PIN inválido", err, parent=parent)
+        return None
+
     p2 = simpledialog.askstring("Confirmación", "Repite el PIN:", parent=parent, show="•")
     if p2 is None:
         return None
-
     if p1 != p2:
         messagebox.showerror("Error", "Los PIN no coinciden.", parent=parent)
         log.warning("Intento de nuevo PIN: los valores no coincidieron.")
@@ -107,6 +82,7 @@ def set_new_pin_hash(parent) -> str | None:
     return h
 
 
+# ---------- Verificación ----------
 def verify_pin_dialog(parent, stored_hash: str) -> bool:
     """
     Abre un diálogo pidiendo el PIN y lo verifica.

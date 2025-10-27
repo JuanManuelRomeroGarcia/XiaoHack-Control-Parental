@@ -1,13 +1,15 @@
 # xiao_gui/pages/whitelist.py — Pestaña "Lista Blanca de juegos"
+from __future__ import annotations
+
 import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from storage import load_config
-from logs import get_logger
-from utils.tk_safe import after_safe
+
+from app.logs import get_logger
+from app.storage import load_config
 from xiao_gui.icon_manager import IconManager
 
-# Gate opcional
+# Gate opcional (fallback ligero)
 try:
     from utils.async_tasks import TaskGate, submit_limited
 except Exception:
@@ -68,7 +70,7 @@ class GameWhitelistPage(ttk.Frame):
                     self.cfg = cfg or {}
                     self._cfg_snapshot = new_list or ()
                     log.info("Lista Blanca actualizada desde disco (%d elementos).", len(new_list or []))
-            after_safe(self, 0, _apply)
+            self.after(0, _apply)
 
         submit_limited(_work, rev)
 

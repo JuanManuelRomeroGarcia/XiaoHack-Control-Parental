@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 import contextlib
 import traceback
-from logs import get_logger
+from app.logs import get_logger
 
 log = get_logger("async")
 

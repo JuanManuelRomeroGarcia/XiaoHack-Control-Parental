@@ -1,12 +1,13 @@
 # webfilter.py — XiaoHack Parental / hosts manager (con logs integrados)
 import os
 import re
+import sys
 import shutil
 import tempfile
 import subprocess
 from datetime import datetime
 from typing import List, Optional
-from logs import get_logger
+from app.logs import get_logger
 
 log = get_logger("webfilter")
 
@@ -167,6 +168,29 @@ def _flush_dns():
         log.warning("No se pudo limpiar cache DNS: %s", e)
 
 # ---------- Construcción del bloque ----------
+def _norm_domain(x: str) -> Optional[str]:
+    """
+    Limpia un dominio ingresado por el usuario:
+    - quita comillas, espacios
+    - quita http:// o https://
+    - quita path y query (todo tras el primer '/')
+    - pasa a minúsculas
+    - descarta entradas vacías o claramente inválidas
+    """
+    if not x:
+        return None
+    x = x.strip().strip('"').strip("'").lower()
+    if not x:
+        return None
+    if x.startswith("http://"):
+        x = x[7:]
+    elif x.startswith("https://"):
+        x = x[8:]
+    if "/" in x:
+        x = x.split("/", 1)[0]
+    x = x.strip(". ")
+    return x or None
+
 def _build_safe_rules(enable_safe: bool,
                       blocked_domains: List[str],
                       google_tlds: Optional[List[str]] = None,
@@ -180,8 +204,11 @@ def _build_safe_rules(enable_safe: bool,
     rules: List[str] = []
 
     for d in blocked_domains or []:
-        d = d.strip().strip('"').strip("'")
+        d = _norm_domain(d)
         if not d:
+            continue
+        # Evita líneas inválidas (hosts no admite '/')
+        if "/" in d:
             continue
         rules.append(f"0.0.0.0 {d}")
         if block_www and not d.startswith("www."):

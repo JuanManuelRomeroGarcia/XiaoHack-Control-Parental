@@ -37,6 +37,8 @@ dist/
 make_runtime_zip.ps1
 install_debug.ps1
 uninstall_test.bat
+estructura.py
+FILES.txt
 
 # === Development files ===
 .gitattributes

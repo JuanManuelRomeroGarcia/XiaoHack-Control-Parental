@@ -3,7 +3,7 @@
 import time
 import threading
 from typing import Any, Callable, Dict, Tuple
-from logs import get_logger
+from app.logs import get_logger
 
 log = get_logger("cache")
 

@@ -1,237 +1,419 @@
-# xiao_gui/services.py — gestión de servicios guardian y notifier
+# xiao_gui/services.py — helpers para la GUI del Panel (tareas, updater, etc.)
+from __future__ import annotations
 import os
-import sys
+import json
 import subprocess
-import time
+import threading
 from pathlib import Path
-import psutil # type: ignore
-from logs import get_logger
+from tkinter import messagebox
+# Helpers de runtime/rutas (proporcionados en utils/runtime.py)
+from utils.runtime import (
+    install_root,
+    datadir_system,
+    control_log_path,
+    python_for_console,
+    python_for_windowed,
+    updater_path,
+    uninstaller_path,
+    task_fullname_guardian,
+    task_fullname_notifier,
+)
 
+from app.logs import get_logger
 log = get_logger("gui.services")
 
-TASK_PATH = "\\XiaoHackParental\\"
-TASK_BARE = "Guardian"
 
-def _tn() -> str:
-    """Nombre completo de la tarea para schtasks"""
-    return f"{TASK_PATH.strip('\\\\')}\\{TASK_BARE}"
+# ---------------------------------------------------------------------------
+# Descubrimiento de instalación (más exhaustivo; deja install_root() como fast-path)
+# ---------------------------------------------------------------------------
+def find_install_root() -> Path:
+    """
+    Busca la raíz de instalación del runtime.
+    Orden:
+      1) ENV XH_INSTALL_DIR
+      2) installed.json cercano a este paquete
+      3) ascenso de carpetas hasta hallar updater.py o VERSION
+      4) install_root() (helper de runtime)
+      5) cwd (fallback)
+    """
+    # 1) ENV
+    inst = os.environ.get("XH_INSTALL_DIR", "").strip('" ').strip()
+    if inst:
+        p = Path(inst)
+        if (p / "updater.py").exists() or (p / "VERSION").exists():
+            return p
 
-# ---------- utilidades generales ----------
-def _root_dir() -> Path:
-    """Ruta raíz del proyecto (sube dos niveles desde este archivo)."""
-    return Path(__file__).resolve().parents[1]
-
-def _pythonw_path() -> Path:
-    """Devuelve pythonw.exe si existe, si no python.exe."""
-    p = _root_dir() / "venv" / "Scripts" / "pythonw.exe"
-    if p.exists():
-        return p
-    cand = Path(sys.executable).with_name("pythonw.exe")
-    if cand.exists():
-        return cand
-    return Path(sys.executable)
-
-def _notifier_script() -> Path:
-    return _root_dir() / "notifier.py"
-
-def _programdata_logs_path() -> Path:
-    base = Path(os.getenv("ProgramData", r"C:\ProgramData")) / "XiaoHackParental" / "logs"
-    base.mkdir(parents=True, exist_ok=True)
-    return base / "control.log"
-
-def _is_windows() -> bool:
-    return os.name == "nt"
-
-
-# ---------- helpers subprocess ----------
-def _run_list(args: list[str], timeout: int = 12) -> tuple[int, str, str]:
+    # 2) installed.json cerca de este paquete
     try:
-        kw = dict(capture_output=True, text=True, timeout=timeout)
-        if os.name == "nt":
-            kw["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            kw["startupinfo"] = si
-        cp = subprocess.run(args, **kw)
-        log.debug("cmd rc=%d → %s", cp.returncode, args)
-        return cp.returncode, cp.stdout or "", cp.stderr or ""
-    except subprocess.TimeoutExpired as e:
-        return 124, (e.stdout or ""), f"Timeout: {e}"
-    except Exception as e:
-        return 1, "", f"{type(e).__name__}: {e}"
+        here = Path(__file__).resolve()
+        for up in [here.parents[1], here.parents[2], here.parents[3]]:
+            mk = up / "installed.json"
+            if mk.exists():
+                try:
+                    data = json.loads(mk.read_text(encoding="utf-8", errors="ignore"))
+                    ip = Path(data.get("install_path", ""))
+                    if ip.exists():
+                        return ip
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # 3) ascenso
+    try:
+        p = Path(__file__).resolve()
+        for _ in range(8):
+            if (p / "updater.py").exists() or (p / "VERSION").exists():
+                return p
+            if p.parent == p:
+                break
+            p = p.parent
+    except Exception:
+        pass
+
+    # 4) helper de runtime
+    try:
+        p = install_root()
+        if (p / "updater.py").exists() or (p / "VERSION").exists():
+            return p
+    except Exception:
+        pass
+
+    # 5) cwd
+    return Path.cwd()
 
 
-# ---------- tarea programada (guardian) ----------
-def query_task_state() -> str:
-    """Lee el estado de la tarea programada \XiaoHackParental\Guardian."""
-    if not _is_windows():
-        return "No disponible (no Windows)"
-
-    tn = _tn()
-    rc, out, err = _run_list(["schtasks", "/Query", "/TN", tn, "/V", "/FO", "LIST"])
-    if rc != 0:
-        return "No instalada"
-
-    state_text, last_text = "", ""
-    for line in (out or "").splitlines():
-        ls = line.strip()
-        if ls.startswith(("Estado:", "Status:")):
-            state_text = ls.split(":", 1)[1].strip()
-        elif ls.startswith(("Último resultado:", "Ultimo resultado:", "Last Run Result:")):
-            last_text = ls.split(":", 1)[1].strip()
-
-    lt = last_text.upper().replace("0X", "0x")
-    if "0x41301" in lt or state_text.lower() in ("en ejecución", "running"):
-        return state_text or "En ejecución"
-    if "0x41300" in lt or state_text.lower() in ("listo", "ready"):
-        return state_text or "Listo"
-    return state_text or "Instalada"
-
-
-def start_service():
-    """Crea y/o arranca la tarea Guardian en ProgramData."""
-    if not _is_windows():
-        return (1, "", "No disponible (no Windows)")
-
-    base = Path(os.getenv("ProgramData", r"C:\ProgramData")) / "XiaoHackParental"
-    run_bat = base / "run_guardian.bat"
-
-    _run_list(["schtasks", "/Delete", "/TN", _tn(), "/F"])
-    rc, out, err = _run_list([
-        "schtasks", "/Create",
-        "/TN", _tn(),
-        "/TR", f"\"{run_bat}\"",
-        "/SC", "ONSTART",
-        "/RU", "SYSTEM",
-        "/RL", "HIGHEST",
-        "/F"
-    ])
-    if rc == 0:
-        _run_list(["schtasks", "/Run", "/TN", _tn()])
-    return rc, out, err
-
-def stop_service():
-    """Detiene la tarea Guardian en ejecución o mata procesos si fallase."""
-    if not _is_windows():
-        return (1, "", "No disponible (no Windows)")
-    rc, out, err = _run_list(["schtasks", "/End", "/TN", _tn()])
-    if rc == 0:
-        time.sleep(0.6)
-        return (0, "Tarea finalizada.", "")
-    # fallback: matar guardian.py
-    killed = 0
-    for p in psutil.process_iter(attrs=["pid", "name", "cmdline"]):
-        try:
-            cmd = " ".join(p.info.get("cmdline") or []).lower()
-            if "guardian.py" in cmd:
-                p.terminate()
-                killed += 1
-        except Exception:
-            pass
-    return (0 if killed else rc, f"Terminados {killed} guardian(s).", err or "")
-
-
-def open_task_scheduler():
-    if not _is_windows():
-        return
-    log.info("Abriendo Programador de tareas de Windows...")
-    for cmd in (["control.exe", "schedtasks"], ["taskschd.msc"]):
-        try:
-            subprocess.Popen(cmd, close_fds=True)
+# ---------------------------------------------------------------------------
+# Updater — chequeo no bloqueante y aplicación (con elevación si hace falta)
+# ---------------------------------------------------------------------------
+def check_update_and_maybe_apply_async(root_tk) -> None:
+    """
+    Lanza un hilo que:
+      - ejecuta updater.py --check
+      - si hay update, pregunta al tutor; si acepta, ejecuta --apply (eleva si es necesario)
+    """
+    def _run():
+        base = find_install_root()
+        up = updater_path()
+        if not up.exists():
+            log.warning("Updater no encontrado en: %s", up)
             return
-        except Exception:
-            continue
 
-def restart_guardian():
-    stop_service()
-    time.sleep(0.3)
-    return start_service()
+        py_console = Path(python_for_console())
+        py_window  = Path(python_for_windowed())
 
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
 
-# ---------- notifier (usuario actual) ----------
-def _get_notifier_pids() -> list[int]:
-    """Busca procesos notifier.py activos (usuario actual)."""
-    pids = []
-    npath = str(_notifier_script()).lower()
-    for p in psutil.process_iter(attrs=["pid", "name", "cmdline"]):
         try:
-            if p.pid == os.getpid():
-                continue
-            cmd = " ".join(p.info.get("cmdline") or []).lower()
-            if "notifier.py" in cmd or npath in cmd:
-                pids.append(p.pid)
-        except Exception:
-            pass
-    return pids
+            log.info("Updater --check: exe=%s, script=%s, cwd=%s", py_console, up, base)
+            out = subprocess.check_output(
+                [str(py_console), str(up), "--check"],
+                stderr=subprocess.STDOUT, cwd=str(base), env=env, timeout=300
+            )
+            res = json.loads(out.decode("utf-8", "ignore"))
+            if res.get("update_available"):
+                latest = res.get("latest") or "desconocida"
+
+                def _apply():
+                    try:
+                        log.info("Updater --apply: exe=%s, script=%s", py_window, up)
+                        subprocess.check_call([str(py_window), str(up), "--apply"], cwd=str(base), env=env)
+                        messagebox.showinfo(
+                            "Actualización",
+                            "Actualización instalada correctamente.\nReinicia el Panel para ver los cambios."
+                        )
+                    except subprocess.CalledProcessError as e:
+                        msg = (e.output or b"").decode("utf-8", "ignore")
+                        messagebox.showerror("Actualización", f"No se pudo actualizar (rc={e.returncode}).\n{msg}")
+                    except Exception as e:
+                        messagebox.showerror("Actualización", f"No se pudo actualizar:\n{e}")
+
+                def _ask():
+                    if messagebox.askyesno(
+                        "Actualización disponible",
+                        f"Hay una nueva versión {latest}.\n¿Quieres instalarla ahora?"
+                    ):
+                        _apply()
+
+                root_tk.after(0, _ask)
+        except subprocess.CalledProcessError as e:
+            msg = (e.output or b"").decode("utf-8", "ignore")
+            rc  = e.returncode
+            log.error("Updater --check falló: rc=%s out=%s", rc, msg)
+            try:
+                # Capturamos rc y msg como valores por defecto del lambda
+                root_tk.after(
+                    0,
+                    lambda rc=rc, msg=msg: messagebox.showerror(
+                        "Actualizaciones", f"Error: Updater falló (rc={rc}).\n{msg}"
+                    ),
+                )
+            except Exception:
+                pass
+
+        except Exception as e:
+            log.error("Updater sin salida: %s", e, exc_info=True)
+            et = type(e).__name__
+            es = str(e)
+            try:
+                # Capturamos et y es como valores por defecto del lambda
+                root_tk.after(
+                    0,
+                    lambda et=et, es=es: messagebox.showerror(
+                        "Actualizaciones", f"Error: Updater sin salida ({et}: {es})."
+                    ),
+                )
+            except Exception:
+                pass
 
 
-def query_notifier_state() -> str:
-    pids = _get_notifier_pids()
-    state = f"Ejecutándose ({len(pids)})" if pids else "Detenido"
-    log.debug("Estado notifier: %s", state)
-    return state
+    threading.Thread(target=_run, daemon=True).start()
 
 
-def start_notifier():
-    pyw = _pythonw_path()
-    script = _notifier_script()
+def run_updater_check_sync() -> dict | None:
+    """Ejecución sin UI del check; útil para diagnósticos o tests."""
+    base = find_install_root()
+    up = updater_path()
+    if not up.exists():
+        log.warning("Updater no encontrado en: %s", up)
+        return None
+    py_console = Path(python_for_console())
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
     try:
-        creationflags = 0
-        if pyw.name.lower().endswith("python.exe"):
-            creationflags = 0x00000008  # DETACHED_PROCESS
-        subprocess.Popen(
-            [str(pyw), str(script)],
-            cwd=str(_root_dir()),
-            close_fds=True,
-            creationflags=creationflags,
+        out = subprocess.check_output(
+            [str(py_console), str(up), "--check"],
+            stderr=subprocess.STDOUT, cwd=str(base), env=env, timeout=300
         )
-        log.info("Notifier iniciado con %s", pyw.name)
-        return (0, "OK", "")
+        return json.loads(out.decode("utf-8", "ignore"))
     except Exception as e:
-        log.error("Error al iniciar notifier: %s", e, exc_info=True)
-        return (1, "", str(e))
+        log.error("run_updater_check_sync error: %s", e, exc_info=True)
+        return None
 
 
-def stop_notifier():
-    pids = _get_notifier_pids()
-    procs = []
-    for pid in pids:
-        try:
-            pr = psutil.Process(pid)
-            pr.terminate()
-            procs.append(pr)
-        except Exception:
-            pass
-    if procs:
-        try:
-            psutil.wait_procs(procs, timeout=1.5)
-        except Exception:
-            pass
-    killed = len(procs)
-    log.info("Notifier detenido (%d procesos).", killed)
-    return (0, f"Terminados {killed} notifier(s).", "")
-
-
-def restart_notifier():
-    stop_notifier()
-    time.sleep(0.3)
-    return start_notifier()
-
-
-def open_notifier_log():
-    logp = _programdata_logs_path()
-    if not logp.exists():
-        try:
-            logp.write_text("", encoding="utf-8")
-        except Exception:
-            pass
+def run_updater_apply_ui() -> None:
+    """Lanza la aplicación del update (UI-friendly)."""
+    base = find_install_root()
+    up = updater_path()
+    if not up.exists():
+        messagebox.showerror("Actualización", f"Updater no encontrado:\n{up}")
+        return
+    py_window = Path(python_for_windowed())
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
     try:
-        if _is_windows():
-            subprocess.Popen(["notepad.exe", str(logp)], close_fds=True)
-        else:
-            subprocess.Popen(["xdg-open", str(logp)], close_fds=True)
-        log.info("Abriendo log del notifier: %s", logp)
-        return (0, "OK", "")
+        subprocess.check_call([str(py_window), str(up), "--apply"], cwd=str(base), env=env)
+        messagebox.showinfo(
+            "Actualización",
+            "Actualización instalada correctamente.\nReinicia el Panel para ver los cambios."
+        )
+    except subprocess.CalledProcessError as e:
+        msg = (e.output or b"").decode("utf-8", "ignore")
+        messagebox.showerror("Actualización", f"No se pudo actualizar (rc={e.returncode}).\n{msg}")
     except Exception as e:
-        log.error("Error abriendo log notifier: %s", e)
-        return (1, "", str(e))
+        messagebox.showerror("Actualización", f"No se pudo actualizar:\n{e}")
+
+
+# ---------------------------------------------------------------------------
+# Uninstaller
+# ---------------------------------------------------------------------------
+def launch_uninstaller_ui() -> None:
+    """
+    Lanza el desinstalador (elevará si hace falta).
+    """
+    base = find_install_root()
+    uni = uninstaller_path()
+    if not uni.exists():
+        messagebox.showerror("Desinstalar", f"No se encontró uninstall.py en:\n{uni}")
+        return
+
+    py_window = Path(python_for_windowed())
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    try:
+        subprocess.Popen([str(py_window), str(uni)], cwd=str(base), env=env)
+    except Exception as e:
+        messagebox.showerror("Desinstalar", f"No se pudo iniciar el desinstalador:\n{e}")
+
+
+# ---------------------------------------------------------------------------
+# Tareas programadas: consulta y control (Guardian / Notifier)
+# ---------------------------------------------------------------------------
+def _query_task_fullname(kind: str) -> str:
+    if kind.lower() == "guardian":
+        return task_fullname_guardian()
+    if kind.lower() == "notifier":
+        return task_fullname_notifier()
+    return kind  # nombre literal
+
+def query_task_state(kind_or_fullname: str) -> dict:
+    """
+    Devuelve un dict con la información de schtasks /Query /V /FO LIST
+    { 'Exists': bool, 'State': 'Running/Ready/…', 'Next Run Time': '…', ... }
+    """
+    name = _query_task_fullname(kind_or_fullname)
+    try:
+        cp = subprocess.run(
+            ["schtasks", "/Query", "/TN", name, "/FO", "LIST", "/V"],
+            capture_output=True, text=True
+        )
+        out = (cp.stdout or "") + (cp.stderr or "")
+        if "ERROR:" in out and cp.returncode:
+            return {"Exists": False, "Raw": out}
+        info = {"Exists": True, "Raw": out}
+        for line in out.splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                info[k.strip()] = v.strip()
+        return info
+    except Exception as e:
+        return {"Exists": False, "Error": str(e)}
+
+def start_service(kind_or_fullname: str) -> bool:
+    """
+    Intenta arrancar la tarea (p.ej., 'guardian' → XiaoHackParental\\Guardian).
+    """
+    name = _query_task_fullname(kind_or_fullname)
+    try:
+        cp = subprocess.run(["schtasks", "/Run", "/TN", name], capture_output=True, text=True)
+        if cp.returncode == 0:
+            log.info("Tarea iniciada: %s", name)
+            return True
+        log.warning("schtasks /Run rc=%s out=%s err=%s", cp.returncode, cp.stdout, cp.stderr)
+        return False
+    except Exception as e:
+        log.error("start_service error: %s", e)
+        return False
+
+def stop_service(kind_or_fullname: str) -> bool:
+    """
+    Intenta detener la tarea (best-effort).
+    """
+    name = _query_task_fullname(kind_or_fullname)
+    try:
+        cp = subprocess.run(["schtasks", "/End", "/TN", name], capture_output=True, text=True)
+        if cp.returncode == 0:
+            log.info("Tarea detenida: %s", name)
+            return True
+        log.warning("schtasks /End rc=%s out=%s err=%s", cp.returncode, cp.stdout, cp.stderr)
+        return False
+    except Exception as e:
+        log.error("stop_service error: %s", e)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Utilidades varias
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Notifier (overlay de bloqueos): estado / iniciar / detener
+# ---------------------------------------------------------------------------
+def _find_notifier_script() -> Path:
+    """Busca notifier.py en la instalación (raíz o app/), similar a updater_path()."""
+    root = find_install_root()
+    cand = [root / "notifier.py", root / "app" / "notifier.py"]
+    for c in cand:
+        if c.exists():
+            return c
+    return cand[0]
+
+def notifier_status() -> dict:
+    """
+    Devuelve {'exists': bool, 'running': bool, 'pids': [..]}.
+    Usa psutil si está; si no, tasklist como fallback.
+    """
+    script = _find_notifier_script()
+    exists = script.exists()
+    running = False
+    pids = []
+
+    try:
+        import psutil  # type: ignore
+        for p in psutil.process_iter(attrs=["pid","name","cmdline"]):
+            try:
+                cmd = " ".join(p.info.get("cmdline") or [])
+                if "--xh-role" in cmd and "notifier" in cmd.lower():
+                    running = True
+                    pids.append(p.info["pid"])
+                elif "notifier.py" in cmd.replace("\\", "/").lower():
+                    running = True
+                    pids.append(p.info["pid"])
+            except Exception:
+                continue
+        return {"exists": exists, "running": running, "pids": pids}
+    except Exception:
+        # Fallback sin psutil
+        try:
+            out = subprocess.check_output(["tasklist", "/FO", "CSV"], text=True, creationflags=0x08000000)
+            for line in out.splitlines():
+                l1 = line.lower()
+                if "pythonw.exe" in l1 or "python.exe" in l1:
+                    if "notifier" in l1:
+                        running = True
+                        # no tenemos PID fiable en este fallback sin parseo completo
+                        break
+        except Exception:
+            pass
+        return {"exists": exists, "running": running, "pids": pids}
+
+def start_notifier() -> bool:
+    """Lanza el Notifier en segundo plano con pythonw.exe."""
+    script = _find_notifier_script()
+    if not script.exists():
+        return False
+    pyw = Path(python_for_windowed())
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    try:
+        subprocess.Popen([str(pyw), str(script), "--xh-role", "notifier"], cwd=str(find_install_root()),
+                         env=env, creationflags=0x08000000)
+        return True
+    except Exception:
+        return False
+
+def stop_notifier() -> bool:
+    """Intenta terminar cualquier proceso del Notifier."""
+    ok = False
+    try:
+        import psutil  # type: ignore
+        for p in psutil.process_iter(attrs=["pid","name","cmdline"]):
+            try:
+                cmd = " ".join(p.info.get("cmdline") or [])
+                if ("--xh-role" in cmd and "notifier" in cmd.lower()) or ("notifier.py" in cmd.lower()):
+                    try:
+                        p.terminate()
+                        ok = True
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+        return ok
+    except Exception:
+        # Fallback best-effort: mata pythonw con filtro de ventana no fiable (evitamos).
+        # Devolvemos False para no dar falsa sensación.
+        return False
+
+
+def open_logs_folder():
+    """Abre la carpeta de logs del sistema (ProgramData\\XiaoHackParental\\logs)."""
+    try:
+        import webbrowser
+        logs_dir = datadir_system() / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        webbrowser.open(str(logs_dir))
+    except Exception as e:
+        log.error("open_logs_folder error: %s", e)
+
+def open_control_log():
+    """Abre el archivo control.log con el visor por defecto."""
+    try:
+        import webbrowser
+        webbrowser.open(str(control_log_path()))
+    except Exception as e:
+        log.error("open_control_log error: %s", e)

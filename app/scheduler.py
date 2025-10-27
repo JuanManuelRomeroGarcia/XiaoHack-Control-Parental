@@ -1,8 +1,8 @@
 # scheduler.py — Horarios y avisos (manual + tramos) con LOG centralizado
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from typing import Dict, List, Tuple, Optional
 
-from logs import get_logger
+from app.logs import get_logger
 log = get_logger("scheduler")
 
 # =========================
@@ -34,8 +34,12 @@ def _norm_days(days: List[str]) -> List[str]:
     return [_DAY_ALIASES.get((d or "").lower()[:3], (d or "").lower()[:3]) for d in days]
 
 def is_within_allowed_hours(cfg: dict, now: datetime) -> bool:
-    """True si 'now' cae dentro de algún tramo permitido (no cruza medianoche)."""
+    """
+    True si 'now' cae dentro de algún tramo permitido.
+    Soporta tramos normales (from <= to) y tramos que cruzan medianoche (from > to).
+    """
     day = now.strftime("%a").lower()[:3]
+    tnow = now.time()
     for sch in cfg.get("schedules", []):
         if not sch or "from" not in sch or "to" not in sch:
             continue
@@ -44,29 +48,56 @@ def is_within_allowed_hours(cfg: dict, now: datetime) -> bool:
             continue
         t_from = _parse_time(sch["from"])
         t_to   = _parse_time(sch["to"])
-        if t_from <= now.time() <= t_to:
-            return True
+        if t_from <= t_to:
+            # Tramo normal: dentro si t_from <= now <= t_to
+            if t_from <= tnow <= t_to:
+                return True
+        else:
+            # Tramo overnight: permitido si now >= from (hoy) o now <= to (mañana)
+            if tnow >= t_from or tnow <= t_to:
+                return True
     return False
+
 
 def current_allowed_window(cfg: dict, now: datetime) -> Optional[Tuple[datetime, datetime]]:
     """
     Si 'now' está dentro de un tramo permitido devuelve (inicio, fin) del tramo (datetimes).
-    Los tramos se asumen sin cruce de medianoche (t_from <= t_to).
+    Soporta tramos normales y que cruzan medianoche.
     """
-    day = now.strftime("%a").lower()[:3]
+    day_code = now.strftime("%a").lower()[:3]
+    tnow = now.time()
+
     for sch in cfg.get("schedules", []):
         if not sch or "from" not in sch or "to" not in sch:
             continue
         days = _norm_days(sch.get("days", []))
-        if day not in days:
+        if day_code not in days:
             continue
+
         t_from = _parse_time(sch["from"])
         t_to   = _parse_time(sch["to"])
-        if t_from <= now.time() <= t_to:
-            start = now.replace(hour=t_from.hour, minute=t_from.minute, second=0, microsecond=0)
-            end   = now.replace(hour=t_to.hour,   minute=t_to.minute,   second=0, microsecond=0)
-            return (start, end)
+
+        if t_from <= t_to:
+            # Tramo normal
+            if t_from <= tnow <= t_to:
+                start = now.replace(hour=t_from.hour, minute=t_from.minute, second=0, microsecond=0)
+                end   = now.replace(hour=t_to.hour,   minute=t_to.minute,   second=0, microsecond=0)
+                return (start, end)
+        else:
+            # Tramo overnight: ejemplo 21:30 → 01:00
+            if tnow >= t_from:
+                # Estamos en la parte "hoy" (desde from hasta 23:59:59...)
+                start = now.replace(hour=t_from.hour, minute=t_from.minute, second=0, microsecond=0)
+                end   = (now + timedelta(days=1)).replace(hour=t_to.hour, minute=t_to.minute, second=0, microsecond=0)
+                return (start, end)
+            elif tnow <= t_to:
+                # Estamos en la parte "madrugada" (00:00 → to); el tramo empezó AYER
+                start = (now - timedelta(days=1)).replace(hour=t_from.hour, minute=t_from.minute, second=0, microsecond=0)
+                end   = now.replace(hour=t_to.hour,   minute=t_to.minute,   second=0, microsecond=0)
+                return (start, end)
+
     return None
+
 
 def is_play_allowed(cfg: dict, state: dict, now: datetime) -> bool:
     """

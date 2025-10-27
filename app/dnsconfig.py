@@ -3,7 +3,7 @@ import re
 import json
 from utils.winproc import _ps, run_quiet
 from utils.cache import memo_ttl
-from logs import get_logger
+from app.logs import get_logger
 
 log = get_logger("dns")
 
@@ -11,6 +11,23 @@ log = get_logger("dns")
 # =====================================================================
 # Funciones principales
 # =====================================================================
+
+def _ps_escape(s: str) -> str:
+    """
+    Escapa cadena para usar dentro de comillas dobles en PowerShell.
+    Reglas básicas: ` -> ``   y   " -> `"
+    """
+    return s.replace("`", "``").replace('"', '`"')
+
+def _dedup_preserve(seq):
+    seen = set()
+    out = []
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
 
 def list_adapters():
     """
@@ -58,7 +75,8 @@ def set_dns_servers(servers_ipv4: list[str], interface_alias: str | None = None)
         return False, "Lista vacía de DNS"
 
     if interface_alias:
-        target = f' -InterfaceAlias "{interface_alias}" '
+        esc = _ps_escape(interface_alias)
+        target = f' -InterfaceAlias "{esc}" '
         scope = f'adaptador \"{interface_alias}\"'
     else:
         target = r' -InterfaceAlias (Get-NetIPConfiguration | Where-Object {$_.IPv4Address -ne $null -and $_.NetAdapter.Status -eq "Up"} | Select-Object -ExpandProperty InterfaceAlias) '
@@ -86,7 +104,8 @@ def set_dns_auto(interface_alias: str | None = None) -> tuple[bool, str]:
     Vuelve a “Obtener direcciones de servidor DNS automáticamente”.
     """
     if interface_alias:
-        target = f' -InterfaceAlias "{interface_alias}" '
+        esc = _ps_escape(interface_alias)
+        target = f' -InterfaceAlias "{esc}" '
         scope = f'adaptador \"{interface_alias}\"'
     else:
         target = r' -InterfaceAlias (Get-NetIPConfiguration | Where-Object {$_.IPv4Address -ne $null -and $_.NetAdapter.Status -eq "Up"} | Select-Object -ExpandProperty InterfaceAlias) '
@@ -132,7 +151,8 @@ def _qname(alias: str) -> str:
 
 def _parse_dnsservers_output(text: str) -> tuple[str, list[str]]:
     t = text.lower()
-    servers = _IP_RE.findall(text)
+    servers = _dedup_preserve(_IP_RE.findall(text))
+
 
     # Señales claras
     if ("dhcp" in t and "configur" in t and "dns" in t) or ("dhcp configured dns servers" in t):
@@ -152,7 +172,8 @@ def _parse_dnsservers_output(text: str) -> tuple[str, list[str]]:
 
 def _parse_showconfig_output(text: str) -> tuple[str, list[str]]:
     t = text.lower()
-    servers = _IP_RE.findall(text)
+    servers = _dedup_preserve(_IP_RE.findall(text))
+
 
     if ("dhcp habilitado: sí" in t) or ("dhcp enabled: yes" in t):
         return "dhcp", servers
@@ -215,7 +236,7 @@ def summarize_dns_status(status: dict) -> str:
     for it in status["interfaces"]:
         al = it.get("alias") or "?"
         mode = it.get("mode") or "unknown"
-        srvs = ", ".join(it.get("servers") or [])
+        srvs = ", ".join(_dedup_preserve(it.get("servers") or []))
         if mode == "static":
             parts.append(f"{al}: fijo → {srvs or '—'}")
         elif mode == "dhcp":

@@ -15,6 +15,7 @@ import subprocess
 import time
 from pathlib import Path
 from urllib.request import urlopen, Request
+from urllib.error import HTTPError, URLError
 
 try:
     import sys
@@ -23,14 +24,26 @@ try:
 except Exception:
     pass
 
-from logs import get_logger
+from app.logs import get_logger
 log = get_logger("gui.Updater")
 
-
-OWNER = "JuanManuelRomeroGarcia"
-REPO  = "XiaoHack-Control-Parental"
+# ---------------- Config GitHub (con overrides por entorno) ----------------
+# [XH] Permitir override para pruebas con forks o ramas
+OWNER = os.getenv("XH_GH_OWNER", "JuanManuelRomeroGarcia")  # [XH]
+REPO  = os.getenv("XH_GH_REPO",  "XiaoHack-Control-Parental")  # [XH]
 API_LATEST = f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest"
-USER_AGENT = "XiaoHack-Updater"
+
+# [XH] Timeout y UA
+HTTP_TIMEOUT = float(os.getenv("XH_HTTP_TIMEOUT", "60"))  # segs  # [XH]
+
+def _local_version_for_ua() -> str:  # [XH]
+    try:
+        return read_local_version()
+    except Exception:
+        return "0.0.0"
+
+def _build_user_agent() -> str:  # [XH]
+    return f"XiaoHack-Updater/{_local_version_for_ua()} (+https://github.com/{OWNER}/{REPO})"
 
 # Rutas
 BASE_DIR     = Path(__file__).resolve().parent             # carpeta instalada (Program Files\XiaoHackParental)
@@ -56,13 +69,28 @@ EXCLUDE_FILES = {".gitignore", ".gitattributes", ".editorconfig", "README", "REA
 
 # ---------------- Utilidades ----------------
 def _http_get(url: str) -> bytes:
-    req = Request(url, headers={"User-Agent": USER_AGENT})
+    # [XH] UA + Accept + token opcional para evitar rate-limit en pruebas
+    headers = {
+        "User-Agent": _build_user_agent(),
+        "Accept": "application/vnd.github+json",
+    }
+    token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = Request(url, headers=headers)
     try:
-        with urlopen(req, timeout=60) as r:
+        with urlopen(req, timeout=HTTP_TIMEOUT) as r:  # [XH] timeout
             return r.read()
+    except HTTPError as e:
+        # Mensaje claro (rate limit, etc.)
+        if e.code in (403, 429):
+            raise RuntimeError(f"GitHub rate limit o acceso denegado ({e.code}). "
+                               f"Intenta más tarde o configura GITHUB_TOKEN.")
+        raise RuntimeError(f"HTTP {e.code} en {url}: {e.reason}")
+    except URLError as e:
+        raise RuntimeError(f"Error de red para {url}: {e.reason}")
     except Exception as e:
-        # Propagamos con mensaje claro
-        raise RuntimeError(f"HTTP GET failed for {url}: {type(e).__name__}: {e}")
+        raise RuntimeError(f"HTTP GET falló para {url}: {type(e).__name__}: {e}")
 
 def _ver_tuple(v: str):
     # robusto: acepta "1.2.3" o "1.2"
@@ -136,8 +164,8 @@ def _kill_processes_in_install():
     try:
         import psutil  # opcional
     except Exception:
-        # fallback agresivo: nada (evitamos matar python global)
-        return
+        return  # si no hay psutil, salimos en silencio
+
     inst = str(INSTALL_DIR).lower()
     for p in psutil.process_iter(attrs=["pid","name","exe","cwd","cmdline"]):
         try:
@@ -155,16 +183,20 @@ def _kill_processes_in_install():
                 p.terminate()
         except Exception:
             continue
-    # espera corta; si sigue vivo lo mata
+    # espera corta; si sigue vivo, intento de kill de último recurso
     time.sleep(0.7)
-    if 'psutil' in sys.modules:
-        import psutil
-        for p in psutil.process_iter(attrs=["pid"]):
-            try:
-                if not p.is_running():
+    for p in psutil.process_iter(attrs=["pid","name","exe","cwd","cmdline"]):
+        try:
+            exe = (p.info.get("exe") or "").lower()
+            cwd = (p.info.get("cwd") or "").lower()
+            cmd = " ".join(p.info.get("cmdline") or []).lower()
+            if inst in exe or inst in cwd or inst in cmd:
+                if p.pid == os.getpid():
                     continue
-            except Exception:
-                continue
+                p.kill()
+        except Exception:
+            continue
+
 
 def _find_zip_root(tmp_dir: Path) -> Path:
     """
@@ -184,7 +216,6 @@ def _apply_zip_to_install(zip_path: Path):
         root = _find_zip_root(tmp)
         # Copia filtrada
         for src_dir, dirs, files in os.walk(root):
-            # filtra dirs in-place (para evitar descender)
             dirs[:] = [d for d in dirs if not _should_skip(os.path.join(src_dir, d), True)]
             for f in files:
                 src = Path(src_dir) / f
@@ -193,8 +224,46 @@ def _apply_zip_to_install(zip_path: Path):
                 rel = src.relative_to(root)
                 dst = INSTALL_DIR / rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
-                # No tocamos ProgramData/LocalAppData: sólo copiamos a INSTALL_DIR
                 shutil.copy2(src, dst)
+
+        # Limpieza opcional de restos de versiones anteriores
+        _cleanup_orphans_from_install(root)
+
+                
+def _cleanup_orphans_from_install(zip_root: Path):
+    """
+    Elimina archivos presentes en INSTALL_DIR que no están en el zip aplicado.
+    Se activa sólo si XH_CLEAN_ORPHANS=1.
+    Nunca borra: venv/, logs/, *.log, installed.json
+    """
+    if os.getenv("XH_CLEAN_ORPHANS", "0") != "1":
+        return
+
+    keep_dirs = {"venv", "logs"}
+    keep_files = {"installed.json"}
+
+    wanted = set()
+    for src_dir, dirs, files in os.walk(zip_root):
+        rel_dir = Path(src_dir).relative_to(zip_root)
+        for f in files:
+            if _should_skip(str(Path(src_dir) / f), False):
+                continue
+            wanted.add((rel_dir / f).as_posix())
+
+    for cur_dir, dirs, files in os.walk(INSTALL_DIR):
+        # filtra dirs que nunca borraríamos
+        dirs[:] = [d for d in dirs if d not in keep_dirs]
+        for f in files:
+            if f in keep_files:
+                continue
+            p = Path(cur_dir) / f
+            rel = p.relative_to(INSTALL_DIR).as_posix()
+            # si el archivo no está en el zip y no es un excluido explícito, borra
+            if rel not in wanted and not _should_skip(str(p), False):
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
 
 # ---------------- Elevación UAC (sólo al aplicar) ----------------
 def _is_admin() -> bool:

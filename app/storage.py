@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Dict
 
 # Importamos utilidades del logger central para unificar el "data dir"
-from logs import get_logger, get_data_dir as _logs_get_data_dir, set_data_dir as _logs_set_data_dir  # noqa: F401
+from app.logs import get_logger, get_data_dir as _logs_get_data_dir, set_data_dir as _logs_set_data_dir  # noqa: F401
 
 log = get_logger("storage")
 
@@ -221,6 +221,49 @@ def load_state() -> dict:
 def save_state(st: dict):
     log.debug("Guardando estado (%s claves)", len(st))
     _atomic_write(STATE_PATH, st)
+    
+# --- Normalizadores (para uso común en GUI/servicios) ---
+def _norm_list(xs):
+    return [x for x in (xs or []) if isinstance(x, str) and x.strip()]
+
+def _norm_domain_list(xs):
+    out = []
+    for x in _norm_list(xs):
+        x = x.strip().lower()
+        # quitar http(s):// y trailing slashes si vinieran del UI
+        if x.startswith("http://"): 
+            x = x[7:]
+        if x.startswith("https://"):
+            x = x[8:]
+        x = x.strip("/ ")
+        if x:
+            out.append(x)
+    return out
+
+# --- Updates transaccionales (evitan carreras entre hilos) ---
+def update_config(mutator):
+    """
+    Carga cfg -> mutator(cfg) -> guarda.
+    'mutator' puede modificar in-place o devolver un dict nuevo.
+    """
+    cfg = load_config()
+    ret = mutator(cfg)
+    if isinstance(ret, dict):
+        cfg = ret
+    # normalización mínima estándar
+    for k in ("blocked_apps","blocked_executables","blocked_paths","game_whitelist"):
+        cfg[k] = _norm_list(cfg.get(k, []))
+    cfg["blocked_domains"] = _norm_domain_list(cfg.get("blocked_domains", []))
+    save_config(cfg)
+    return cfg
+
+def update_state(mutator):
+    st = load_state()
+    ret = mutator(st)
+    if isinstance(ret, dict):
+        st = ret
+    save_state(st)
+    return st
 
 # Utilidades opcionales (para tests o herramientas)
 def data_dir() -> str:
@@ -244,6 +287,20 @@ def set_data_dir_forced(path: str) -> None:
     except Exception:
         pass
     log.info("Data dir forzado a: %s", DATA_DIR)
+    
+# --- Path getters (reutilizables) ---
+def get_config_path() -> Path:
+    return CONFIG_PATH
+
+def get_state_path() -> Path:
+    return STATE_PATH
+
+def get_db_path() -> Path:
+    return DB_PATH
+
+def get_logs_dir_path() -> Path:
+    return LOGS_DIR
+
 
 # ==============================================================================
 # Log resumen de entorno

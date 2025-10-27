@@ -1,17 +1,25 @@
 # pages/apps.py — XiaoHack GUI — Pestaña Aplicaciones/Juegos (depurada)
+from __future__ import annotations
+
 import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from storage import load_config, save_config
-from test_app.utils import log_block_event_for_test
+from app.logs import get_logger
+from app.storage import load_config, save_config, update_config  # normaliza y guarda  # noqa: F401
 from xiao_gui.icon_manager import IconManager
-from logs import get_logger
-from utils.tk_safe import after_safe
 
-log = get_logger("gui.apps")
+# Fallbacks suaves si utils no está disponible aún
+try:
+    from utils.tk_safe import after_safe  # asegura after() contra widgets destruidos
+except Exception:
+    def after_safe(widget, ms, func):
+        # Fallback: mejor esfuerzo
+        try:
+            widget.after(ms, func)
+        except Exception:
+            pass
 
-# Gate para evitar carreras cuando cambias rápido de pestaña
 try:
     from utils.async_tasks import TaskGate
 except Exception:
@@ -22,6 +30,15 @@ except Exception:
             return self._rev
         def is_current(self, rev): return rev == self._rev
 
+# Bloqueo de prueba vía auditoría (sustituye a test_app.utils.log_block_event_for_test)
+try:
+    from app.audit import AuditLogger
+    _AUDIT = AuditLogger()
+except Exception:
+    _AUDIT = None
+
+log = get_logger("gui.apps")
+
 
 class AppsPage(ttk.Frame):
     """Pestaña de Aplicaciones/Juegos (sin UI de whitelist)."""
@@ -30,17 +47,14 @@ class AppsPage(ttk.Frame):
         super().__init__(master)
         self.cfg = cfg
         self.dark = dark
+
         self.iconman = IconManager()
         self._icon_h = 22
-        self._img_refs = {}         # iid -> PhotoImage (evitar GC)
-        self._rules_ctx_menu = None # menú contextual
+        self._img_refs: dict[str, tk.PhotoImage] = {}    # iid -> PhotoImage (evitar GC)
+        self._rules_ctx_menu: tk.Menu | None = None      # menú contextual
+        self._gate = TaskGate()                          # anti-carreras al entrar/salir
 
-        # Anti-avalanchas de on_show
-        self._gate = TaskGate()
-
-        # Snapshot inicial
         self._cfg_snapshot = self._snapshot_from_cfg(cfg)
-
         self._build()
         log.debug("AppsPage inicializada (blocked=%d)", len(cfg.get("blocked_apps", [])))
 
@@ -55,26 +69,28 @@ class AppsPage(ttk.Frame):
             log.info("Config actualizada en disco; recargando reglas de apps.")
             self._cfg_snapshot = new_snap
             self.cfg = new_cfg
+
             def _apply():
                 if not self._gate.is_current(rev) or not self.winfo_exists():
                     return
                 self._reload_from_cfg()
+
             after_safe(self, 0, _apply)
 
-    def refresh_lite(self):  # compatibilidad
+    def refresh_lite(self):  # compat
         pass
 
     def has_unsaved_changes(self) -> bool:
         current = self.collect()
         base = {
-            "blocked_apps": sorted(self.cfg.get("blocked_apps", [])),
-            "blocked_executables": sorted(self.cfg.get("blocked_executables", [])),
-            "blocked_paths": sorted(self.cfg.get("blocked_paths", [])),
+            "blocked_apps":           sorted(self.cfg.get("blocked_apps", []) or []),
+            "blocked_executables":    sorted(self.cfg.get("blocked_executables", []) or []),
+            "blocked_paths":          sorted(self.cfg.get("blocked_paths", []) or []),
         }
         mine = {
-            "blocked_apps": sorted(current["blocked_apps"]),
-            "blocked_executables": sorted(current["blocked_executables"]),
-            "blocked_paths": sorted(current["blocked_paths"]),
+            "blocked_apps":           sorted(current["blocked_apps"]),
+            "blocked_executables":    sorted(current["blocked_executables"]),
+            "blocked_paths":          sorted(current["blocked_paths"]),
         }
         dirty = mine != base
         if dirty:
@@ -107,7 +123,7 @@ class AppsPage(ttk.Frame):
         self.tv.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         self.tv.grid(row=0, column=0, sticky="nsew", padx=6, pady=(6, 0))
         vsb.grid(row=0, column=1, sticky="ns", pady=(6, 0))
-        hsb.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 6))
+        hsb.grid(row=1, column=0, sticky="ew",  padx=6, pady=(0, 6))
 
         # Cargar datos iniciales
         self._reload_from_cfg()
@@ -139,8 +155,10 @@ class AppsPage(ttk.Frame):
                 ent_name.delete(0, "end")
 
         def add_name_exe():
-            p = filedialog.askopenfilename(title="Selecciona .exe (añadir por NOMBRE)",
-                                           filetypes=[("Aplicaciones", "*.exe")])
+            p = filedialog.askopenfilename(
+                title="Selecciona .exe (añadir por NOMBRE)",
+                filetypes=[("Aplicaciones", "*.exe")],
+            )
             if p:
                 n = os.path.basename(p)
                 self._insert_rule("Nombre", n, "Bloqueo por nombre (.exe)")
@@ -154,8 +172,10 @@ class AppsPage(ttk.Frame):
                 ent_path.delete(0, "end")
 
         def add_path_exe():
-            p = filedialog.askopenfilename(title="Selecciona .exe (bloquear por RUTA exacta)",
-                                           filetypes=[("Aplicaciones", "*.exe")])
+            p = filedialog.askopenfilename(
+                title="Selecciona .exe (bloquear por RUTA exacta)",
+                filetypes=[("Aplicaciones", "*.exe")],
+            )
             if p:
                 self._insert_rule("Ruta", os.path.normpath(p), "Bloqueo por ruta exacta")
                 log.info("Añadida regla por ruta desde archivo: %s", p)
@@ -174,8 +194,10 @@ class AppsPage(ttk.Frame):
                 log.info("Añadida carpeta bloqueada: %s", d)
 
         def add_folder_from_exe():
-            p = filedialog.askopenfilename(title="Selecciona .exe (bloquear su carpeta)",
-                                           filetypes=[("Aplicaciones", "*.exe")])
+            p = filedialog.askopenfilename(
+                title="Selecciona .exe (bloquear su carpeta)",
+                filetypes=[("Aplicaciones", "*.exe")],
+            )
             if p:
                 folder = os.path.dirname(p)
                 self._insert_rule("Carpeta", os.path.normpath(folder), "Bloqueo por carpeta")
@@ -208,10 +230,12 @@ class AppsPage(ttk.Frame):
         self.tv.bind("<Button-3>", self._show_rules_context_menu)
         self.bind_all("<Control-w>", lambda e: self._add_selected_to_whitelist())
 
-        ttk.Button(self, text="Probar notificación de bloqueo",
-                   command=lambda: (log_block_event_for_test("AplicacionDePrueba.exe") and
-                                    messagebox.showinfo("OK",
-                                    "Se insertó un bloqueo de prueba.\nSi el notifier está activo, verás la notificación en unos segundos."))).grid(row=2, column=0, sticky="w", **pad)
+        # Botón de prueba (inserta evento de bloqueo en auditoría si disponible)
+        ttk.Button(
+            self,
+            text="Probar notificación de bloqueo",
+            command=self._test_block_notification,
+        ).grid(row=2, column=0, sticky="w", **pad)
 
     # ---- helpers ----
     def _snapshot_from_cfg(self, cfg: dict) -> dict:
@@ -232,6 +256,7 @@ class AppsPage(ttk.Frame):
             total += 1
         for p in self.cfg.get("blocked_executables", []):
             self._insert_rule("Ruta", os.path.normpath(p), "Bloqueo por ruta exacta")
+            total += 1
         for p in self.cfg.get("blocked_paths", []):
             self._insert_rule("Carpeta", os.path.normpath(p), "Bloqueo por carpeta")
             total += 1
@@ -256,11 +281,12 @@ class AppsPage(ttk.Frame):
         return None
 
     def _add_selected_to_whitelist(self):
-        if not self.tv.selection():
+        sel = self.tv.selection()
+        if not sel:
             messagebox.showwarning("Sin selección", "Selecciona una o varias reglas primero.")
             return
-        names = []
-        for iid in self.tv.selection():
+        names: list[str] = []
+        for iid in sel:
             tipo, valor, _ = self.tv.item(iid, "values")
             n = self._exe_from_rule(tipo, valor)
             if n:
@@ -276,24 +302,29 @@ class AppsPage(ttk.Frame):
             messagebox.showinfo("Sin cambios", "Todos los elementos ya estaban en la Lista Blanca.")
 
     def _add_to_whitelist_storage(self, names: list[str]) -> list[str]:
-        """Fusiona con storage evitando duplicados. Devuelve los realmente añadidos."""
+        """Fusiona con storage evitando duplicados. Devuelve los realmente añadidos (antes→después)."""
         try:
-            cfg = load_config()
-            current = set(cfg.get("game_whitelist", []))
-            added = []
-            for n in (x.strip() for x in names):
-                if n and n not in current:
-                    current.add(n)
-                    added.append(n)
-            if added:
-                cfg["game_whitelist"] = sorted(current)
-                save_config(cfg)
-                self.cfg = cfg
-                self._cfg_snapshot = self._snapshot_from_cfg(cfg)
-                log.debug("Whitelist actualizada (%d añadidos).", len(added))
+            # Snapshot previo (para calcular “added” con precisión)
+            cfg0 = load_config()
+            prev = set(cfg0.get("game_whitelist", []) or [])
+
+            def _mut(cfg):
+                cur = set(cfg.get("game_whitelist", []) or [])
+                for n in (x.strip() for x in names):
+                    if n:
+                        cur.add(n)
+                cfg["game_whitelist"] = sorted(cur)
+                return cfg
+
+            cfg = update_config(_mut)   # normaliza y guarda
+            self.cfg = cfg
+            self._cfg_snapshot = self._snapshot_from_cfg(cfg)
+
+            after = set(cfg.get("game_whitelist", []) or [])
+            added = sorted(after - prev)
             return added
         except Exception as e:
-            log.error("Error actualizando lista blanca: %s", e)
+            log.error("Error actualizando lista blanca: %s", e, exc_info=True)
             return []
 
     def _show_rules_context_menu(self, event):
@@ -308,6 +339,7 @@ class AppsPage(ttk.Frame):
     def collect(self) -> dict:
         """Devuelve las reglas actuales (bloqueos)."""
         ba, be, bp = [], [], []
+
         def dedupe(seq):
             seen, out = set(), []
             for x in seq:
@@ -315,6 +347,7 @@ class AppsPage(ttk.Frame):
                     seen.add(x)
                     out.append(x)
             return out
+
         for iid in self.tv.get_children(""):
             tipo, valor, _ = self.tv.item(iid, "values")
             if not valor:
@@ -325,24 +358,48 @@ class AppsPage(ttk.Frame):
                 be.append(os.path.normpath(valor.strip()))
             elif tipo == "Carpeta":
                 bp.append(os.path.normpath(valor.strip()))
-        return {"blocked_apps": dedupe(ba), "blocked_executables": dedupe(be), "blocked_paths": dedupe(bp)}
+        return {
+            "blocked_apps": dedupe(ba),
+            "blocked_executables": dedupe(be),
+            "blocked_paths": dedupe(bp),
+        }
 
     def _save_rules(self):
         """Guarda bloqueos en storage sin tocar game_whitelist."""
         try:
             data = self.collect()
-            cfg = load_config()
-            cfg["blocked_apps"] = data["blocked_apps"]
-            cfg["blocked_executables"] = data["blocked_executables"]
-            cfg["blocked_paths"] = data["blocked_paths"]
-            save_config(cfg)
+
+            def _mut(cfg):
+                cfg["blocked_apps"] = data["blocked_apps"]
+                cfg["blocked_executables"] = data["blocked_executables"]
+                cfg["blocked_paths"] = data["blocked_paths"]
+                return cfg
+
+            cfg = update_config(_mut)  # normaliza y guarda
             self.cfg = cfg
             self._cfg_snapshot = self._snapshot_from_cfg(cfg)
             messagebox.showinfo("OK", "Reglas guardadas correctamente.\nSe aplicarán en unos segundos.")
-            log.info("Reglas guardadas (%d total).", len(data["blocked_apps"]) + len(data["blocked_executables"]) + len(data["blocked_paths"]))
+            log.info(
+                "Reglas guardadas (%d total).",
+                len(data["blocked_apps"]) + len(data["blocked_executables"]) + len(data["blocked_paths"]),
+            )
         except Exception as e:
             messagebox.showerror("Error", f"No se pudieron guardar las reglas:\n{e}")
             log.error("Error guardando reglas: %s", e, exc_info=True)
+
+    def _test_block_notification(self):
+        """Inserta un evento de bloqueo de prueba para que el Notifier lo muestre."""
+        try:
+            if _AUDIT is None:
+                raise RuntimeError("AuditLogger no disponible")
+            _AUDIT.log_block("AplicacionDePrueba.exe", reason="test/gui")
+            messagebox.showinfo(
+                "OK",
+                "Se insertó un bloqueo de prueba.\nSi el Notifier está activo, verás la notificación en unos segundos.",
+            )
+        except Exception as e:
+            log.error("No se pudo registrar el bloqueo de prueba: %s", e)
+            messagebox.showerror("Error", f"No se pudo registrar el bloqueo de prueba:\n{e}")
 
     def apply_theme(self, dark: bool):
         self.dark = dark

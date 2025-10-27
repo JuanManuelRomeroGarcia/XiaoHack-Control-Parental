@@ -2,7 +2,7 @@ import json
 import winreg
 from utils.cache import memo_ttl
 from utils.winproc import _ps
-from logs import get_logger
+from app.logs import get_logger
 log = get_logger("brave")
 
 HKCU = r"HKCU:\Software\Policies\BraveSoftware\Brave"

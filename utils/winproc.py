@@ -6,7 +6,7 @@ import os
 import shlex
 import time
 from typing import List, Tuple, Union
-from logs import get_logger
+from app.logs import get_logger
 
 log = get_logger("winproc")
 
