@@ -24,16 +24,16 @@ try:
     WM_CLOSE = getattr(_w32con, "WM_CLOSE", 0x0010)
 except Exception:
     WM_CLOSE = 0x0010
-    
+
 from app.webfilter import ensure_hosts_rules, remove_parental_block
 from app.audit import AuditLogger
 from app.logs import get_logger, install_exception_hooks
 from app.storage import (
     load_config, load_state, now_epoch,
-    DB_PATH, LOGS_DIR, save_state
+    DB_PATH, LOGS_DIR, save_state,
+    set_data_dir_forced as _storage_set_data_dir_forced,  # ⬅️ añadido
 )
-
-from app.scheduler import check_playtime_alerts, remaining_play_seconds, is_within_allowed_hours 
+from app.scheduler import check_playtime_alerts, remaining_play_seconds, is_within_allowed_hours
 
 try:
     import pythoncom  # type: ignore
@@ -58,12 +58,22 @@ try:
 except Exception:
     pass
 
-
 # =============================================================================
 # Config básica y logger
 # =============================================================================
 BASE_DIR = Path(__file__).resolve().parent
 PROTECT_SELF = False  # pon True si quieres blindar la carpeta de instalación
+
+# ⬇️ Forzar data dir único (ProgramData) respetando XH_DATA_DIR si viene del .bat
+try:
+    _data_env = os.getenv("XH_DATA_DIR")
+    if _data_env:
+        _storage_set_data_dir_forced(Path(_data_env))
+    else:
+        _storage_set_data_dir_forced(Path(os.getenv("ProgramData", r"C:\ProgramData")) / "XiaoHackParental")
+except Exception:
+    # no impedimos el arranque si falla el forzado
+    pass
 
 log = get_logger("guardian")
 install_exception_hooks("guardian-crash")

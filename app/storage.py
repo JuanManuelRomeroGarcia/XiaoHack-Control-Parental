@@ -9,10 +9,24 @@ import tempfile
 import time
 import threading
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Union
 
 # Importamos utilidades del logger central para unificar el "data dir"
-from app.logs import get_logger, get_data_dir as _logs_get_data_dir, set_data_dir as _logs_set_data_dir  # noqa: F401
+from app.logs import (
+    get_logger,
+    get_data_dir as _logs_get_data_dir,
+    set_data_dir as _logs_set_data_dir,  # noqa: F401
+)
+
+# ========= APLICAR OVERRIDE TEMPRANO (si viene de los .bat) ====================
+# Esto asegura que el logger ya se inicialice apuntando al DATA_DIR correcto.
+try:
+    _XH_ENV = os.getenv("XH_DATA_DIR")
+    if _XH_ENV:
+        _logs_set_data_dir(_XH_ENV)
+except Exception:
+    # No impedimos el arranque si falla el override del entorno
+    pass
 
 log = get_logger("storage")
 
@@ -204,6 +218,8 @@ def load_config() -> dict:
     # Asegurar flags presentes
     cfg.setdefault("safesearch", False)
     cfg.setdefault("apply_on_start", False)
+    # Normalización de dominios (limpia http(s):// y slashes) por si llegan del UI
+    cfg["blocked_domains"] = _norm_domain_list(cfg.get("blocked_domains", []))
     return cfg
 
 def save_config(cfg: dict):
@@ -221,7 +237,7 @@ def load_state() -> dict:
 def save_state(st: dict):
     log.debug("Guardando estado (%s claves)", len(st))
     _atomic_write(STATE_PATH, st)
-    
+
 # --- Normalizadores (para uso común en GUI/servicios) ---
 def _norm_list(xs):
     return [x for x in (xs or []) if isinstance(x, str) and x.strip()]
@@ -231,7 +247,7 @@ def _norm_domain_list(xs):
     for x in _norm_list(xs):
         x = x.strip().lower()
         # quitar http(s):// y trailing slashes si vinieran del UI
-        if x.startswith("http://"): 
+        if x.startswith("http://"):
             x = x[7:]
         if x.startswith("https://"):
             x = x[8:]
@@ -270,13 +286,14 @@ def data_dir() -> str:
     """Ruta del directorio de datos activo."""
     return str(DATA_DIR)
 
-def set_data_dir_forced(path: str) -> None:
+def set_data_dir_forced(path: Union[str, os.PathLike[str], Path]) -> None:
     """
-    Fuerza el data_dir para esta sesión (tests). Debe llamarse muy temprano.
+    Fuerza el data_dir para esta sesión (tests/arranques controlados).
     También ajusta el de logs para mantener coherencia.
     """
     global DATA_DIR, CONFIG_PATH, STATE_PATH, DB_PATH, LOGS_DIR
-    _logs_set_data_dir(path)
+    p_str = str(path)
+    _logs_set_data_dir(p_str)
     DATA_DIR = _get_data_dir()
     CONFIG_PATH = DATA_DIR / "config.json"
     STATE_PATH  = DATA_DIR / "state.json"
@@ -287,7 +304,7 @@ def set_data_dir_forced(path: str) -> None:
     except Exception:
         pass
     log.info("Data dir forzado a: %s", DATA_DIR)
-    
+
 # --- Path getters (reutilizables) ---
 def get_config_path() -> Path:
     return CONFIG_PATH

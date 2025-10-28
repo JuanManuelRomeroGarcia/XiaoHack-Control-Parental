@@ -23,9 +23,8 @@ from app.storage import (
 )
 
 from utils.runtime import parse_role, set_process_title, set_appusermodelid
-
-
 from app.logs import get_logger, install_exception_hooks
+
 log = get_logger("notifier")
 install_exception_hooks("notifier-crash")
 
@@ -43,25 +42,33 @@ except Exception:
     pass
 
 # --------------------------------------------------------------------
-# Forzar data_dir a ProgramData (mismo que guardian)
+# Rutas de instalación/datos (respetando variables de entorno de los .bat)
 # --------------------------------------------------------------------
+BASE = Path(__file__).resolve().parent               # ...\app
+INSTALL_DIR = Path(os.getenv("XH_INSTALL_DIR", str(BASE.parent)))  # raíz de instalación
+ASSETS_DIR = INSTALL_DIR / "assets"
 
-PROGRAMDATA_DIR = Path(os.getenv("PROGRAMDATA", r"C:\ProgramData")) / "XiaoHackParental"
+# Forzar data_dir a lo que venga en XH_DATA_DIR o a ProgramData\XiaoHackParental
+_XH_DATA_ENV = os.getenv("XH_DATA_DIR", "")
+if _XH_DATA_ENV:
+    DATA_DIR_FORCED = Path(_XH_DATA_ENV)
+else:
+    DATA_DIR_FORCED = Path(os.getenv("PROGRAMDATA", r"C:\ProgramData")) / "XiaoHackParental"
+
 try:
-    _storage_set_data_dir_forced(str(PROGRAMDATA_DIR))
-    log.info("Notifier data_dir forzado a ProgramData: %s", _storage_data_dir())
+    _storage_set_data_dir_forced(str(DATA_DIR_FORCED))
+    log.info("Notifier data_dir forzado: %s", _storage_data_dir())
 except Exception as e:
-    log.warning("No se pudo forzar data_dir a ProgramData: %s", e)
+    log.warning("No se pudo forzar data_dir: %s", e)
+
 DB_PD = _STORAGE_DB_PATH
+CONFIG_PATH_PD = DATA_DIR_FORCED / "config.json"
 
-
-BASE = Path(__file__).resolve().parent
+# Estado local por-usuario (para recordar último id de evento mostrado)
 APPDATA = Path(os.getenv("APPDATA", str(BASE)))
 STATE_DIR = APPDATA / "XiaoHackParental"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = STATE_DIR / "notifier_state.json"
-
-CONFIG_PATH_PD = PROGRAMDATA_DIR / "config.json"
 
 APP_ID      = "XiaoHack.Parental"
 APP_DISPLAY = "XiaoHack Control Parental"
@@ -101,6 +108,11 @@ def register_appid_in_registry(app_id: str, display_name: str, icon_path: str | 
         log.warning("Fallo al registrar AppID: %s", e)
 
 def ensure_appid_shortcut(app_id: str, icon_path: str | None = None):
+    """
+    Crea/actualiza un acceso directo en el Menú Inicio del usuario que lanza:
+      pythonw.exe -m app.notifier --xh-role notifier
+    con WorkingDirectory en la raíz de instalación (INSTALL_DIR).
+    """
     try:
         import pythoncom
         from win32com.shell import shell  # type: ignore
@@ -112,8 +124,8 @@ def ensure_appid_shortcut(app_id: str, icon_path: str | None = None):
         lnk_path = str((start_menu / "XiaoHack Parental.lnk").resolve())
 
         pyw = Path(sys.executable).with_name("pythonw.exe")
-        args = f"\"{(BASE / 'notifier.py').resolve()}\" --xh-role notifier"
-        workdir = str(BASE)
+        args = "-m app.notifier --xh-role notifier"
+        workdir = str(INSTALL_DIR)
 
         link = pythoncom.CoCreateInstance(shell.CLSID_ShellLink, None,
                                           pythoncom.CLSCTX_INPROC_SERVER,
@@ -148,19 +160,19 @@ def ensure_appid_shortcut(app_id: str, icon_path: str | None = None):
 WINRT_OK = WINOTIFY_OK = False
 TOASTER = None
 try:
-    from winsdk.windows.ui.notifications import ToastNotificationManager, ToastNotification # type: ignore
-    from winsdk.windows.data.xml.dom import XmlDocument # type: ignore
+    from winsdk.windows.ui.notifications import ToastNotificationManager, ToastNotification  # type: ignore
+    from winsdk.windows.data.xml.dom import XmlDocument  # type: ignore
     WINRT_OK = True
 except Exception:
     pass
 try:
-    from winotify import Notification as WNotify, audio as wnaudio # type: ignore
+    from winotify import Notification as WNotify, audio as wnaudio  # type: ignore
     WINOTIFY_OK = True
 except Exception:
     pass
 if not WINOTIFY_OK:
     try:
-        from win10toast import ToastNotifier # type: ignore
+        from win10toast import ToastNotifier  # type: ignore
         TOASTER = ToastNotifier()
     except Exception:
         pass
@@ -173,14 +185,16 @@ def _show_winrt_toast(title: str, msg: str, icon_path: str | None = None):
     xdoc.load_xml(xml)
     ToastNotificationManager.create_toast_notifier(APP_ID).show(ToastNotification(xdoc))
 
-def notify(title: str, msg: str, duration=5):
-    icon = None
+def _pick_icon() -> str | None:
     for cand in ("app_icon.ico", "app_icon.png"):
-        p = BASE / "assets" / cand
+        p = ASSETS_DIR / cand
         if p.exists():
-            icon = str(p)
-            break
-    log.info("Notificación: %s | %s", title, msg[:80])
+            return str(p)
+    return None
+
+def notify(title: str, msg: str, duration=5):
+    icon = _pick_icon()
+    log.info("Notificación: %s | %s", title, (msg or "")[:80])
     if WINRT_OK:
         try:
             _show_winrt_toast(title, msg, icon)
@@ -372,10 +386,8 @@ try:
         px = struct.pack("BBBB", bg[2], bg[1], bg[0], bg[3])  # noqa: F841
         # Rellenar
         ctypes.memset(bits, 0, w * h * 4)
-        # (memset negro con alpha 0; para alpha global lo hacemos con blend)
 
         # Render del texto (blanco)
-        # Elegimos tamaños relativos a la diagonal
         import math
         diag = int(math.hypot(w, h))
         size_main = max(72, diag // 18)
@@ -434,7 +446,6 @@ try:
             self._current_bitmap = None
 
         def _blit_text(self, text: str):
-            # Crear bitmap con texto y hacer UpdateLayeredWindow
             hbmp = _create_text_bitmap(self.w, self.h, text, self.subtitle)
             hdc_screen = win32gui.GetDC(0)
             hdc_mem = win32gui.CreateCompatibleDC(hdc_screen)
@@ -620,12 +631,7 @@ def overlay_loop(stop_ev: threading.Event):
 # --------------------------------------------------------------------
 def main():
     log.info("Notifier iniciado. Overlay=%s", _OVERLAY_IMPL)
-    icon_path = None
-    for cand in ("app_icon.ico", "app_icon.png"):
-        p = BASE / "assets" / cand
-        if p.exists():
-            icon_path = str(p)
-            break
+    icon_path = _pick_icon()
 
     register_appid_in_registry(APP_ID, APP_DISPLAY, icon_path)
     ensure_appid_shortcut(APP_ID, icon_path)

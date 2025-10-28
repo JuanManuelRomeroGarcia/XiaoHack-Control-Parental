@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+import time
 from tkinter import messagebox
 # Helpers de runtime/rutas (proporcionados en utils/runtime.py)
 from utils.runtime import (
@@ -167,25 +168,23 @@ def check_update_and_maybe_apply_async(root_tk) -> None:
 
 def auto_check_updates_once(root):
     """
-    Chequeo no bloqueante: autodetecta si el updater va como módulo (-m app.updater)
-    o como script (updater.py en raíz).
+    Chequeo no bloqueante: autodetecta si el updater va como módulo (-m app.updater).
     """
-    import os
     import json
     import subprocess
     from pathlib import Path
 
     def _run():
-        base = find_install_root(Path(__file__).resolve())
+        base = find_install_root()  # ← antes pasaba un Path inválido
         py_console = Path(python_for_console())
         py_window  = Path(python_for_windowed())
-                          
+
         cmd_check = [str(py_console), "-m", "app.updater", "--check"]
         cmd_apply = [str(py_window),  "-m", "app.updater", "--apply"]
 
         # Log del updater (por si algo falla)
         try:
-            _logdir = Path(os.getenv("ProgramData", r"C:\ProgramData")) / "XiaoHackParental" / "logs"
+            _logdir = datadir_system() / "logs"
             _logdir.mkdir(parents=True, exist_ok=True)
             gui_log = _logdir / "updater_gui.log"
         except Exception:
@@ -206,7 +205,10 @@ def auto_check_updates_once(root):
 
         try:
             _write_log(f"[check] cmd={cmd_check} cwd={base}")
-            out = subprocess.check_output(cmd_check, stderr=subprocess.STDOUT, cwd=str(base), env=env, timeout=180, creationflags=0x08000000)
+            out = subprocess.check_output(
+                cmd_check, stderr=subprocess.STDOUT, cwd=str(base), env=env,
+                timeout=180, creationflags=0x08000000
+            )
             txt = out.decode("utf-8", "ignore")
             _write_log(f"[check] stdout:\n{txt}")
             res = json.loads(txt)
@@ -217,7 +219,10 @@ def auto_check_updates_once(root):
                 def _apply():
                     try:
                         _write_log(f"[apply] cmd={cmd_apply}")
-                        subprocess.check_call(cmd_apply, cwd=str(base), env=env, creationflags=0x08000000)
+                        subprocess.check_call(
+                            cmd_apply, cwd=str(base), env=env,
+                            creationflags=0x08000000
+                        )
                         messagebox.showinfo(
                             "Actualización",
                             "Actualización instalada correctamente.\nReinicia el Panel para ver los cambios."
@@ -440,79 +445,125 @@ def _find_notifier_script() -> Path:
 def notifier_status() -> dict:
     """
     Devuelve {'exists': bool, 'running': bool, 'pids': [..]}.
-    Usa psutil si está; si no, tasklist como fallback.
+    Considera python.exe/pythonw.exe con '-m app.notifier' o 'notifier.py',
+    filtrado al USUARIO ACTUAL.
     """
-    script = _find_notifier_script()
-    exists = script.exists()
+    root = find_install_root()
+    bat = root / "run_notifier.bat"
+    exists = bat.exists()
     running = False
     pids = []
 
     try:
-        import psutil  # type: ignore
-        for p in psutil.process_iter(attrs=["pid","name","cmdline"]):
+        import psutil
+        import getpass  # type: ignore
+        me = getpass.getuser().lower()
+        for p in psutil.process_iter(attrs=["pid","name","username","cmdline"]):
             try:
-                cmd = " ".join(p.info.get("cmdline") or [])
-                if "--xh-role" in cmd and "notifier" in cmd.lower():
+                user = (p.info.get("username") or "").lower()
+                if user and (me not in user):
+                    continue  # solo sesión actual
+                name = (p.info.get("name") or "").lower()
+                if name not in ("python.exe", "pythonw.exe"):
+                    continue
+                cmd = " ".join(p.info.get("cmdline") or []).lower().replace("\\", "/")
+                if ("-m app.notifier" in cmd) or ("/app/notifier.py" in cmd) or (" notifier.py" in cmd):
                     running = True
-                    pids.append(p.info["pid"])
-                elif "notifier.py" in cmd.replace("\\", "/").lower():
-                    running = True
-                    pids.append(p.info["pid"])
+                    pids.append(int(p.info["pid"]))
             except Exception:
                 continue
-        return {"exists": exists, "running": running, "pids": pids}
     except Exception:
-        # Fallback sin psutil
+        # Fallback muy básico sin psutil:
         try:
             out = subprocess.check_output(["tasklist", "/FO", "CSV"], text=True, creationflags=0x08000000)
             for line in out.splitlines():
                 l1 = line.lower()
-                if "pythonw.exe" in l1 or "python.exe" in l1:
-                    if "notifier" in l1:
-                        running = True
-                        # no tenemos PID fiable en este fallback sin parseo completo
-                        break
+                if ("pythonw.exe" in l1 or "python.exe" in l1) and "notifier" in l1:
+                    running = True
+                    break
         except Exception:
             pass
-        return {"exists": exists, "running": running, "pids": pids}
+
+    return {"exists": exists, "running": running, "pids": pids}
 
 def start_notifier() -> bool:
-    """Lanza el Notifier en segundo plano con pythonw.exe."""
-    script = _find_notifier_script()
-    if not script.exists():
-        return False
-    pyw = Path(python_for_windowed())
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUTF8"] = "1"
-    try:
-        subprocess.Popen([str(pyw), str(script), "--xh-role", "notifier"], cwd=str(find_install_root()),
-                         env=env, creationflags=0x08000000)
-        return True
-    except Exception:
+    """
+    Lanza el Notifier vía run_notifier.bat (oculto, sesión actual),
+    sin tocar APPDATA/LOCALAPPDATA.
+    """
+    root = find_install_root()
+    bat = root / "run_notifier.bat"
+    if not bat.exists():
+        log.error("run_notifier.bat no existe: %s", bat)
         return False
 
-def stop_notifier() -> bool:
-    """Intenta terminar cualquier proceso del Notifier."""
-    ok = False
+    comspec = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
     try:
-        import psutil  # type: ignore
-        for p in psutil.process_iter(attrs=["pid","name","cmdline"]):
+        subprocess.Popen([comspec, "/c", str(bat)],
+                         cwd=str(root),
+                         creationflags=0x08000000,  # CREATE_NO_WINDOW
+                         close_fds=True)
+    except Exception as e:
+        log.error("start_notifier Popen error: %s", e)
+        return False
+
+    # pequeña espera y verificación
+    for _ in range(10):
+        time.sleep(0.2)
+        if notifier_status().get("running"):
+            return True
+    return False
+
+def stop_notifier() -> bool:
+    """
+    Termina cualquier Notifier de la sesión actual (pythonw/python con '-m app.notifier' o 'notifier.py').
+    """
+    ok_any = False
+    try:
+        import psutil
+        import getpass  # type: ignore
+        me = getpass.getuser().lower()
+        targets = []
+        for p in psutil.process_iter(attrs=["pid","name","username","cmdline"]):
             try:
-                cmd = " ".join(p.info.get("cmdline") or [])
-                if ("--xh-role" in cmd and "notifier" in cmd.lower()) or ("notifier.py" in cmd.lower()):
-                    try:
-                        p.terminate()
-                        ok = True
-                    except Exception:
-                        pass
+                user = (p.info.get("username") or "").lower()
+                if user and (me not in user):
+                    continue
+                name = (p.info.get("name") or "").lower()
+                if name not in ("python.exe", "pythonw.exe"):
+                    continue
+                cmd = " ".join(p.info.get("cmdline") or []).lower().replace("\\", "/")
+                if ("-m app.notifier" in cmd) or ("/app/notifier.py" in cmd) or (" notifier.py" in cmd):
+                    targets.append(p)
             except Exception:
                 continue
-        return ok
-    except Exception:
-        # Fallback best-effort: mata pythonw con filtro de ventana no fiable (evitamos).
-        # Devolvemos False para no dar falsa sensación.
-        return False
+
+        for p in targets:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        gone, alive = psutil.wait_procs(targets, timeout=2.0)
+        for p in alive:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        ok_any = bool(gone) and not alive
+
+    except Exception as e:
+        log.warning("stop_notifier psutil fallback: %s", e)
+        # Fallback best-effort (puede matar otros python del usuario, ÚSALO solo si hace falta)
+        try:
+            subprocess.run(["taskkill", "/F", "/IM", "pythonw.exe"], capture_output=True, text=True, creationflags=0x08000000)
+            subprocess.run(["taskkill", "/F", "/IM", "python.exe"],  capture_output=True, text=True, creationflags=0x08000000)
+        except Exception:
+            pass
+
+    # Comprobar estado final
+    time.sleep(0.3)
+    return not notifier_status().get("running", False) or ok_any
+
 
 
 def open_logs_folder():
@@ -526,9 +577,16 @@ def open_logs_folder():
         log.error("open_logs_folder error: %s", e)
 
 def open_control_log():
-    """Abre el archivo control.log con el visor por defecto."""
+    """
+    Abre ProgramData\XiaoHackParental\logs\control.log con el visor por defecto.
+    Crea el fichero si no existe.
+    """
     try:
-        import webbrowser
-        webbrowser.open(str(control_log_path()))
+        p = datadir_system() / "logs" / "control.log"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if not p.exists():
+            p.write_text("", encoding="utf-8")
+        os.startfile(str(p))
     except Exception as e:
         log.error("open_control_log error: %s", e)
+        raise
