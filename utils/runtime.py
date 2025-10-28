@@ -1,5 +1,6 @@
 # utils/runtime.py
 from __future__ import annotations
+import os
 import sys
 import ctypes
 import traceback
@@ -74,6 +75,40 @@ def quote(s: str) -> str:
             return f'"{s}"'
     return s
 
+def find_install_root(start: Path | None = None) -> Path:
+    """
+    Localiza la carpeta de instalación del runtime.
+    Prioriza:
+      1) var de entorno XH_INSTALL_DIR (instalador)
+      2) carpeta padre que contenga updater.py o VERSION
+      3) cwd
+    """
+    env = os.environ.get("XH_INSTALL_DIR", "").strip()
+    if env:
+        p = Path(env)
+        if p.exists():
+            return p
+
+    here = Path(start or Path(__file__).resolve()).resolve()
+    p = here
+    for _ in range(6):
+        if (p / "app").is_dir() or (p / "VERSION").exists() or (p / "VERSION.json").exists():
+            return p
+        if p.parent == p:
+            break
+        p = p.parent
+
+    return Path.cwd()
+
+def read_version(base: Path | None = None) -> str:
+    """
+    Devuelve la versión del runtime leyendo el fichero VERSION (utf-8).
+    """
+    try:
+        root = find_install_root(base)
+        return (root / "VERSION").read_text(encoding="utf-8").strip()
+    except Exception:
+        return "0.0.0"
 
 # --- Parseo de rol -------------------------------------------------------------
 def parse_role(argv: list[str]) -> Optional[str]:

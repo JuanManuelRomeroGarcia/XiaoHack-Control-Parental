@@ -162,7 +162,7 @@ def _dedup_and_clean(lines: List[str]) -> List[str]:
 
 def _flush_dns():
     try:
-        subprocess.run(["ipconfig", "/flushdns"], capture_output=True, text=True, check=False)
+        subprocess.run(["ipconfig", "/flushdns"], capture_output=True, text=True, check=False, creationflags=0x08000000)
         log.info("DNS cache limpiada (ipconfig /flushdns).")
     except Exception as e:
         log.warning("No se pudo limpiar cache DNS: %s", e)
@@ -381,7 +381,7 @@ def _powershell_elevated_wait(args: list[str]) -> int:
         )
     ]
     try:
-        cp = subprocess.run(ps, capture_output=True, text=True)
+        cp = subprocess.run(ps, capture_output=True, text=True, creationflags=0x08000000)
         if cp.stdout:
             log.debug("PS STDOUT: %s", cp.stdout.strip())
         if cp.stderr:

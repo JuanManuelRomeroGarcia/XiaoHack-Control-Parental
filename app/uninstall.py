@@ -238,7 +238,7 @@ foreach ($i in $ifaces) {
 '''
     try:
         cp = subprocess.run(["PowerShell","-NoProfile","-ExecutionPolicy","Bypass","-Command", ps],
-                            capture_output=True, text=True)
+                            capture_output=True, text=True, creationflags=0x08000000)
         log.info("[dns] Auto (fallback PS) rc=%s out=%s err=%s", cp.returncode, (cp.stdout or "").strip(), (cp.stderr or "").strip())
     except Exception as e:
         log.warning("[dns] Fallback PS error: %s", e)
@@ -288,7 +288,7 @@ foreach ($p in $paths) {
 '''
     try:
         cp = subprocess.run(["PowerShell","-NoProfile","-ExecutionPolicy","Bypass","-Command", ps],
-                            capture_output=True, text=True)
+                            capture_output=True, text=True, creationflags=0x08000000)
         log.info("[doh] Fallback PS rc=%s out=%s err=%s", cp.returncode, (cp.stdout or "").strip(), (cp.stderr or "").strip())
     except Exception as e:
         log.warning("[doh] Fallback PS error: %s", e)  

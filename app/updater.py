@@ -3,6 +3,7 @@
 # - Elevación UAC sólo al aplicar (si faltan permisos)
 # - Detiene/relanza tarea SYSTEM del Guardian de forma segura
 # - No toca ProgramData ni LocalAppData (solo binarios en INSTALL_DIR)
+# --- bootstrap de imports cuando se ejecuta por ruta --------------------------
 
 from __future__ import annotations
 import json
@@ -17,6 +18,15 @@ from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
 
+# --- bootstrap de imports cuando se ejecuta por ruta --------------------------
+# Permite "from app..." aunque se lance updater.py por ruta.
+_ROOT = Path(__file__).resolve().parents[1]  # ...\XiaoHackParental
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+# ------------------------------------------------------------------------------
+
+from app.logs import get_logger  # noqa: E402
+
 try:
     import sys
     if hasattr(sys.stdout, "reconfigure"):
@@ -24,8 +34,9 @@ try:
 except Exception:
     pass
 
-from app.logs import get_logger
+
 log = get_logger("gui.Updater")
+
 
 # ---------------- Config GitHub (con overrides por entorno) ----------------
 # [XH] Permitir override para pruebas con forks o ramas
@@ -33,8 +44,27 @@ OWNER = os.getenv("XH_GH_OWNER", "JuanManuelRomeroGarcia")  # [XH]
 REPO  = os.getenv("XH_GH_REPO",  "XiaoHack-Control-Parental")  # [XH]
 API_LATEST = f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest"
 
+
 # [XH] Timeout y UA
 HTTP_TIMEOUT = float(os.getenv("XH_HTTP_TIMEOUT", "60"))  # segs  # [XH]
+
+# --- Texto / versiones: robusto con BOM y normalización ----------------------
+def _read_text_clean(path):
+    # Lee UTF-8 con/sin BOM y limpia espacios/BOM residuales
+    return path.read_text(encoding="utf-8-sig").strip().lstrip("\ufeff")
+
+def _write_text_utf8(path, text):
+    # Escribe en UTF-8 sin BOM (con LF final estándar)
+    path.write_text((text or "").rstrip() + "\n", encoding="utf-8")
+
+def _normalize_version_str(v: str) -> str:
+    # quita prefijo "v", recorta y deja solo "X.Y.Z" (o "X.Y")
+    v = (v or "").strip()
+    if v.lower().startswith("v"):
+        v = v[1:].strip()
+    return v
+# -----------------------------------------------------------------------------
+
 
 def _local_version_for_ua() -> str:  # [XH]
     try:
@@ -46,9 +76,12 @@ def _build_user_agent() -> str:  # [XH]
     return f"XiaoHack-Updater/{_local_version_for_ua()} (+https://github.com/{OWNER}/{REPO})"
 
 # Rutas
-BASE_DIR     = Path(__file__).resolve().parent             # carpeta instalada (Program Files\XiaoHackParental)
-INSTALL_DIR  = BASE_DIR
-VERSION_FILE = INSTALL_DIR / "VERSION"
+BASE_DIR     = Path(__file__).resolve().parent   
+INSTALL_DIR  = _ROOT                                        
+VER_JSON = INSTALL_DIR / "VERSION.json"
+VER_TXT  = INSTALL_DIR / "VERSION"
+
+
 
 # Tarea programada del servicio guardian (SYSTEM)
 TASK_GUARDIAN = r"XiaoHackParental\Guardian"
@@ -104,11 +137,27 @@ def _ver_tuple(v: str):
         parts.append(0)
     return tuple(parts[:3])
 
-def read_local_version():
+def read_local_version() -> str:
+    # Prioriza JSON, luego texto; ambos BOM-safe
     try:
-        return VERSION_FILE.read_text(encoding="utf-8").strip()
+        if VER_JSON.exists():
+            data = json.loads(_read_text_clean(VER_JSON))
+            v = _normalize_version_str(data.get("version", ""))
+            if v:
+                return v
     except Exception:
-        return "0.0.0"
+        pass
+    try:
+        if VER_TXT.exists():
+            return _normalize_version_str(_read_text_clean(VER_TXT)) or "0.0.0"
+    except Exception:
+        pass
+    return "0.0.0"
+
+def write_local_version(new_version: str) -> None:
+    # Escribe SIEMPRE JSON bonito y sin BOM
+    data = {"version": _normalize_version_str(new_version)}
+    _write_text_utf8(VER_JSON, json.dumps(data, ensure_ascii=False))
 
 def get_latest_release():
     """
@@ -117,8 +166,9 @@ def get_latest_release():
     """
     try:
         data = json.loads(_http_get(API_LATEST).decode("utf-8"))
-        tag = (data.get("tag_name") or data.get("name") or "").lstrip("v").strip()
-        assets = data.get("assets", [])
+        tag = _normalize_version_str((data.get("tag_name") or data.get("name") or ""))
+        assets = data.get("assets", []) or []
+        # Intenta casar con tus nombres zip esperados según 'tag'
         wanted = set(candidate_zip_names(tag)) if tag else set()
         zip_asset = None
         by_name = {a.get("name", ""): a for a in assets}
@@ -127,13 +177,54 @@ def get_latest_release():
                 zip_asset = by_name[name]
                 break
         if not zip_asset:
-            zips = [a for a in assets if (a.get("name", "").lower().endswith(".zip"))]
+            zips = [a for a in assets if a.get("name", "").lower().endswith(".zip")]
             if len(zips) == 1:
                 zip_asset = zips[0]
-        return tag, zip_asset
+        return (tag or None), zip_asset
     except Exception as e:
         log.error("Error obteniendo última versión desde GitHub: %s", e, exc_info=True)
-        return None, None  # señal de error controlado
+        return None, None
+
+
+def get_latest_version_fallback(owner: str, repo: str, branch: str = "main"):
+    """
+    Intenta leer VERSION.json o VERSION desde la rama.
+    Devuelve (latest_version, error_str|None).
+    """
+    last_err = None
+    urls = [
+        f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/VERSION.json",
+        f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/VERSION",
+    ]
+    for url in urls:
+        try:
+            raw = _http_get(url)
+            if url.endswith(".json"):
+                data = json.loads(raw.decode("utf-8"))
+                v = _normalize_version_str(data.get("version", ""))
+            else:
+                v = _normalize_version_str(raw.decode("utf-8-sig", "replace").strip().lstrip("\ufeff"))
+            if v:
+                return v, None
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+    return None, (last_err or "No se pudo leer VERSION en raw.githubusercontent.com")
+
+
+def resolve_latest_version(owner: str, repo: str, branch: str = "main"):
+    """
+    Devuelve (latest_version|None, error_str|None).
+    Primero intenta releases, si no hay, cae a raw VERSION.
+    """
+    tag, _asset = get_latest_release()
+    if tag:
+        return tag, None
+    latest, err = get_latest_version_fallback(owner, repo, branch)
+    if latest:
+        return latest, None
+    return None, (err or "No se pudo obtener la versión de GitHub")
+
+
 
 def _should_skip(path: str, is_dir: bool) -> bool:
     name = os.path.basename(path)
@@ -149,13 +240,13 @@ def _should_skip(path: str, is_dir: bool) -> bool:
 
 def _stop_guardian_task():
     try:
-        subprocess.run(["schtasks", "/End", "/TN", TASK_GUARDIAN], check=False, capture_output=True)
+        subprocess.run(["schtasks", "/End", "/TN", TASK_GUARDIAN], check=False, capture_output=True, creationflags=0x08000000)
     except Exception:
         pass
 
 def _start_guardian_task():
     try:
-        subprocess.run(["schtasks", "/Run", "/TN", TASK_GUARDIAN], check=False, capture_output=True)
+        subprocess.run(["schtasks", "/Run", "/TN", TASK_GUARDIAN], check=False, capture_output=True, creationflags=0x08000000)
     except Exception:
         pass
 
@@ -274,40 +365,37 @@ def _is_admin() -> bool:
         return False
 
 def _elevate_and_apply(tmp_json: Path) -> int:
-    """
-    Re-lanza este updater con UAC y espera a que termine.
-    """
     py = os.path.normpath(sys.executable)
+    pyw = str(Path(py).with_name("pythonw.exe"))
+    py_to_use = pyw if os.path.exists(pyw) else py
     ps = [
         "PowerShell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+        "-WindowStyle", "Hidden",
         "-Command",
-        r"$p=Start-Process -Verb RunAs -FilePath '{}' -ArgumentList '{}','--apply-elevated','{}' -PassThru -Wait; exit $p.ExitCode".format(
-            py.replace("'", "''"),
+        r"$p=Start-Process -Verb RunAs -WindowStyle Hidden -FilePath '{}' -ArgumentList '{}','--apply-elevated','{}' -PassThru -Wait; exit $p.ExitCode".format(
+            py_to_use.replace("'", "''"),
             str(Path(__file__).resolve()).replace("'", "''"),
             str(tmp_json).replace("'", "''"),
         )
     ]
-    cp = subprocess.run(ps, capture_output=True, text=True)
+    cp = subprocess.run(ps, capture_output=True, text=True, creationflags=0x08000000)
     return cp.returncode
 
 # ---------------- API pública ----------------
 def check_for_update(auto_apply=False) -> dict:
     """
     Comprueba versión y, si auto_apply=True, aplica update con elevación si hace falta.
-    Devuelve: {"current","latest","update_available", "applied", "error"}
+    Devuelve: {"current","latest","update_available","applied","error"}
     """
     info = {"current": read_local_version(), "latest": None, "update_available": False, "applied": False, "error": None}
-    try:
-        latest, zip_asset = get_latest_release()
-        info["latest"] = latest
-    except Exception as e:
-        info["error"] = f"No se pudo consultar GitHub: {e}"
-        return info
 
+    # 1) Resolver latest con releases -> fallback a raw VERSION(.json)
+    latest, err = resolve_latest_version(OWNER, REPO, branch="main")  # cambia a "master" si toca
     if not latest:
-        info["error"] = "No se pudo leer la versión de GitHub."
+        info["error"] = f"No se pudo obtener la versión de GitHub: {err}"
         return info
 
+    info["latest"] = latest
     if _ver_tuple(latest) <= _ver_tuple(info["current"]):
         return info  # ya al día
 
@@ -315,28 +403,32 @@ def check_for_update(auto_apply=False) -> dict:
     if not auto_apply:
         return info
 
+    # 2) Para auto-apply necesitamos localizar el ZIP en releases
+    tag, zip_asset = get_latest_release()
+    if not tag or _normalize_version_str(tag) != _normalize_version_str(latest):
+        info["error"] = ("No se encontró un release con ZIP para esta versión. "
+                         "Descarga manual o publica el asset runtime.")
+        return info
     if not zip_asset:
         info["error"] = ("No se encontró un ZIP de runtime en el release. "
                          "Sugerido: XiaoHackParental-<version>-runtime.zip")
         return info
 
-    zip_url = zip_asset.get("browser_download_url")
-    zip_name = zip_asset.get("name","update.zip")
+    zip_url  = zip_asset.get("browser_download_url")
+    zip_name = zip_asset.get("name", "update.zip")
     if not zip_url:
         info["error"] = "El asset ZIP no tiene URL de descarga."
         return info
 
-    # Descarga y aplica (con elevación si hace falta)
+    # 3) Descarga/aplica (eleva si hace falta)
     try:
         with tempfile.TemporaryDirectory() as td:
             td_p = Path(td)
             local_zip = td_p / zip_name
             local_zip.write_bytes(_http_get(zip_url))
 
-            # Si no hay permisos de escritura en INSTALL_DIR, elevamos
             can_write = os.access(INSTALL_DIR, os.W_OK)
             if not can_write or not _is_admin():
-                # Guardamos la info temporal (ruta del zip descargado) para el proceso elevado
                 payload = {"zip": str(local_zip), "latest": latest, "install_dir": str(INSTALL_DIR)}
                 tmp_json = td_p / "apply.json"
                 tmp_json.write_text(json.dumps(payload), encoding="utf-8")
@@ -347,18 +439,18 @@ def check_for_update(auto_apply=False) -> dict:
                 info["applied"] = True
                 return info
 
-            # Caso: ya somos admin — aplicar en línea
             _stop_guardian_task()
             _kill_processes_in_install()
             time.sleep(0.5)
             _apply_zip_to_install(local_zip)
             try:
-                VERSION_FILE.write_text(latest + "\n", encoding="utf-8")
+                write_local_version(latest)
             except Exception:
                 pass
             _start_guardian_task()
             info["applied"] = True
             return info
+
     except Exception as e:
         try:
             _start_guardian_task()
@@ -366,6 +458,7 @@ def check_for_update(auto_apply=False) -> dict:
             pass
         info["error"] = f"Fallo al actualizar: {e}"
         return info
+
 
 # ---------------- Entrada CLI (modo elevado) ----------------
 def _apply_elevated_from_payload(payload_path: Path) -> int:
@@ -381,7 +474,7 @@ def _apply_elevated_from_payload(payload_path: Path) -> int:
         time.sleep(0.5)
         _apply_zip_to_install(zip_path)
         try:
-            VERSION_FILE.write_text(latest + "\n", encoding="utf-8")
+            write_local_version(latest)
         except Exception:
             pass
         _start_guardian_task()
@@ -392,6 +485,7 @@ def _apply_elevated_from_payload(payload_path: Path) -> int:
         except Exception:
             pass
         return 2
+
 
 if __name__ == "__main__":
     # Modos:

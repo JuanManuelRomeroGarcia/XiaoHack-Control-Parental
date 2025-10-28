@@ -1,14 +1,12 @@
 # xiao_gui/pages/options.py — XiaoHack GUI: pestaña Opciones (limpia y consolidada)
 from __future__ import annotations
 
-import json  # noqa: F401
+import json
 import os
-import sys  # noqa: F401
 import subprocess
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
-from pathlib import Path  # noqa: F401
 
 from app.logs import get_logger
 from ..dialogs import set_new_pin_hash
@@ -37,32 +35,21 @@ except Exception:
     def submit_limited(fn, *a, **k): return _EXEC.submit(fn, *a, **k)
 
 # Helpers consolidados del runtime/servicios
-from utils.runtime import read_version
+from utils.runtime import read_version, find_install_root, updater_path, python_for_console
 from xiao_gui.services import (
-    find_install_root,
-    run_updater_check_sync,
     run_updater_apply_ui,
     launch_uninstaller_ui,
-    query_task_state,
-    start_service,
-    stop_service,
+    query_task_state, start_service, stop_service,
     open_control_log,
-    notifier_status,
-    start_notifier,
-    stop_notifier,
-
+    notifier_status, start_notifier, stop_notifier,
 )
 
 log = get_logger("gui.options")
 
-# ----------------- helpers locales (schtasks, etc.) -----------------
-_TASK_FULLNAME = r"XiaoHackParental\Guardian"
 
-def _run(*cmd):
-    """Ejecuta un proceso en silencio y devuelve (rc, out, err)."""
-    p = subprocess.run(cmd, capture_output=True, text=True, creationflags=0x08000000)
-    return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
-
+# ---------------------------------------------------------------------------
+# utilidades locales
+# ---------------------------------------------------------------------------
 def _open_task_scheduler_local():
     """Abre el Programador de tareas."""
     try:
@@ -75,8 +62,8 @@ def _read_version_fallback() -> str:
     try:
         return read_version()
     except Exception:
-        root = find_install_root()
         try:
+            root = find_install_root()
             return (root / "VERSION").read_text(encoding="utf-8").strip()
         except Exception:
             return "0.0.0"
@@ -103,8 +90,8 @@ class OptionsPage(ttk.Frame):
     def on_show_async(self, rev=None):
         rev = self._gate.next_rev() if rev is None else rev
         submit_limited(self._task_refresh_service, rev)
-        self.after(1200, self._auto_check_updates)
         self.after(300, self.refresh_notifier)
+        self.after(1200, self._auto_check_updates)
 
     def refresh_lite(self):
         pass
@@ -112,63 +99,79 @@ class OptionsPage(ttk.Frame):
     # ---------------- Construcción UI --------------------
     def _build(self):
         pad = {"padx": 6, "pady": 6}
+        row = 0
 
-        # --- PIN ---
+        # --- PIN / Desinstalar ---
         top = ttk.Frame(self)
-        top.grid(row=0, column=0, sticky="ew")
+        top.grid(row=row, column=0, sticky="ew")
         top.grid_columnconfigure(2, weight=1)
-
         ttk.Label(top, text="Cambiar PIN del tutor").grid(row=0, column=0, sticky="w", **pad)
         ttk.Button(top, text="Cambiar PIN", command=self._change_pin).grid(row=0, column=1, sticky="w", **pad)
+        ttk.Button(top, text="Desinstalar XiaoHack…", command=self._uninstall_from_app).grid(row=0, column=3, sticky="e", padx=12)
+        row += 1
 
-        ttk.Button(top, text="Desinstalar XiaoHack…", command=self._uninstall_from_app)\
-            .grid(row=0, column=3, sticky="e", padx=12)
-
-        ttk.Separator(self).grid(row=1, column=0, columnspan=6, sticky="ew", padx=6, pady=12)
+        ttk.Separator(self).grid(row=row, column=0, sticky="ew", padx=6, pady=12)
+        row += 1
 
         # --- Apariencia ---
-        ttk.Label(self, text="Apariencia").grid(row=2, column=0, sticky="w", **pad)
+        ttk.Label(self, text="Apariencia").grid(row=row, column=0, sticky="w", **pad)
         ttk.Checkbutton(self, text="Tema oscuro", variable=self.ui_dark, command=self.on_toggle_theme)\
-            .grid(row=2, column=1, sticky="w", **pad)
+            .grid(row=row, column=0, sticky="e", padx=140, pady=6)
+        row += 1
 
-        ttk.Separator(self).grid(row=3, column=0, columnspan=6, sticky="ew", padx=6, pady=12)
+        ttk.Separator(self).grid(row=row, column=0, sticky="ew", padx=6, pady=12)
+        row += 1
 
-        # --- Servicio (guardian / tarea programada) ---
-        ttk.Label(self, text="Servicio (tarea programada): XiaoHackParental\\Guardian").grid(row=4, column=0, sticky="w", **pad)
+        # --- Servicio Guardian ---
+        ttk.Label(self, text="Servicio (tarea programada): XiaoHackParental\\Guardian").grid(row=row, column=0, sticky="w", **pad)
+        row += 1
+
         self.var_srv = tk.StringVar(value="Estado: (desconocido)")
-        ttk.Label(self, textvariable=self.var_srv).grid(row=5, column=0, sticky="w", **pad)
+        ttk.Label(self, textvariable=self.var_srv).grid(row=row, column=0, sticky="w", **pad)
+        row += 1
 
         btns_srv = ttk.Frame(self)
-        btns_srv.grid(row=6, column=0, sticky="w", **pad)
+        btns_srv.grid(row=row, column=0, sticky="w", **pad)
         ttk.Button(btns_srv, text="Iniciar servicio", command=self._start_service).grid(row=0, column=0, padx=4)
         ttk.Button(btns_srv, text="Detener servicio", command=self._stop_service).grid(row=0, column=1, padx=4)
         ttk.Button(btns_srv, text="Reiniciar servicio", command=self._restart_guardian).grid(row=0, column=2, padx=4)
         ttk.Button(btns_srv, text="Refrescar estado", command=self.refresh_service).grid(row=0, column=3, padx=4)
         ttk.Button(btns_srv, text="Abrir Programador de tareas", command=self._open_task_scheduler).grid(row=0, column=4, padx=4)
+        row += 1
 
-        ttk.Separator(self).grid(row=7, column=0, columnspan=6, sticky="ew", padx=6, pady=12)
-        
-        # --- Notifier (overlay de bloqueos) ---
-        ttk.Label(self, text="Notifier (superposición de bloqueos)").grid(row=13, column=0, sticky="w", **pad)
+        ttk.Separator(self).grid(row=row, column=0, sticky="ew", padx=6, pady=12)
+        row += 1
+
+        # --- Notifier ---
+        ttk.Label(self, text="Notifier (superposición de bloqueos)").grid(row=row, column=0, sticky="w", **pad)
+        row += 1
+
         self.var_notif = tk.StringVar(value="Estado: (desconocido)")
-        ttk.Label(self, textvariable=self.var_notif).grid(row=14, column=0, sticky="w", **pad)
+        ttk.Label(self, textvariable=self.var_notif).grid(row=row, column=0, sticky="w", **pad)
+        row += 1
 
         btns_not = ttk.Frame(self)
-        btns_not.grid(row=8, column=0, sticky="w", **pad)
+        btns_not.grid(row=row, column=0, sticky="w", **pad)
         ttk.Button(btns_not, text="Iniciar Notifier", command=self._start_notifier).grid(row=0, column=0, padx=4)
         ttk.Button(btns_not, text="Detener Notifier", command=self._stop_notifier).grid(row=0, column=1, padx=4)
         ttk.Button(btns_not, text="Reiniciar Notifier", command=self._restart_notifier).grid(row=0, column=2, padx=4)
         ttk.Button(btns_not, text="Refrescar estado", command=self.refresh_notifier).grid(row=0, column=3, padx=4)
+        row += 1
 
-        # --- Log / Notificaciones ---
-        ttk.Label(self, text="Registros y notificaciones").grid(row=9, column=0, sticky="w", **pad)
-        ttk.Button(self, text="Abrir control.log", command=self._open_control_log).grid(row=9, column=0, sticky="w", **pad)
+        ttk.Separator(self).grid(row=row, column=0, sticky="ew", padx=6, pady=12)
+        row += 1
 
-        ttk.Separator(self).grid(row=10, column=0, columnspan=6, sticky="ew", padx=6, pady=12)
+        # --- Logs ---
+        ttk.Label(self, text="Registros y notificaciones").grid(row=row, column=0, sticky="w", **pad)
+        ttk.Button(self, text="Abrir control.log", command=self._open_control_log).grid(row=row, column=0, sticky="e", padx=170, pady=6)
+        row += 1
+
+        ttk.Separator(self).grid(row=row, column=0, sticky="ew", padx=6, pady=12)
+        row += 1
 
         # === Actualizaciones ===
         upd = ttk.LabelFrame(self, text="Actualizaciones")
-        upd.grid(row=11, column=0, sticky="ew", padx=6, pady=6)
+        upd.grid(row=row, column=0, sticky="ew", padx=6, pady=6)
         upd.grid_columnconfigure(1, weight=1)
 
         self.var_cur = tk.StringVar(value=_read_version_fallback())
@@ -267,11 +270,8 @@ class OptionsPage(ttk.Frame):
 
     def _restart_guardian(self):
         log.info("Reiniciando servicio…")
-        def _after_stop():
-            self._start_service()
         self._stop_service()
-        # levantar tras un pequeño margen
-        self.after(900, _after_stop)
+        self.after(900, self._start_service)
 
     def _open_task_scheduler(self):
         _open_task_scheduler_local()
@@ -280,16 +280,9 @@ class OptionsPage(ttk.Frame):
         try:
             open_control_log()
         except Exception:
-            # Fallback manual
-            logs = find_install_root().parent / "XiaoHackParental" / "logs"  # no debería usarse
-            p = logs / "control.log"
-            if p.exists():
-                os.startfile(str(p))
-            else:
-                messagebox.showerror("Error", f"No se encontró control.log en {p}")
-                
+            messagebox.showerror("Error", "No se pudo abrir el control.log")
+
     # ---------------- Notifier ----------------
-        # ---------------- Notifier ----------------
     def refresh_notifier(self):
         try:
             st = notifier_status()
@@ -321,7 +314,6 @@ class OptionsPage(ttk.Frame):
         self._stop_notifier()
         self.after(900, self._start_notifier)
 
-
     # ---------------- Actualizaciones ----------------
     def _set_upd_busy(self, busy: bool, msg: str | None = None):
         st = "disabled" if busy else "normal"
@@ -335,22 +327,82 @@ class OptionsPage(ttk.Frame):
             self._on_check_updates()
 
     def _on_check_updates(self):
+        """Comprueba updater.py --check en hilo y actualiza la UI (con logs detallados)."""
+        self._set_upd_busy(True, "Comprobando…")
+
         def work():
-            self._set_upd_busy(True, "Comprobando…")
-            res = run_updater_check_sync()
+            from pathlib import Path as _P
+            base = find_install_root()
+            up = updater_path()
+            py = python_for_console()
+
+            # Log a archivo
+            logdir = _P(os.getenv("ProgramData", r"C:\ProgramData")) / "XiaoHackParental" / "logs"
+            logdir.mkdir(parents=True, exist_ok=True)
+            gui_log = logdir / "updater_gui.log"
+
+            def _w(line: str):
+                try:
+                    gui_log.write_text(
+                        (gui_log.read_text(encoding="utf-8") if gui_log.exists() else "") + line + "\n",
+                        encoding="utf-8"
+                    )
+                except Exception:
+                    pass
+                log.info(line)
+
+            if not up.exists():
+                res = {"error": f"Updater no encontrado: {up}"}
+                return self.after(0, self._after_check_updates, res)
+
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONUTF8"] = "1"
+
+            cmd = [py, str(up), "--check"]
+            _w(f"[check] cwd={base} cmd={' '.join(cmd)}")
+
+            # Usamos run para capturar stdout+stderr y rc
+            proc = subprocess.run(
+                cmd, cwd=str(base), env=env,
+                capture_output=True, text=True, timeout=180,
+                creationflags=0x08000000 
+            )
+            out = (proc.stdout or "")
+            err = (proc.stderr or "")
+            rc  = proc.returncode
+            _w(f"[check] rc={rc}")
+            if out:
+                _w("[check] stdout:\n" + out.strip())
+            if err:
+                _w("[check] stderr:\n" + err.strip())
+
+            if rc != 0:
+                # Devolvemos las primeras líneas para mostrar en dialog
+                snippet = (out or err).strip().splitlines()[:15]
+                res = {"error": f"rc={rc}", "snippet": "\n".join(snippet)}
+                return self.after(0, self._after_check_updates, res)
+
+            # JSON OK
+            try:
+                data = json.loads(out)
+                res = {"ok": True, **data}
+            except Exception as e:
+                res = {"error": f"JSON inválido: {e}", "snippet": out[:1000]}
             self.after(0, self._after_check_updates, res)
+
         threading.Thread(target=work, daemon=True).start()
+
 
     def _after_check_updates(self, res: dict | None):
         self._set_upd_busy(False)
-        if not isinstance(res, dict):
+        if not isinstance(res, dict) or res.get("error"):
             self.var_upd.set("Error")
-            messagebox.showerror("Actualizaciones", "Sin respuesta del updater.")
-            return
-
-        if res.get("error"):
-            self.var_upd.set("Error")
-            messagebox.showerror("Actualizaciones", f"Error: {res['error']}")
+            extra = ""
+            if isinstance(res, dict) and res.get("snippet"):
+                extra = "\n\nSalida:\n" + res["snippet"]
+            msg = (res.get("error") if isinstance(res, dict) else "Sin respuesta del updater.") + extra
+            messagebox.showerror("Actualizaciones", f"Error al comprobar: {msg}")
             return
 
         cur = res.get("current") or _read_version_fallback()
@@ -362,12 +414,11 @@ class OptionsPage(ttk.Frame):
         self.var_upd.set("Actualización disponible" if upd else "Al día")
         self.btn_apply.configure(state=("normal" if upd else "disabled"))
 
-        if upd:
-            if messagebox.askyesno(
-                "Actualización disponible",
-                f"Se encontró la versión {lat}.\n¿Quieres instalarla ahora?"
-            ):
-                self._on_apply_update()
+        if upd and messagebox.askyesno(
+            "Actualización disponible",
+            f"Se encontró la versión {lat}.\n¿Quieres instalarla ahora?"
+        ):
+            self._on_apply_update()
 
     def _on_apply_update(self):
         def work():
@@ -388,7 +439,8 @@ class OptionsPage(ttk.Frame):
             return
 
         latest = self.var_lat.get()
-        self.var_cur.set(latest)
+        if latest and latest != "—":
+            self.var_cur.set(latest)
         self.var_upd.set("Actualizado")
         messagebox.showinfo("Actualizar", "Actualización aplicada correctamente.\nReinicia el Panel para ver cambios.")
 

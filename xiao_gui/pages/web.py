@@ -514,7 +514,7 @@ class WebPage(ttk.Frame):
         # 5) Lanzar Guardian (aplica o limpia como SYSTEM)
         try:
             cp = subprocess.run(["schtasks", "/Run", "/TN", r"XiaoHackParental\Guardian"],
-                                capture_output=True, text=True)
+                                capture_output=True, text=True, creationflags=0x08000000)
             log.info("schtasks /Run Guardian rc=%s out=%s err=%s",
                      cp.returncode, (cp.stdout or "").strip(), (cp.stderr or "").strip())
         except Exception as e:
@@ -638,7 +638,7 @@ class WebPage(ttk.Frame):
                 # avisar al servicio
                 try:
                     subprocess.run(["schtasks", "/Run", "/TN", r"XiaoHackParental\Guardian"],
-                                   capture_output=True, text=True)
+                                   capture_output=True, text=True, creationflags=0x08000000)
                 except Exception:
                     pass
             except PermissionError as e:
@@ -690,7 +690,7 @@ class WebPage(ttk.Frame):
                 # avisar al servicio
                 try:
                     subprocess.run(["schtasks", "/Run", "/TN", r"XiaoHackParental\Guardian"],
-                                   capture_output=True, text=True)
+                                   capture_output=True, text=True, creationflags=0x08000000)
                 except Exception:
                     pass
             except PermissionError as e:
@@ -730,7 +730,7 @@ class WebPage(ttk.Frame):
         try:
             cp = subprocess.run(
                 ["schtasks", "/Run", "/TN", r"XiaoHackParental\Guardian"],
-                capture_output=True, text=True
+                capture_output=True, text=True, creationflags=0x08000000
             )
             log.info("schtasks /Run Guardian rc=%s out=%s err=%s",
                      cp.returncode, (cp.stdout or "").strip(), (cp.stderr or "").strip())
@@ -744,7 +744,7 @@ class WebPage(ttk.Frame):
 
         def _work():
             try:
-                cp = subprocess.run(["ipconfig", "/flushdns"], capture_output=True, text=True)
+                cp = subprocess.run(["ipconfig", "/flushdns"], capture_output=True, text=True, creationflags=0x08000000)
                 out = (cp.stdout or "") + (cp.stderr or "")
                 ok = (cp.returncode == 0)
             except Exception as e:

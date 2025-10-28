@@ -13,7 +13,6 @@ from utils.runtime import (
     control_log_path,
     python_for_console,
     python_for_windowed,
-    updater_path,
     uninstaller_path,
     task_fullname_guardian,
     task_fullname_notifier,
@@ -40,7 +39,7 @@ def find_install_root() -> Path:
     inst = os.environ.get("XH_INSTALL_DIR", "").strip('" ').strip()
     if inst:
         p = Path(inst)
-        if (p / "updater.py").exists() or (p / "VERSION").exists():
+        if (p / "updater.py").exists() or (p / "VERSION").exists() or (p / "VERSION.json").exists(): 
             return p
 
     # 2) installed.json cerca de este paquete
@@ -63,7 +62,7 @@ def find_install_root() -> Path:
     try:
         p = Path(__file__).resolve()
         for _ in range(8):
-            if (p / "updater.py").exists() or (p / "VERSION").exists():
+            if (p / "updater.py").exists() or (p / "VERSION").exists() or (p / "VERSION.json").exists(): 
                 return p
             if p.parent == p:
                 break
@@ -74,7 +73,7 @@ def find_install_root() -> Path:
     # 4) helper de runtime
     try:
         p = install_root()
-        if (p / "updater.py").exists() or (p / "VERSION").exists():
+        if (p / "updater.py").exists() or (p / "VERSION").exists() or (p / "VERSION.json").exists():           
             return p
     except Exception:
         pass
@@ -89,37 +88,40 @@ def find_install_root() -> Path:
 def check_update_and_maybe_apply_async(root_tk) -> None:
     """
     Lanza un hilo que:
-      - ejecuta updater.py --check
-      - si hay update, pregunta al tutor; si acepta, ejecuta --apply (eleva si es necesario)
+      - ejecuta updater (como módulo si está en app/, como script si está en raíz)
+      - si hay update, pregunta al tutor; si acepta, ejecuta --apply
     """
     def _run():
         base = find_install_root()
-        up = updater_path()
-        if not up.exists():
-            log.warning("Updater no encontrado en: %s", up)
-            return
 
         py_console = Path(python_for_console())
         py_window  = Path(python_for_windowed())
+
+        # ¿Está en app/? -> usamos -m app.updater
+        cmd_check = [str(py_console), "-m", "app.updater", "--check"]
+        cmd_apply = [str(py_window),  "-m", "app.updater", "--apply"]
 
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
 
         try:
-            log.info("Updater --check: exe=%s, script=%s, cwd=%s", py_console, up, base)
+            log.info("Updater --check: cmd=%s  cwd=%s", cmd_check, base)
             out = subprocess.check_output(
-                [str(py_console), str(up), "--check"],
-                stderr=subprocess.STDOUT, cwd=str(base), env=env, timeout=300
-            )
+            cmd_check, stderr=subprocess.STDOUT, cwd=str(base), env=env, timeout=300,
+            creationflags=0x08000000 
+        )
             res = json.loads(out.decode("utf-8", "ignore"))
+
             if res.get("update_available"):
                 latest = res.get("latest") or "desconocida"
 
                 def _apply():
                     try:
-                        log.info("Updater --apply: exe=%s, script=%s", py_window, up)
-                        subprocess.check_call([str(py_window), str(up), "--apply"], cwd=str(base), env=env)
+                        log.info("Updater --apply: cmd=%s", cmd_apply)
+                        subprocess.check_call(cmd_apply, cwd=str(base), env=env,
+                                              creationflags=0x08000000
+                                              )
                         messagebox.showinfo(
                             "Actualización",
                             "Actualización instalada correctamente.\nReinicia el Panel para ver los cambios."
@@ -138,84 +140,154 @@ def check_update_and_maybe_apply_async(root_tk) -> None:
                         _apply()
 
                 root_tk.after(0, _ask)
+
         except subprocess.CalledProcessError as e:
             msg = (e.output or b"").decode("utf-8", "ignore")
             rc  = e.returncode
             log.error("Updater --check falló: rc=%s out=%s", rc, msg)
             try:
-                # Capturamos rc y msg como valores por defecto del lambda
-                root_tk.after(
-                    0,
-                    lambda rc=rc, msg=msg: messagebox.showerror(
-                        "Actualizaciones", f"Error: Updater falló (rc={rc}).\n{msg}"
-                    ),
-                )
+                root_tk.after(0, lambda rc=rc, msg=msg: messagebox.showerror(
+                    "Actualizaciones", f"Error: Updater falló (rc={rc}).\n{msg}"
+                ))
             except Exception:
                 pass
-
         except Exception as e:
             log.error("Updater sin salida: %s", e, exc_info=True)
-            et = type(e).__name__
-            es = str(e)
+            et, es = type(e).__name__, str(e)
             try:
-                # Capturamos et y es como valores por defecto del lambda
-                root_tk.after(
-                    0,
-                    lambda et=et, es=es: messagebox.showerror(
-                        "Actualizaciones", f"Error: Updater sin salida ({et}: {es})."
-                    ),
-                )
+                root_tk.after(0, lambda et=et, es=es: messagebox.showerror(
+                    "Actualizaciones", f"Error: Updater sin salida ({et}: {es})."
+                ))
             except Exception:
                 pass
-
 
     threading.Thread(target=_run, daemon=True).start()
 
 
-def run_updater_check_sync() -> dict | None:
-    """Ejecución sin UI del check; útil para diagnósticos o tests."""
-    base = find_install_root()
-    up = updater_path()
-    if not up.exists():
-        log.warning("Updater no encontrado en: %s", up)
-        return None
-    py_console = Path(python_for_console())
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUTF8"] = "1"
-    try:
-        out = subprocess.check_output(
-            [str(py_console), str(up), "--check"],
-            stderr=subprocess.STDOUT, cwd=str(base), env=env, timeout=300
-        )
-        return json.loads(out.decode("utf-8", "ignore"))
-    except Exception as e:
-        log.error("run_updater_check_sync error: %s", e, exc_info=True)
-        return None
+def auto_check_updates_once(root):
+    """
+    Chequeo no bloqueante: autodetecta si el updater va como módulo (-m app.updater)
+    o como script (updater.py en raíz).
+    """
+    from utils.runtime import find_install_root, venv_executables
+    import os
+    import json
+    import subprocess
+    from pathlib import Path
+
+    def _run():
+        base = find_install_root(Path(__file__).resolve())
+
+        py_console, py_window = venv_executables(base)
+
+
+        cmd_check = [str(py_console), "-m", "app.updater", "--check"]
+        cmd_apply = [str(py_window),  "-m", "app.updater", "--apply"]
+
+        # Log del updater (por si algo falla)
+        try:
+            _logdir = Path(os.getenv("ProgramData", r"C:\ProgramData")) / "XiaoHackParental" / "logs"
+            _logdir.mkdir(parents=True, exist_ok=True)
+            gui_log = _logdir / "updater_gui.log"
+        except Exception:
+            gui_log = None
+
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+
+        def _write_log(line: str):
+            log.info(line)
+            try:
+                if gui_log:
+                    prev = gui_log.read_text(encoding="utf-8") if gui_log.exists() else ""
+                    gui_log.write_text(prev + line + "\n", encoding="utf-8")
+            except Exception:
+                pass
+
+        try:
+            _write_log(f"[check] cmd={cmd_check} cwd={base}")
+            out = subprocess.check_output(cmd_check, stderr=subprocess.STDOUT, cwd=str(base), env=env, timeout=180, creationflags=0x08000000)
+            txt = out.decode("utf-8", "ignore")
+            _write_log(f"[check] stdout:\n{txt}")
+            res = json.loads(txt)
+
+            if res.get("update_available"):
+                latest = res.get("latest") or "desconocida"
+
+                def _apply():
+                    try:
+                        _write_log(f"[apply] cmd={cmd_apply}")
+                        subprocess.check_call(cmd_apply, cwd=str(base), env=env, creationflags=0x08000000)
+                        messagebox.showinfo(
+                            "Actualización",
+                            "Actualización instalada correctamente.\nReinicia el Panel para ver los cambios."
+                        )
+                        _write_log("[apply] OK")
+                    except subprocess.CalledProcessError as e:
+                        msg = (e.output or b"").decode("utf-8", "ignore") if hasattr(e, "output") else str(e)
+                        _write_log(f"[apply] ERROR rc={getattr(e,'returncode',None)}\n{msg}")
+                        messagebox.showerror("Actualización", f"No se pudo actualizar (rc={getattr(e,'returncode',None)}):\n{msg}")
+                    except Exception as e:
+                        _write_log(f"[apply] ERROR gen: {e!r}")
+                        messagebox.showerror("Actualización", f"No se pudo actualizar:\n{e}")
+
+                root.after(0, lambda: (
+                    messagebox.askyesno("Actualización disponible",
+                                        f"Hay una nueva versión {latest}.\n¿Quieres instalarla ahora?")
+                    and _apply()
+                ))
+
+        except subprocess.CalledProcessError as e:
+            msg = (e.output or b"").decode("utf-8", "ignore") if hasattr(e, "output") else ""
+            rc = getattr(e, "returncode", None)
+            _write_log(f"[check] ERROR rc={rc}\n{msg}")
+            try:
+                messagebox.showerror("Actualizaciones", f"El updater falló (rc={rc}).\n\nSalida:\n{msg}")
+            except Exception:
+                pass
+        except json.JSONDecodeError as e:
+            _txt = locals().get("txt", "")
+            _write_log(f"[check] JSON inválido: {e}\nRAW:\n{_txt}")
+            try:
+                messagebox.showerror("Actualizaciones", "El updater devolvió una respuesta no válida.\nRevisa updater_gui.log")
+            except Exception:
+                pass
+        except Exception as e:
+            _write_log(f"[check] ERROR gen: {e!r}")
+            try:
+                messagebox.showerror("Actualizaciones", f"Error ejecutando el updater:\n{e}")
+            except Exception:
+                pass
+
+    threading.Thread(target=_run, daemon=True).start()
+
 
 
 def run_updater_apply_ui() -> None:
-    """Lanza la aplicación del update (UI-friendly)."""
+    """Lanza la aplicación del update (UI-friendly) como módulo, sin exigir updater.py físico."""
     base = find_install_root()
-    up = updater_path()
-    if not up.exists():
-        messagebox.showerror("Actualización", f"Updater no encontrado:\n{up}")
-        return
-    py_window = Path(python_for_windowed())
+    pyw = Path(python_for_windowed())
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
     try:
-        subprocess.check_call([str(py_window), str(up), "--apply"], cwd=str(base), env=env)
+        subprocess.check_call(
+            [str(pyw), "-m", "app.updater", "--apply"],
+            cwd=str(base),
+            env=env,
+            creationflags=0x08000000
+        )
         messagebox.showinfo(
             "Actualización",
             "Actualización instalada correctamente.\nReinicia el Panel para ver los cambios."
         )
     except subprocess.CalledProcessError as e:
-        msg = (e.output or b"").decode("utf-8", "ignore")
+        msg = (getattr(e, "output", b"") or b"").decode("utf-8", "ignore")
         messagebox.showerror("Actualización", f"No se pudo actualizar (rc={e.returncode}).\n{msg}")
     except Exception as e:
         messagebox.showerror("Actualización", f"No se pudo actualizar:\n{e}")
+
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +308,7 @@ def launch_uninstaller_ui() -> None:
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
     try:
-        subprocess.Popen([str(py_window), str(uni)], cwd=str(base), env=env)
+        subprocess.Popen([str(py_window), str(uni)], cwd=str(base), env=env, creationflags=0x08000000)
     except Exception as e:
         messagebox.showerror("Desinstalar", f"No se pudo iniciar el desinstalador:\n{e}")
 
@@ -260,7 +332,7 @@ def query_task_state(kind_or_fullname: str) -> dict:
     try:
         cp = subprocess.run(
             ["schtasks", "/Query", "/TN", name, "/FO", "LIST", "/V"],
-            capture_output=True, text=True
+            capture_output=True, text=True, creationflags=0x08000000
         )
         out = (cp.stdout or "") + (cp.stderr or "")
         if "ERROR:" in out and cp.returncode:
@@ -280,7 +352,7 @@ def start_service(kind_or_fullname: str) -> bool:
     """
     name = _query_task_fullname(kind_or_fullname)
     try:
-        cp = subprocess.run(["schtasks", "/Run", "/TN", name], capture_output=True, text=True)
+        cp = subprocess.run(["schtasks", "/Run", "/TN", name], capture_output=True, text=True, creationflags=0x08000000)
         if cp.returncode == 0:
             log.info("Tarea iniciada: %s", name)
             return True
@@ -296,7 +368,7 @@ def stop_service(kind_or_fullname: str) -> bool:
     """
     name = _query_task_fullname(kind_or_fullname)
     try:
-        cp = subprocess.run(["schtasks", "/End", "/TN", name], capture_output=True, text=True)
+        cp = subprocess.run(["schtasks", "/End", "/TN", name], capture_output=True, text=True, creationflags=0x08000000)
         if cp.returncode == 0:
             log.info("Tarea detenida: %s", name)
             return True
