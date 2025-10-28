@@ -1,11 +1,6 @@
-﻿<<<<<<< HEAD
 ﻿{
-=======
-{
->>>>>>> 981d447d196907ab4649be293a9f87d2e57c77e6
   "version": "2025.10.5",
   "channel": "stable",
   "notes_url": "https://tus-release-notes",
   "min_installer": "2025.10.0"
 }
-
