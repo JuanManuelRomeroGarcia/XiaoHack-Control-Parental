@@ -2,6 +2,8 @@
 # Bloqueo por nombre, ruta exacta, carpeta; argumentos; ficheros abiertos;
 # auto-protección opcional; detección instantánea por WMI; logs centralizados; heartbeat;
 # SINGLE-INSTANCE para evitar múltiples procesos.
+from __future__ import annotations
+import app._bootstrap  # noqa: F401
 
 import datetime
 import os
@@ -17,18 +19,22 @@ from urllib.request import url2pathname
 
 import psutil  # type: ignore
 
-from app.notifier import WM_CLOSE
+try:
+    import win32con as _w32con
+    WM_CLOSE = getattr(_w32con, "WM_CLOSE", 0x0010)
+except Exception:
+    WM_CLOSE = 0x0010
+    
 from app.webfilter import ensure_hosts_rules, remove_parental_block
 from app.audit import AuditLogger
 from app.logs import get_logger, install_exception_hooks
-# ⚠️ Usamos ProgramData (rutas compartidas) desde storage:
 from app.storage import (
     load_config, load_state, now_epoch,
     DB_PATH, LOGS_DIR, save_state
 )
 
-from app.scheduler import check_playtime_alerts, remaining_play_seconds, is_within_allowed_hours  # ← nuevo
-# == Opcionales (pywin32). Si faltan, seguimos en modo polling.
+from app.scheduler import check_playtime_alerts, remaining_play_seconds, is_within_allowed_hours 
+
 try:
     import pythoncom  # type: ignore
     import win32com.client  # type: ignore  # WMI

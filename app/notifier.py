@@ -2,6 +2,8 @@
 # Overlay nativo Win32 (Layered + TopMost + NoActivate) per-monitor para countdown
 # Lectura de estado y eventos desde %ProgramData%\XiaoHackParental (mismo que guardian)
 # Toasters WinRT/winotify/win10toast + ExplorerWatch (como antes)
+from __future__ import annotations
+import app._bootstrap  # noqa: F401  # side-effects
 
 import os
 import sys
