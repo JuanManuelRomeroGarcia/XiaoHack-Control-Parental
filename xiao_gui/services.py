@@ -263,28 +263,43 @@ def auto_check_updates_once(root):
 
 
 def run_updater_apply_ui() -> None:
-    """Lanza la aplicación del update (UI-friendly) como módulo, sin exigir updater.py físico."""
+    """Aplica la actualización ejecutando el updater como MÓDULO y mostrando el motivo si falla."""
     base = find_install_root()
-    pyw = Path(python_for_windowed())
+
+    # Usamos python.exe (console) + CREATE_NO_WINDOW para poder CAPTURAR salida sin abrir consola
+    py = Path(python_for_console())
+
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
+
     try:
-        subprocess.check_call(
-            [str(pyw), "-m", "app.updater", "--apply"],
+        proc = subprocess.run(
+            [str(py), "-m", "app.updater", "--apply"],
             cwd=str(base),
             env=env,
-            creationflags=0x08000000
+            text=True,
+            capture_output=True,
+            timeout=1800,
+            creationflags=0x08000000,  # oculta la ventana
         )
-        messagebox.showinfo(
-            "Actualización",
-            "Actualización instalada correctamente.\nReinicia el Panel para ver los cambios."
-        )
-    except subprocess.CalledProcessError as e:
-        msg = (getattr(e, "output", b"") or b"").decode("utf-8", "ignore")
-        messagebox.showerror("Actualización", f"No se pudo actualizar (rc={e.returncode}).\n{msg}")
     except Exception as e:
         messagebox.showerror("Actualización", f"No se pudo actualizar:\n{e}")
+        return
+
+    if proc.returncode != 0:
+        # Muestra el motivo que imprimió el updater
+        details = ((proc.stdout or "") + ("\n" if proc.stdout and proc.stderr else "") + (proc.stderr or "")).strip()
+        if not details:
+            details = r"Revisa el log: C:\ProgramData\XiaoHackParental\logs\updater_apply.log"
+        messagebox.showerror("Actualización", f"No se pudo actualizar (rc={proc.returncode}).\n{details}")
+        return
+
+    messagebox.showinfo(
+        "Actualización",
+        "Actualización instalada correctamente.\nReinicia el Panel para ver los cambios."
+    )
+
 
 
 

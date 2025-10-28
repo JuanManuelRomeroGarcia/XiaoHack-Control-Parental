@@ -10,6 +10,8 @@ import json
 import os
 import sys
 import shutil
+import traceback
+from typing import NoReturn
 import zipfile
 import tempfile
 import subprocess
@@ -36,6 +38,34 @@ except Exception:
 
 
 log = get_logger("gui.Updater")
+  # ya usas time, Path, etc.
+
+def _apply_log_path() -> Path:
+    try:
+        base = Path(os.getenv("ProgramData", r"C:\ProgramData")) / "XiaoHackParental" / "logs"
+        base.mkdir(parents=True, exist_ok=True)
+        return base / "updater_apply.log"
+    except Exception:
+        td = Path(os.getenv("TEMP", os.getenv("TMP", ".")))
+        return td / "updater_apply.log"
+
+def _apply_log(msg: str) -> None:
+    try:
+        p = _apply_log_path()
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(p, "a", encoding="utf-8", errors="ignore") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        pass
+
+def _fail(code: int, message: str, exc: Exception | None = None) -> NoReturn:
+
+    _apply_log(f"ERROR {code}: {message}")
+    if exc:
+        _apply_log("TRACEBACK:\n" + "".join(traceback.format_exception(exc)))
+    print(message, file=sys.stdout, flush=True)  # <- la GUI lo capturará
+    raise SystemExit(code)
+
 
 
 # ---------------- Config GitHub (con overrides por entorno) ----------------
@@ -250,43 +280,54 @@ def _start_guardian_task():
     except Exception:
         pass
 
-def _kill_processes_in_install():
-    """Mejor-esfuerzo: cierra procesos que ejecuten desde INSTALL_DIR (notifier/panel)."""
+def _kill_processes_in_install(extra_names: tuple[str, ...] = ()) -> None:
+    """
+    Mata procesos cuyo ExecutablePath esté dentro de INSTALL_DIR,
+    EXCEPTO el proceso actual (y, opcionalmente, nombres extra por si quieres preservarlos).
+    Deja trazas en el apply log.
+    """
+    base = str(INSTALL_DIR).lower()
+    me = os.getpid()
     try:
-        import psutil  # opcional
+        myexe = str(Path(sys.executable).resolve())
     except Exception:
-        return  # si no hay psutil, salimos en silencio
+        myexe = ""
 
-    inst = str(INSTALL_DIR).lower()
-    for p in psutil.process_iter(attrs=["pid","name","exe","cwd","cmdline"]):
-        try:
-            exe = (p.info.get("exe") or "").lower()
-            cwd = (p.info.get("cwd") or "").lower()
-            cmd = " ".join(p.info.get("cmdline") or []).lower()
-            if inst in exe or inst in cwd or inst in cmd:
-                if p.pid == os.getpid():
-                    continue
-                for c in p.children(recursive=True):
-                    try:
-                        c.terminate()
-                    except Exception:
-                        pass
-                p.terminate()
-        except Exception:
-            continue
-    # espera corta; si sigue vivo, intento de kill de último recurso
-    time.sleep(0.7)
-    for p in psutil.process_iter(attrs=["pid","name","exe","cwd","cmdline"]):
-        try:
-            exe = (p.info.get("exe") or "").lower()
-            cwd = (p.info.get("cwd") or "").lower()
-            cmd = " ".join(p.info.get("cmdline") or []).lower()
-            if inst in exe or inst in cwd or inst in cmd:
-                if p.pid == os.getpid():
-                    continue
-                p.kill()
-        except Exception:
-            continue
+    _apply_log(f"KILL in install dir: base={base} pid_me={me} exe_me={myexe}")
+
+    # PowerShell porque WMIC está deprecado y necesitamos ExecutablePath
+    ps = rf"""
+$base = '{base}'
+$me   = {me}
+Get-CimInstance Win32_Process |
+  ForEach-Object {{
+    try {{
+      $exe = $_.ExecutablePath
+      if (-not $exe) {{ return }}
+      $exel = $exe.lower()
+      if ($exel.StartsWith($base)) {{
+        if ($_.ProcessId -eq $me) {{ return }}              # NO matarnos
+        # Evitar matar el mismo intérprete que está ejecutando el updater (por path)
+        if ($exel -eq '{myexe.lower()}') {{ return }}
+        # Evitar matar por nombres extra, si se pasan
+        $name = $_.Name.lower()
+        {('' if not extra_names else "if (@(" + ",".join([f"'{n.lower()}'" for n in extra_names]) + ").Contains($name)) { return }")}
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
+        Write-Output ('KILLED ' + $_.ProcessId + ' ' + $exe)
+      }}
+    }} catch {{ }}
+  }}
+"""
+    cp = subprocess.run(
+        ["PowerShell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+        capture_output=True, text=True, creationflags=0x08000000
+    )
+    if cp.stdout:
+        for line in cp.stdout.splitlines():
+            _apply_log(line.strip())
+    if cp.stderr:
+        _apply_log("KILL STDERR: " + cp.stderr.strip())
+
 
 
 def _find_zip_root(tmp_dir: Path) -> Path:
@@ -365,21 +406,106 @@ def _is_admin() -> bool:
         return False
 
 def _elevate_and_apply(tmp_json: Path) -> int:
+    _apply_log(f"Elevando para aplicar. Payload: {tmp_json}")
     py = os.path.normpath(sys.executable)
     pyw = str(Path(py).with_name("pythonw.exe"))
     py_to_use = pyw if os.path.exists(pyw) else py
-    ps = [
-        "PowerShell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-        "-WindowStyle", "Hidden",
-        "-Command",
-        r"$p=Start-Process -Verb RunAs -WindowStyle Hidden -FilePath '{}' -ArgumentList '{}','--apply-elevated','{}' -PassThru -Wait; exit $p.ExitCode".format(
-            py_to_use.replace("'", "''"),
-            str(Path(__file__).resolve()).replace("'", "''"),
-            str(tmp_json).replace("'", "''"),
-        )
-    ]
-    cp = subprocess.run(ps, capture_output=True, text=True, creationflags=0x08000000)
+
+    exe     = py_to_use.replace("'", "''")
+    script  = str(Path(__file__).resolve()).replace("'", "''")
+    payload = str(tmp_json).replace("'", "''")
+
+    ps_cmd = (
+        "$argsList=@('{script}','--apply-elevated','{payload}');"
+        "$p=Start-Process -Verb RunAs -WindowStyle Hidden -FilePath '{exe}' "
+        "-ArgumentList $argsList -PassThru -Wait;"
+        "exit $p.ExitCode"
+    ).format(exe=exe, script=script, payload=payload)
+
+    cp = subprocess.run(
+        ["PowerShell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
+        text=True, capture_output=True, creationflags=0x08000000
+    )
+    _apply_log(f"Elevación terminada. rc={cp.returncode}")
+    if cp.stdout:
+        _apply_log("ELEVATION STDOUT:\n" + cp.stdout.strip())
+    if cp.stderr:
+        _apply_log("ELEVATION STDERR:\n" + cp.stderr.strip())
     return cp.returncode
+
+def cmd_check() -> int:
+    info = check_for_update(auto_apply=False)
+    print(json.dumps(info, ensure_ascii=False))
+    return 0
+
+def cmd_apply() -> int:
+    _apply_log("BEGIN --apply")
+    try:
+        current = read_local_version()
+        _apply_log(f"Versión local: {current}; INSTALL_DIR={INSTALL_DIR}")
+
+        latest, err = resolve_latest_version(OWNER, REPO, branch="main")  # cambia a "master" si procede
+        if not latest:
+            _fail(15, f"No se pudo obtener la versión de GitHub: {err}")
+
+        _apply_log(f"Latest en GitHub: {latest}")
+        if _ver_tuple(latest) <= _ver_tuple(current):
+            msg = f"Ya está actualizado (local={current}, latest={latest})."
+            _apply_log(msg) 
+            print(msg)
+            return 0
+
+        tag, zip_asset = get_latest_release()
+        if not tag or _normalize_version_str(tag) != _normalize_version_str(latest):
+            _fail(15, "No se encontró un release con ZIP para esta versión. "
+                      "Sube el asset runtime al release o ajusta get_latest_release().")
+        if not zip_asset:
+            _fail(15, "No se encontró un ZIP de runtime en el release. "
+                      "Sugerido: XiaoHackParental-<version>-runtime.zip")
+
+        zip_url  = zip_asset.get("browser_download_url")
+        zip_name = zip_asset.get("name", "update.zip")
+        if not zip_url:
+            _fail(15, "El asset ZIP del release no tiene browser_download_url.")
+
+        with tempfile.TemporaryDirectory() as td:
+            td_p = Path(td)
+            local_zip = td_p / zip_name
+            _apply_log(f"Descargando ZIP: {zip_url}")
+            local_zip.write_bytes(_http_get(zip_url))
+            _apply_log(f"ZIP descargado: {local_zip} ({local_zip.stat().st_size} bytes)")
+
+            can_write = os.access(INSTALL_DIR, os.W_OK)
+            if not can_write or not _is_admin():
+                payload = {"zip": str(local_zip), "latest": latest, "install_dir": str(INSTALL_DIR)}
+                tmp_json = td_p / "apply.json"
+                tmp_json.write_text(json.dumps(payload), encoding="utf-8")
+                _apply_log(f"Sin permisos. Elevando con payload: {tmp_json}")
+                code = _elevate_and_apply(tmp_json)
+                if code != 0:
+                    _fail(code or 15, f"Operación cancelada o fallida durante la elevación (rc={code}).")
+                _apply_log("OK: actualización aplicada por proceso elevado.")
+                print("OK: actualización aplicada (elevado).")
+                return 0
+
+            _apply_log("Parando guardian y aplicando ZIP en línea (somos admin).")
+            _stop_guardian_task()
+            _kill_processes_in_install()
+            time.sleep(0.5)
+            _apply_zip_to_install(local_zip)
+            try:
+                write_local_version(latest)
+            except Exception as e:
+                _apply_log(f"WARNING: no pude escribir VERSION.json: {e}")
+            _start_guardian_task()
+            _apply_log("OK: actualización aplicada (en línea).")
+            print("OK: actualización aplicada.") 
+            return 0
+
+    except SystemExit:
+        raise
+    except Exception as e:
+        _fail(15, f"Fallo inesperado en --apply: {e}", e)
 
 # ---------------- API pública ----------------
 def check_for_update(auto_apply=False) -> dict:
@@ -462,43 +588,48 @@ def check_for_update(auto_apply=False) -> dict:
 
 # ---------------- Entrada CLI (modo elevado) ----------------
 def _apply_elevated_from_payload(payload_path: Path) -> int:
+    _apply_log(f"BEGIN --apply-elevated payload={payload_path}")
     try:
         payload = json.loads(payload_path.read_text(encoding="utf-8"))
         zip_path = Path(payload["zip"])
         latest = payload.get("latest", "")
-        # Asegurar que el ZIP sigue existiendo (si no, abortar)
         if not zip_path.exists():
-            return 3
+            _fail(3, f"ZIP temporal no existe: {zip_path}")
+
         _stop_guardian_task()
         _kill_processes_in_install()
         time.sleep(0.5)
         _apply_zip_to_install(zip_path)
         try:
             write_local_version(latest)
-        except Exception:
-            pass
+        except Exception as e:
+            _apply_log(f"WARNING: no pude escribir VERSION.json elevado: {e}")
         _start_guardian_task()
+        _apply_log("OK: actualización aplicada (elevado).")
+        print("OK: actualización aplicada (elevado).")
         return 0
-    except Exception:
+    except SystemExit:
+        raise
+    except Exception as e:
         try:
             _start_guardian_task()
         except Exception:
             pass
-        return 2
+        _fail(2, f"Fallo en --apply-elevated: {e}", e)
+
 
 
 if __name__ == "__main__":
-    # Modos:
-    #   (1) python updater.py            -> sólo check (sin aplicar)
-    #   (2) python updater.py --apply    -> aplica (eleva si hace falta)
-    #   (3) python updater.py --apply-elevated <payload.json> -> uso interno
-    if "--apply-elevated" in sys.argv:
-        i = sys.argv.index("--apply-elevated")
-        payload = Path(sys.argv[i+1]) if i+1 < len(sys.argv) else None
-        if not payload:
-            sys.exit(2)
-        sys.exit(_apply_elevated_from_payload(payload))
+    import argparse
+    parser = argparse.ArgumentParser(prog="app.updater")
+    parser.add_argument("--check", action="store_true", help="Solo comprobar (JSON)")
+    parser.add_argument("--apply", action="store_true", help="Aplicar actualización (elevar si hace falta)")
+    parser.add_argument("--apply-elevated", metavar="PAYLOAD", help="Uso interno (proceso elevado)")
+    args = parser.parse_args()
 
-    auto = "--apply" in sys.argv
-    out = check_for_update(auto_apply=auto)
-    print(json.dumps(out, ensure_ascii=False, indent=2))
+    if args.apply_elevated:
+        sys.exit(_apply_elevated_from_payload(Path(args.apply_elevated)))
+    if args.apply:
+        sys.exit(cmd_apply())
+    # por defecto o --check:
+    sys.exit(cmd_check())
