@@ -35,7 +35,7 @@ except Exception:
     def submit_limited(fn, *a, **k): return _EXEC.submit(fn, *a, **k)
 
 # Helpers consolidados del runtime/servicios
-from utils.runtime import read_version, find_install_root, updater_path, python_for_console
+from utils.runtime import read_version, find_install_root, python_for_console
 from xiao_gui.services import (
     run_updater_apply_ui,
     launch_uninstaller_ui,
@@ -59,14 +59,33 @@ def _open_task_scheduler_local():
         return 1, "", str(e)
 
 def _read_version_fallback() -> str:
+    # Intenta primero runtime.read_version(); si falla, lee JSON y luego texto
     try:
         return read_version()
     except Exception:
-        try:
-            root = find_install_root()
-            return (root / "VERSION").read_text(encoding="utf-8").strip()
-        except Exception:
-            return "0.0.0"
+        pass
+    try:
+        root = find_install_root()
+        vjson = (root / "VERSION.json")
+        if vjson.exists():
+            import json
+            data = json.loads(vjson.read_text(encoding="utf-8-sig"))
+            v = str(data.get("version", "")).strip()
+            if v.lower().startswith("v"):
+                v = v[1:].strip()
+            if v:
+                return v
+        vtxt = (root / "VERSION")
+        if vtxt.exists():
+            v = vtxt.read_text(encoding="utf-8-sig").lstrip("\ufeff").strip()
+            if v.lower().startswith("v"):
+                v = v[1:].strip()
+            if v:
+                return v
+    except Exception:
+        pass
+    return "0.0.0"
+
 
 
 # =====================================================================
@@ -327,13 +346,12 @@ class OptionsPage(ttk.Frame):
             self._on_check_updates()
 
     def _on_check_updates(self):
-        """Comprueba updater.py --check en hilo y actualiza la UI (con logs detallados)."""
+        """Comprueba actualizaciones en hilo y actualiza la UI (sin exigir updater.py)."""
         self._set_upd_busy(True, "Comprobando…")
 
         def work():
             from pathlib import Path as _P
             base = find_install_root()
-            up = updater_path()
             py = python_for_console()
 
             # Log a archivo
@@ -351,22 +369,18 @@ class OptionsPage(ttk.Frame):
                     pass
                 log.info(line)
 
-            if not up.exists():
-                res = {"error": f"Updater no encontrado: {up}"}
-                return self.after(0, self._after_check_updates, res)
-
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONUTF8"] = "1"
 
-            cmd = [py, str(up), "--check"]
+            # SIEMPRE como módulo (evita depender de un archivo físico)
+            cmd = [py, "-m", "app.updater", "--check"]
             _w(f"[check] cwd={base} cmd={' '.join(cmd)}")
 
-            # Usamos run para capturar stdout+stderr y rc
             proc = subprocess.run(
                 cmd, cwd=str(base), env=env,
                 capture_output=True, text=True, timeout=180,
-                creationflags=0x08000000 
+                creationflags=0x08000000  # oculta ventana
             )
             out = (proc.stdout or "")
             err = (proc.stderr or "")
@@ -378,12 +392,10 @@ class OptionsPage(ttk.Frame):
                 _w("[check] stderr:\n" + err.strip())
 
             if rc != 0:
-                # Devolvemos las primeras líneas para mostrar en dialog
                 snippet = (out or err).strip().splitlines()[:15]
                 res = {"error": f"rc={rc}", "snippet": "\n".join(snippet)}
                 return self.after(0, self._after_check_updates, res)
 
-            # JSON OK
             try:
                 data = json.loads(out)
                 res = {"ok": True, **data}
@@ -392,6 +404,7 @@ class OptionsPage(ttk.Frame):
             self.after(0, self._after_check_updates, res)
 
         threading.Thread(target=work, daemon=True).start()
+
 
 
     def _after_check_updates(self, res: dict | None):

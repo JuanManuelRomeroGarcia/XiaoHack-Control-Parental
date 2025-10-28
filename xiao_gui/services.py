@@ -31,7 +31,7 @@ def find_install_root() -> Path:
     Orden:
       1) ENV XH_INSTALL_DIR
       2) installed.json cercano a este paquete
-      3) ascenso de carpetas hasta hallar updater.py o VERSION
+      3) ascenso de carpetas hasta hallar app/ o VERSION(.json)
       4) install_root() (helper de runtime)
       5) cwd (fallback)
     """
@@ -39,7 +39,7 @@ def find_install_root() -> Path:
     inst = os.environ.get("XH_INSTALL_DIR", "").strip('" ').strip()
     if inst:
         p = Path(inst)
-        if (p / "updater.py").exists() or (p / "VERSION").exists() or (p / "VERSION.json").exists(): 
+        if (p / "app").is_dir() or (p / "VERSION").exists() or (p / "VERSION.json").exists():
             return p
 
     # 2) installed.json cerca de este paquete
@@ -62,7 +62,7 @@ def find_install_root() -> Path:
     try:
         p = Path(__file__).resolve()
         for _ in range(8):
-            if (p / "updater.py").exists() or (p / "VERSION").exists() or (p / "VERSION.json").exists(): 
+            if (p / "app").is_dir() or (p / "VERSION").exists() or (p / "VERSION.json").exists():
                 return p
             if p.parent == p:
                 break
@@ -73,7 +73,7 @@ def find_install_root() -> Path:
     # 4) helper de runtime
     try:
         p = install_root()
-        if (p / "updater.py").exists() or (p / "VERSION").exists() or (p / "VERSION.json").exists():           
+        if (p / "app").is_dir() or (p / "VERSION").exists() or (p / "VERSION.json").exists():
             return p
     except Exception:
         pass
@@ -169,7 +169,6 @@ def auto_check_updates_once(root):
     Chequeo no bloqueante: autodetecta si el updater va como módulo (-m app.updater)
     o como script (updater.py en raíz).
     """
-    from utils.runtime import find_install_root, venv_executables
     import os
     import json
     import subprocess
@@ -177,10 +176,9 @@ def auto_check_updates_once(root):
 
     def _run():
         base = find_install_root(Path(__file__).resolve())
-
-        py_console, py_window = venv_executables(base)
-
-
+        py_console = Path(python_for_console())
+        py_window  = Path(python_for_windowed())
+                          
         cmd_check = [str(py_console), "-m", "app.updater", "--check"]
         cmd_apply = [str(py_window),  "-m", "app.updater", "--apply"]
 
