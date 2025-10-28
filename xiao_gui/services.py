@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from tkinter import messagebox
@@ -263,43 +264,72 @@ def auto_check_updates_once(root):
 
 
 def run_updater_apply_ui() -> None:
-    """Aplica la actualización ejecutando el updater como MÓDULO y mostrando el motivo si falla."""
+    """
+    Aplica la actualización (sin ventana) y, al terminar, muestra:
+    'Actualizada — ¿Relanzar ahora?'. Si aceptas, relanza y cierra este panel.
+    """
     base = find_install_root()
 
-    # Usamos python.exe (console) + CREATE_NO_WINDOW para poder CAPTURAR salida sin abrir consola
-    py = Path(python_for_console())
-
+    pyw = Path(python_for_windowed())  # venv\Scripts\pythonw.exe (sin consola)
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
+    # Modo manual: el updater NO cierra ni relanza; solo aplica y deja resultado
+    env["XH_MANUAL_RELAUNCH"] = "1"
 
+    # Identidad del panel y plan de relanzado (mismos args que ahora)
+    env["XH_GUI_PID"] = str(os.getpid())
+    env["XH_GUI_EXE"] = sys.executable
+    run_py = base / "run.py"
+    env["XH_GUI_SCRIPT"] = str(run_py) if run_py.exists() else ""
     try:
-        proc = subprocess.run(
-            [str(py), "-m", "app.updater", "--apply"],
+        env["XH_GUI_ARGS_JSON"] = json.dumps(sys.argv[1:], ensure_ascii=False)
+    except Exception:
+        env["XH_GUI_ARGS_JSON"] = "[]"
+
+    # Ejecutar updater y esperar (sin ventana)
+    try:
+        subprocess.check_call(
+            [str(pyw), "-m", "app.updater", "--apply"],
             cwd=str(base),
             env=env,
-            text=True,
-            capture_output=True,
-            timeout=1800,
-            creationflags=0x08000000,  # oculta la ventana
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
         )
+    except subprocess.CalledProcessError as e:
+        messagebox.showerror("Actualización", f"No se pudo actualizar (rc={e.returncode}).")
+        return
     except Exception as e:
         messagebox.showerror("Actualización", f"No se pudo actualizar:\n{e}")
         return
 
-    if proc.returncode != 0:
-        # Muestra el motivo que imprimió el updater
-        details = ((proc.stdout or "") + ("\n" if proc.stdout and proc.stderr else "") + (proc.stderr or "")).strip()
-        if not details:
-            details = r"Revisa el log: C:\ProgramData\XiaoHackParental\logs\updater_apply.log"
-        messagebox.showerror("Actualización", f"No se pudo actualizar (rc={proc.returncode}).\n{details}")
-        return
+    # Leer resultado para mostrar versión destino (si existe)
+    latest = None
+    try:
+        from utils.runtime import datadir_system
+        res_path = (datadir_system() / "logs" / "updater_result.json")
+        if res_path.exists():
+            data = json.loads(res_path.read_text(encoding="utf-8", errors="ignore"))
+            latest = data.get("latest")
+    except Exception:
+        pass
 
-    messagebox.showinfo(
-        "Actualización",
-        "Actualización instalada correctamente.\nReinicia el Panel para ver los cambios."
-    )
-
+    ver_txt = f" a la versión {latest}" if latest else ""
+    if messagebox.askyesno("Actualización instalada",
+                           f"Se ha actualizado{ver_txt}.\n\n¿Relanzar el Panel ahora?"):
+        # Relanzar con los mismos parámetros del acceso directo
+        try:
+            args = json.loads(env.get("XH_GUI_ARGS_JSON", "[]"))
+        except Exception:
+            args = sys.argv[1:]
+        cmd = [str(pyw)]
+        if run_py.exists():
+            cmd += [str(run_py)] + list(args)
+        else:
+            cmd += ["-m", "xiao_gui.app"]
+        subprocess.Popen(cmd, cwd=str(base), creationflags=0x08000000)
+        os._exit(0)  # cerrar este proceso GUI
+    else:
+        messagebox.showinfo("Actualización", "Podrás abrir el Panel más tarde desde el acceso directo.")
 
 
 

@@ -30,7 +30,6 @@ if str(_ROOT) not in sys.path:
 from app.logs import get_logger  # noqa: E402
 
 try:
-    import sys
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
@@ -57,6 +56,20 @@ def _apply_log(msg: str) -> None:
             f.write(f"[{ts}] {msg}\n")
     except Exception:
         pass
+    
+def _write_result_json(ok: bool, latest: str, mode: str) -> None:
+    """
+    Guarda un JSON para que la GUI muestre el resultado.
+    """
+    try:
+        p = _apply_log_path().parent / "updater_result.json"
+        data = {"ok": ok, "latest": latest, "mode": mode, "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        _apply_log(f"RESULT written: {p}")
+    except Exception as e:
+        _apply_log(f"RESULT write failed: {e}")
+
+
 
 def _fail(code: int, message: str, exc: Exception | None = None) -> NoReturn:
 
@@ -66,6 +79,51 @@ def _fail(code: int, message: str, exc: Exception | None = None) -> NoReturn:
     print(message, file=sys.stdout, flush=True)  # <- la GUI lo capturará
     raise SystemExit(code)
 
+def _build_relaunch_plan_from_env() -> dict:
+    exe = os.getenv("XH_GUI_EXE") or str(INSTALL_DIR / "venv" / "Scripts" / "pythonw.exe")
+    script = os.getenv("XH_GUI_SCRIPT") or ""
+    try:
+        args = json.loads(os.getenv("XH_GUI_ARGS_JSON") or "[]")
+    except Exception:
+        args = []
+    return {"exe": exe, "script": script, "args": args}
+
+def _build_relaunch_plan_from_payload(payload: dict) -> dict:
+    exe = payload.get("gui_exe") or str(INSTALL_DIR / "venv" / "Scripts" / "pythonw.exe")
+    script = payload.get("gui_script") or ""
+    argsj = payload.get("gui_args_json") or "[]"
+    try:
+        args = json.loads(argsj)
+    except Exception:
+        args = []
+    return {"exe": exe, "script": script, "args": args}
+
+
+def _relaunch_panel(plan: dict | None = None) -> bool:
+    """
+    Relanza el panel con el plan indicado (exe/script/args). Si no hay script,
+    intenta -m xiao_gui.app como fallback.
+    """
+    try:
+        if plan is None:
+            plan = _build_relaunch_plan_from_env()
+
+        exe = Path(plan.get("exe") or (INSTALL_DIR / "venv" / "Scripts" / "pythonw.exe"))
+        script = plan.get("script") or ""
+        args = plan.get("args") or []
+
+        if script and Path(script).exists():
+            cmd = [str(exe), script] + list(args)
+        else:
+            # Fallback muy robusto
+            cmd = [str(exe), "-m", "xiao_gui.app"]
+
+        _apply_log("RELAUNCH panel: " + " ".join(map(str, cmd)))
+        subprocess.Popen(cmd, cwd=str(INSTALL_DIR), creationflags=0x08000000)
+        return True
+    except Exception as e:
+        _apply_log(f"RELAUNCH failed: {e}")
+        return False
 
 
 # ---------------- Config GitHub (con overrides por entorno) ----------------
@@ -283,40 +341,44 @@ def _start_guardian_task():
 def _kill_processes_in_install(extra_names: tuple[str, ...] = ()) -> None:
     """
     Mata procesos cuyo ExecutablePath esté dentro de INSTALL_DIR,
-    EXCEPTO el proceso actual (y, opcionalmente, nombres extra por si quieres preservarlos).
-    Deja trazas en el apply log.
+    excepto el proceso actual y el propio intérprete que ejecuta el updater.
     """
     base = str(INSTALL_DIR).lower()
     me = os.getpid()
     try:
         myexe = str(Path(sys.executable).resolve())
     except Exception:
-        myexe = ""
+        myexe = sys.executable
 
     _apply_log(f"KILL in install dir: base={base} pid_me={me} exe_me={myexe}")
 
-    # PowerShell porque WMIC está deprecado y necesitamos ExecutablePath
+    # Preparar literales seguros para PowerShell
+    base_ps  = base.replace("'", "''")
+    myexe_ps = myexe.lower().replace("'", "''")
+
+    allow_block = ""
+    if extra_names:
+        allow = ",".join([f"'{n.lower()}'" for n in extra_names])
+        allow_block = f"$allow=@({allow}); if ($allow -contains $name) {{ return }}"
+
     ps = rf"""
-$base = '{base}'
+$base = '{base_ps}'
 $me   = {me}
-Get-CimInstance Win32_Process |
-  ForEach-Object {{
-    try {{
-      $exe = $_.ExecutablePath
-      if (-not $exe) {{ return }}
-      $exel = $exe.lower()
-      if ($exel.StartsWith($base)) {{
-        if ($_.ProcessId -eq $me) {{ return }}              # NO matarnos
-        # Evitar matar el mismo intérprete que está ejecutando el updater (por path)
-        if ($exel -eq '{myexe.lower()}') {{ return }}
-        # Evitar matar por nombres extra, si se pasan
-        $name = $_.Name.lower()
-        {('' if not extra_names else "if (@(" + ",".join([f"'{n.lower()}'" for n in extra_names]) + ").Contains($name)) { return }")}
-        Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
-        Write-Output ('KILLED ' + $_.ProcessId + ' ' + $exe)
-      }}
-    }} catch {{ }}
-  }}
+Get-CimInstance Win32_Process | ForEach-Object {{
+  try {{
+    $exe = $_.ExecutablePath
+    if (-not $exe) {{ return }}
+    $exel = $exe.ToLower()
+    if ($exel.StartsWith($base)) {{
+      if ($_.ProcessId -eq $me) {{ return }}                  
+      if ($exel -eq '{myexe_ps}') {{ return }}                
+      $name = ($_.Name); if ($name) {{ $name = $name.ToLower() }} else {{ $name = '' }}
+      {allow_block}
+      Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
+      Write-Output ('KILLED ' + $_.ProcessId + ' ' + $exe)
+    }}
+  }} catch {{ }}
+}}
 """
     cp = subprocess.run(
         ["PowerShell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
@@ -327,6 +389,60 @@ Get-CimInstance Win32_Process |
             _apply_log(line.strip())
     if cp.stderr:
         _apply_log("KILL STDERR: " + cp.stderr.strip())
+
+def _kill_gui_explicit(gui_pid: int | None, gui_exe: str | None) -> None:
+    """
+    Intenta cerrar el panel por PID y/o por ruta de ejecutable.
+    Refuerza por CommandLine (run.py / --xh-role panel).
+    """
+    try:
+        pid = int(gui_pid) if gui_pid is not None else 0
+    except Exception:
+        pid = 0
+    exe = (gui_exe or "").strip().lower()
+
+    _apply_log(f"KILL GUI explicit: pid={pid} exe={exe}")
+
+    exe_ps = exe.replace("'", "''")
+    ps = rf"""
+$pidTarget = {pid}
+$exeTarget = '{exe_ps}'
+try {{
+  if ($pidTarget -gt 0) {{
+    try {{ Stop-Process -Id $pidTarget -Force -ErrorAction Stop; Write-Output ('KILLED_GUI_PID ' + $pidTarget) }} catch {{}}
+    try {{ Wait-Process -Id $pidTarget -Timeout 7 -ErrorAction SilentlyContinue }} catch {{}}
+  }}
+  Get-CimInstance Win32_Process | ForEach-Object {{
+    try {{
+      $exe = $_.ExecutablePath
+      if (-not $exe) {{ return }}
+      $exel = $exe.ToLower()
+      if ($exeTarget -and $exel -eq $exeTarget) {{
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
+        Write-Output ('KILLED_GUI_EXE ' + $_.ProcessId + ' ' + $exe)
+        return
+      }}
+      $cmd = ($_.CommandLine)
+      if ($cmd) {{
+        $cl = $cmd.ToLower()
+        if ($cl.Contains('run.py') -or ($cl.Contains('--xh-role') -and $cl.Contains('panel'))) {{
+          Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
+          Write-Output ('KILLED_GUI_CMD ' + $_.ProcessId + ' ' + $cmd)
+        }}
+      }}
+    }} catch {{}}
+  }}
+}} catch {{ }}
+"""
+    cp = subprocess.run(
+        ["PowerShell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+        capture_output=True, text=True, creationflags=0x08000000
+    )
+    if cp.stdout:
+        for line in cp.stdout.splitlines():
+            _apply_log(line.strip())
+    if cp.stderr:
+        _apply_log("KILL GUI STDERR: " + cp.stderr.strip())
 
 
 
@@ -444,15 +560,16 @@ def cmd_apply() -> int:
         current = read_local_version()
         _apply_log(f"Versión local: {current}; INSTALL_DIR={INSTALL_DIR}")
 
-        latest, err = resolve_latest_version(OWNER, REPO, branch="main")  # cambia a "master" si procede
+        latest, err = resolve_latest_version(OWNER, REPO, branch="main")
         if not latest:
             _fail(15, f"No se pudo obtener la versión de GitHub: {err}")
 
         _apply_log(f"Latest en GitHub: {latest}")
         if _ver_tuple(latest) <= _ver_tuple(current):
             msg = f"Ya está actualizado (local={current}, latest={latest})."
-            _apply_log(msg) 
-            print(msg)
+            _apply_log(msg)
+            print(msg, flush=True)
+            _write_result_json(True, latest, mode="noop")
             return 0
 
         tag, zip_asset = get_latest_release()
@@ -468,6 +585,8 @@ def cmd_apply() -> int:
         if not zip_url:
             _fail(15, "El asset ZIP del release no tiene browser_download_url.")
 
+        manual = (os.getenv("XH_MANUAL_RELAUNCH") == "1")
+
         with tempfile.TemporaryDirectory() as td:
             td_p = Path(td)
             local_zip = td_p / zip_name
@@ -477,19 +596,36 @@ def cmd_apply() -> int:
 
             can_write = os.access(INSTALL_DIR, os.W_OK)
             if not can_write or not _is_admin():
-                payload = {"zip": str(local_zip), "latest": latest, "install_dir": str(INSTALL_DIR)}
+                payload = {
+                    "zip": str(local_zip),
+                    "latest": latest,
+                    "install_dir": str(INSTALL_DIR),
+                    "gui_pid": int(os.getenv("XH_GUI_PID") or "0"),
+                    "gui_exe": os.getenv("XH_GUI_EXE"),
+                    "gui_script": os.getenv("XH_GUI_SCRIPT"),
+                    "gui_args_json": os.getenv("XH_GUI_ARGS_JSON"),
+                    "manual": 1 if manual else 0,
+                }
                 tmp_json = td_p / "apply.json"
                 tmp_json.write_text(json.dumps(payload), encoding="utf-8")
                 _apply_log(f"Sin permisos. Elevando con payload: {tmp_json}")
                 code = _elevate_and_apply(tmp_json)
                 if code != 0:
                     _fail(code or 15, f"Operación cancelada o fallida durante la elevación (rc={code}).")
-                _apply_log("OK: actualización aplicada por proceso elevado.")
-                print("OK: actualización aplicada (elevado).")
+                _apply_log("OK: actualización aplicada por proceso elevado (hijo).")
+                print("OK: actualización aplicada (elevado).", flush=True)
                 return 0
 
+            # --- Aplicación en línea (somos admin) ---
             _apply_log("Parando guardian y aplicando ZIP en línea (somos admin).")
             _stop_guardian_task()
+
+            # En modo manual NO cerramos la GUI desde aquí (la GUI espera y muestra diálogo).
+            if not manual:
+                gui_pid = os.getenv("XH_GUI_PID")
+                gui_exe = os.getenv("XH_GUI_EXE")
+                _kill_gui_explicit(gui_pid, gui_exe)
+
             _kill_processes_in_install()
             time.sleep(0.5)
             _apply_zip_to_install(local_zip)
@@ -498,14 +634,28 @@ def cmd_apply() -> int:
             except Exception as e:
                 _apply_log(f"WARNING: no pude escribir VERSION.json: {e}")
             _start_guardian_task()
-            _apply_log("OK: actualización aplicada (en línea).")
-            print("OK: actualización aplicada.") 
+
+            # Resultado para la GUI
+            _write_result_json(True, latest, mode=("manual" if manual else "inline"))
+
+            if manual:
+                _apply_log("Manual mode: no relaunch/kill; devuelve control a la GUI.")
+                print("OK: actualización aplicada (manual).", flush=True)
+                return 0
+
+            # Automático: relanzar
+            plan = _build_relaunch_plan_from_env()
+            _ok = _relaunch_panel(plan)
+            _apply_log("OK: actualización aplicada (en línea). Relaunch=" + ("yes" if _ok else "no"))
+            print("OK: actualización aplicada.", flush=True)
             return 0
 
     except SystemExit:
         raise
     except Exception as e:
         _fail(15, f"Fallo inesperado en --apply: {e}", e)
+
+
 
 # ---------------- API pública ----------------
 def check_for_update(auto_apply=False) -> dict:
@@ -596,7 +746,18 @@ def _apply_elevated_from_payload(payload_path: Path) -> int:
         if not zip_path.exists():
             _fail(3, f"ZIP temporal no existe: {zip_path}")
 
+        manual = bool(payload.get("manual"))
+        plan = _build_relaunch_plan_from_payload(payload)
+
+        _apply_log("Parando guardian y aplicando ZIP (elevado).")
         _stop_guardian_task()
+
+        # En modo manual NO cerramos la GUI; la GUI espera al updater.
+        if not manual:
+            gui_pid = payload.get("gui_pid", 0) or 0
+            gui_exe = payload.get("gui_exe", "")
+            _kill_gui_explicit(gui_pid, gui_exe)
+
         _kill_processes_in_install()
         time.sleep(0.5)
         _apply_zip_to_install(zip_path)
@@ -605,9 +766,19 @@ def _apply_elevated_from_payload(payload_path: Path) -> int:
         except Exception as e:
             _apply_log(f"WARNING: no pude escribir VERSION.json elevado: {e}")
         _start_guardian_task()
-        _apply_log("OK: actualización aplicada (elevado).")
-        print("OK: actualización aplicada (elevado).")
+
+        _write_result_json(True, latest, mode=("manual" if manual else "elevated"))
+
+        if manual:
+            _apply_log("Manual mode (elevado): no relaunch/kill; devuelve control a la GUI.")
+            print("OK: actualización aplicada (elevado, manual).", flush=True)
+            return 0
+
+        _ok = _relaunch_panel(plan)
+        _apply_log("OK: actualización aplicada (elevado). Relaunch=" + ("yes" if _ok else "no"))
+        print("OK: actualización aplicada (elevado).", flush=True)
         return 0
+
     except SystemExit:
         raise
     except Exception as e:
@@ -616,6 +787,7 @@ def _apply_elevated_from_payload(payload_path: Path) -> int:
         except Exception:
             pass
         _fail(2, f"Fallo en --apply-elevated: {e}", e)
+
 
 
 
