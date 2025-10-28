@@ -12,7 +12,6 @@ from tkinter import messagebox
 from utils.runtime import (
     install_root,
     datadir_system,
-    control_log_path,
     python_for_console,
     python_for_windowed,
     uninstaller_path,
