@@ -37,11 +37,14 @@ except Exception:
 # Helpers consolidados del runtime/servicios
 from utils.runtime import read_version, find_install_root, python_for_console
 from xiao_gui.services import (
+    notifier_regenerate_aumid,
+    notifier_test_toast,
     run_updater_apply_ui,
     launch_uninstaller_ui,
     query_task_state, start_service, stop_service,
     open_control_log,
     notifier_status, start_notifier, stop_notifier,
+    diagnose_notifications,
 )
 
 log = get_logger("gui.options")
@@ -175,6 +178,21 @@ class OptionsPage(ttk.Frame):
         ttk.Button(btns_not, text="Detener Notifier", command=self._stop_notifier).grid(row=0, column=1, padx=4)
         ttk.Button(btns_not, text="Reiniciar Notifier", command=self._restart_notifier).grid(row=0, column=2, padx=4)
         ttk.Button(btns_not, text="Refrescar estado", command=self.refresh_notifier).grid(row=0, column=3, padx=4)
+        row += 1
+         # --- Diagnóstico de notificaciones ---
+        row += 1
+        diag_frm = ttk.Frame(self)
+        diag_frm.grid(row=row, column=0, sticky="w", padx=6, pady=(0,6))
+        self.var_diag_fix = tk.BooleanVar(value=False)
+        ttk.Checkbutton(diag_frm, text="Auto-arreglar si es posible", variable=self.var_diag_fix).grid(row=0, column=0, padx=(0,8))
+        ttk.Button(diag_frm, text="Diagnosticar notificaciones", command=self._on_diag_notifs).grid(row=0, column=1)
+        row += 1
+        # --- Herramientas Notifier ---
+        row += 1
+        tools_frm = ttk.Frame(self)
+        tools_frm.grid(row=row, column=0, sticky="w", padx=6, pady=(0,6))
+        ttk.Button(tools_frm, text="Toast de prueba", command=self._on_test_toast).grid(row=0, column=0, padx=(0,8))
+        ttk.Button(tools_frm, text="Regenerar AppID/atajo", command=self._on_regen_aumid).grid(row=0, column=1)
         row += 1
 
         ttk.Separator(self).grid(row=row, column=0, sticky="ew", padx=6, pady=12)
@@ -332,6 +350,109 @@ class OptionsPage(ttk.Frame):
     def _restart_notifier(self):
         self._stop_notifier()
         self.after(900, self._start_notifier)
+        
+    def _on_diag_notifs(self):
+        auto_fix = bool(self.var_diag_fix.get())
+        log.info("Diagnóstico de notificaciones (auto_fix=%s)…", auto_fix)
+
+        def _work():
+            res = diagnose_notifications(auto_fix=auto_fix)  # llama a services.py
+            def _ui():
+                if not self.winfo_exists():
+                    return
+                if not res.get("ok"):
+                    messagebox.showerror("Diagnóstico",
+                        f"Fallo al ejecutar diagnóstico (rc={res.get('rc')}):\n{res.get('stderr') or res.get('stdout') or 'Sin salida.'}")
+                    return
+
+                d = res.get("data") or {}
+                # Campos esperados
+                app_id     = d.get("app_id")
+                aumid_ok   = bool(d.get("has_shortcut"))
+                winrt_ok   = bool(d.get("winrt_available"))
+                toast_g    = d.get("toast_enabled")
+                toast_app  = d.get("app_enabled")
+                qh         = bool(d.get("quiet_hours_active"))
+                lnk_path   = d.get("shortcut_path")
+
+                lines = []
+                lines.append(f"AUMID: {app_id}")
+                lines.append(f"Acceso directo (.lnk): {'OK' if aumid_ok else 'FALTA'}")
+                if lnk_path:
+                    lines.append(f" - {lnk_path}")
+                lines.append(f"WinRT disponible: {'sí' if winrt_ok else 'no'}")
+                if toast_g is not None:
+                    lines.append(f"Notificaciones globales (ToastEnabled): {'ON' if toast_g==1 else 'OFF'}")
+                else:
+                    lines.append("Notificaciones globales: (sin clave, se usa valor por defecto)")
+                if toast_app is not None:
+                    lines.append(f"Notificaciones para la app: {'ON' if toast_app==1 else 'OFF'}")
+                else:
+                    lines.append("Notificaciones para la app: (sin clave, se usa valor por defecto)")
+                lines.append(f"No molestar / Focus Assist activo: {'sí' if qh else 'no'}")
+
+                advice = []
+                if not aumid_ok:
+                    advice.append("➤ Falta el acceso directo en Menú Inicio. Pulsa “Iniciar Notifier” para regenerarlo o reinicia Notifier.")
+                if toast_g == 0:
+                    advice.append("➤ Las notificaciones globales están desactivadas. Actívalas en Configuración → Sistema → Notificaciones.")
+                if toast_app == 0:
+                    advice.append("➤ Las notificaciones para XiaoHack están desactivadas. Actívalas en Configuración → Sistema → Notificaciones → XiaoHack Control Parental.")
+                if qh:
+                    advice.append("➤ El modo “No molestar” está activo. Desactívalo para ver toasts inmediatamente.")
+
+                msg = "\n".join(lines)
+                if advice:
+                    msg += "\n\nRecomendaciones:\n" + "\n".join(advice)
+
+                if auto_fix:
+                    msg = "Se intentó auto-arreglo cuando era posible.\n\n" + msg
+
+                messagebox.showinfo("Diagnóstico de notificaciones", msg)
+
+            self.after(0, _ui)
+
+        # Ejecuta sin bloquear UI
+        threading.Thread(target=_work, daemon=True).start()
+        
+    def _on_test_toast(self):
+        def work():
+            res = notifier_test_toast()
+            def ui():
+                if not self.winfo_exists():
+                    return
+                if res.get("ok"):
+                    messagebox.showinfo("Toast de prueba", "Enviado. Si las notificaciones no estaban silenciadas, deberías ver el aviso al instante.")
+                else:
+                    messagebox.showerror("Toast de prueba", f"Fallo (rc={res.get('rc')}):\n{res.get('stderr') or res.get('stdout') or 'Sin salida.'}")
+            self.after(0, ui)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_regen_aumid(self):
+        def work():
+            res = notifier_regenerate_aumid()
+            def ui():
+                if not self.winfo_exists():
+                    return
+                if not res.get("ok"):
+                    messagebox.showerror("Regenerar AppID/atajo",
+                                        f"Fallo (rc={res.get('rc')}):\n{res.get('stderr') or res.get('stdout') or 'Sin salida.'}")
+                    return
+                d = res.get("data") or {}
+                lines = [
+                    f"AUMID: {d.get('app_id')}",
+                    f"Acceso directo (.lnk): {'OK' if d.get('has_shortcut') else 'FALTA'}",
+                    d.get('shortcut_path',''),
+                    f"WinRT disponible: {'sí' if d.get('winrt_available') else 'no'}",
+                    f"Notificaciones globales: {('ON' if d.get('toast_enabled')==1 else ('OFF' if d.get('toast_enabled')==0 else '(sin clave)'))}",
+                    f"Notificaciones para la app: {('ON' if d.get('app_enabled')==1 else ('OFF' if d.get('app_enabled')==0 else '(sin clave)'))}",
+                    f"No molestar / Focus Assist activo: {'sí' if d.get('quiet_hours_active') else 'no'}",
+                ]
+                messagebox.showinfo("Regenerar AppID/atajo", "\n".join([s for s in lines if s]))
+            self.after(0, ui)
+        threading.Thread(target=work, daemon=True).start()
+
+
 
     # ---------------- Actualizaciones ----------------
     def _set_upd_busy(self, busy: bool, msg: str | None = None):

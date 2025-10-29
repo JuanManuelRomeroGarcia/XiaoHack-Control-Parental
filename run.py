@@ -25,7 +25,7 @@ set_process_title(XH_ROLE)
 _log_level = "INFO"
 try:
     import os
-    _log_level = os.getenv("XH_LOGLEVEL", "INFO").upper()
+    _log_level = os.getenv("XH_LOGLEVEL", _log_level).upper()
 except Exception:
     pass
 

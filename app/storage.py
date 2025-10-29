@@ -36,27 +36,25 @@ log = get_logger("storage")
 def _get_data_dir() -> Path:
     """
     Devuelve la carpeta de datos activa de la app.
-    Se apoya en logs.get_data_dir(), que decide:
-      - XH_DATA_DIR (override)
-      - XH_ROLE=guardian o cuenta SYSTEM -> %ProgramData%\XiaoHackParental
-      - Usuario -> %LOCALAPPDATA%\XiaoHackParental (fallback: %APPDATA%)
-      - Último recurso: .\.xh_data
+    Corrige el caso en que por error llegue ...\XiaoHackParental\logs.
     """
     base = Path(_logs_get_data_dir())
+    # ⚠️ Autocorrección si alguien pasó el directorio de LOGS por error
+    if base.name.lower() == "logs":
+        base = base.parent
     try:
         base.mkdir(parents=True, exist_ok=True)
-        # Verificar escritura
         test = base / ".write_test"
         test.write_text("ok", encoding="utf-8")
         test.unlink(missing_ok=True)
         log.debug("Usando directorio de datos: %s", base)
         return base
     except Exception as e:
-        # Último fallback muy defensivo (no debería ocurrir si logs.py resolvió bien)
         log.warning("No se pudo asegurar escritura en %s (%s). Usando cwd/.xh_data", base, e)
         alt = Path.cwd() / ".xh_data"
         alt.mkdir(parents=True, exist_ok=True)
         return alt
+
 
 
 DATA_DIR = _get_data_dir()
@@ -73,6 +71,7 @@ except Exception:
 LEGACY_DIRS = [
     # Junto al archivo actual (instalaciones antiguas en la carpeta del programa)
     Path(__file__).resolve().parent,
+    (Path(_logs_get_data_dir()) / "..").resolve(), # Por si el data dir estaba mal apuntando a logs
     # AppData clásico (por si existiera de builds previas)
     Path(os.environ.get("APPDATA", str(Path.home()))) / "XiaoHackParental",
 ]
@@ -99,6 +98,8 @@ _DEFAULT_CFG: Dict = {
     "log_process_activity": False,
     # Flag opcional por si la app quiere control explícito:
     "apply_on_start": False,
+    "overlay": { "mode": "banner|fullscreen", "position": "top|bottom",
+                   "height": 160, "opacity": 0.92 }
 }
 
 _DEFAULT_STATE: Dict = {
@@ -142,22 +143,44 @@ def _atomic_write(path: Path, data: dict):
             except Exception:
                 pass
 
-def _read_json(path: Path, defaults: dict) -> dict:
-    """Lee JSON; si no existe o hay error, lo crea con defaults y devuelve una copia."""
-    try:
-        if path.exists():
+def _read_json(path: Path, default: Dict | list | None = None):
+    """
+    Lee JSON con tolerancia a bloqueos (PermissionError) y escrituras en curso.
+    - 8 reintentos con backoff.
+    - Si falla, intenta .bak y devuelve default.
+    """
+    default = {} if default is None else default
+    for i in range(8):
+        try:
             with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                log.debug("Leído correctamente %s", path)
-                return data
-        else:
-            log.info("Archivo no encontrado (%s). Creando con defaults (NO-OP).", path)
-            _atomic_write(path, defaults)
-            return defaults.copy()
-    except Exception as e:
-        log.warning("Error al leer %s: %s (recreando con defaults)", path, e, exc_info=True)
-        _atomic_write(path, defaults)
-        return defaults.copy()
+                return json.load(f)
+        except PermissionError:
+            # Archivo momentáneamente bloqueado por otro proceso: reintenta
+            time.sleep(0.04 * (i + 1))
+            continue
+        except json.JSONDecodeError:
+            # Posible escritura a medio volcar: reintenta
+            time.sleep(0.04 * (i + 1))
+            continue
+        except FileNotFoundError:
+            break
+        except Exception as e:
+            log.warning("Error al leer %s: %s", path, e)
+            break
+
+    # Fallback a copia si la usas al guardar (opcional)
+    bak = path.with_suffix(path.suffix + ".bak")
+    if bak.exists():
+        try:
+            with open(bak, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+
+    # Último recurso
+    log.warning("Devolviendo default para %s (no se pudo leer de forma segura).", path)
+    return default
+
 
 # ==============================================================================
 # Migración inicial (una sola vez)

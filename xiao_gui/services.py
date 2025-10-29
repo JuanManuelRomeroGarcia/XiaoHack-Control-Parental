@@ -4,6 +4,7 @@ import os
 import json
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 import time
@@ -589,3 +590,176 @@ def open_control_log():
     except Exception as e:
         log.error("open_control_log error: %s", e)
         raise
+
+def diagnose_notifications(auto_fix: bool = False) -> dict:
+    """
+    Ejecuta un runner temporal con python.exe que añade la INSTALL_DIR a sys.path
+    y llama a app.notifier.diagnose_notification_env(...).
+    Devuelve: { ok, rc, stdout, stderr, data(dict|None) }.
+    """
+    import os
+    import json
+    import subprocess
+    import tempfile
+    from pathlib import Path
+    from utils.runtime import find_install_root, python_for_console
+
+    base = Path(find_install_root())  # p.ej. C:\Program Files\XiaoHackParental
+    py = python_for_console()
+
+    # Forzar consola (python.exe), nunca pythonw.exe
+    try:
+        p = Path(py)
+        if p.name.lower() == "pythonw.exe":
+            py = str(p.with_name("python.exe"))
+    except Exception:
+        pass
+    if not py or not os.path.exists(py):
+        cand = base / "venv" / "Scripts" / "python.exe"
+        py = str(cand)
+
+    # Runner: añade la ruta de instalación a sys.path y ejecuta el diagnóstico
+    base_str = str(base)  # sin barra final
+    code = (
+        "import sys, json\n"
+        f"sys.path.insert(0, r'{base_str}')\n"
+        "from app.notifier import diagnose_notification_env\n"
+        f"print(json.dumps(diagnose_notification_env(auto_fix={str(bool(auto_fix))}), ensure_ascii=False))\n"
+    )
+
+    tmp_script = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as fh:
+            fh.write(code)
+            tmp_script = fh.name
+
+        env = os.environ.copy()
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+
+        CREATE_NO_WINDOW = 0x08000000
+        proc = subprocess.run(
+            [py, "-X", "utf8", tmp_script],
+            cwd=str(base),                    # no imprescindible, pero coherente
+            env=env,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=12,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except Exception as e:
+        return {"ok": False, "rc": None, "stdout": "", "stderr": str(e), "data": None}
+    finally:
+        if tmp_script:
+            try:
+                os.remove(tmp_script)
+            except Exception:
+                pass
+
+    out = proc.stdout or ""
+    err = proc.stderr or ""
+    data = None
+    if out.strip():
+        try:
+            data = json.loads(out)
+        except Exception:
+            data = None
+
+    return {"ok": proc.returncode == 0, "rc": proc.returncode, "stdout": out, "stderr": err, "data": data}
+
+def notifier_test_toast() -> dict:
+    """
+    Lanza: pythonw -m app.notifier --test
+    Devuelve { ok, rc, stdout, stderr }.
+    """
+    base = Path(find_install_root())
+    py_console = Path(python_for_console())
+
+    # Preferimos pythonw.exe para que no parpadee consola
+    if py_console.name.lower() == "python.exe":
+        pyw = py_console.with_name("pythonw.exe")
+    else:
+        pyw = py_console
+    if not pyw.exists():
+        pyw = base / "venv" / "Scripts" / "pythonw.exe"
+
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    CREATE_NO_WINDOW = 0x08000000
+    try:
+        proc = subprocess.run(
+            [str(pyw), "-m", "app.notifier", "--test"],
+            cwd=str(base),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except Exception as e:
+        return {"ok": False, "rc": None, "stdout": "", "stderr": str(e)}
+    return {"ok": proc.returncode == 0, "rc": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
+
+def notifier_regenerate_aumid() -> dict:
+    """
+    Ejecuta un runner temporal que llama a:
+      ensure_aumid_ready(); diagnose_notification_env()
+    Devuelve { ok, rc, stdout, stderr, data } donde data es el dict del diagnóstico.
+    """
+    base = Path(find_install_root())
+    py = Path(python_for_console())
+    if py.name.lower() == "pythonw.exe":
+        py = py.with_name("python.exe")
+    if not py.exists():
+        py = base / "venv" / "Scripts" / "python.exe"
+
+    code = (
+        "import sys, json\n"
+        f"sys.path.insert(0, r'{str(base)}')\n"
+        "from app.notifier import ensure_aumid_ready, diagnose_notification_env\n"
+        "ensure_aumid_ready()\n"
+        "print(json.dumps(diagnose_notification_env(auto_fix=False), ensure_ascii=False))\n"
+    )
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as fh:
+            fh.write(code)
+            tmp_path = fh.name
+
+        env = os.environ.copy()
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+
+        CREATE_NO_WINDOW = 0x08000000
+        proc = subprocess.run(
+            [str(py), "-X", "utf8", tmp_path],
+            cwd=str(base),
+            env=env,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except Exception as e:
+        return {"ok": False, "rc": None, "stdout": "", "stderr": str(e), "data": None}
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    out = proc.stdout or ""
+    err = proc.stderr or ""
+    data = None
+    if out.strip():
+        try:
+            data = json.loads(out)
+        except Exception:
+            data = None
+    return {"ok": proc.returncode == 0, "rc": proc.returncode, "stdout": out, "stderr": err, "data": data}
