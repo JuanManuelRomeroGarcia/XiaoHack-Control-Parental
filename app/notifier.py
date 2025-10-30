@@ -431,17 +431,14 @@ def query_new_notifies(since_id: int):
     return fetch_events_since("notify", since_id)
 
 _LAST_STOP_TS = 0.0
-_LAST_START_DEADLINE = None
 
 def _handle_countdown_event(value: str, meta: str):
     """
     value: "start" | "stop"
     meta : JSON {"deadline": epoch} o {"seconds": n}
-    Reglas:
-      - Anti-rearme: si acabamos de parar (t<3s), ignorar 'start'
-      - Idempotencia: si llega un 'start' con el mismo deadline y ya está armado, ignorar
     """
-    global _LAST_STOP_TS, _LAST_START_DEADLINE
+    import json
+    import time
     try:
         payload = {}
         if meta:
@@ -451,46 +448,34 @@ def _handle_countdown_event(value: str, meta: str):
                 payload = {}
 
         if value == "start":
-            # Ventana anti-rearme tras STOP
-            if _LAST_STOP_TS and (time.time() - _LAST_STOP_TS) < 3.0:
-                log.info("Countdown START ignorado (ventana tras STOP)")
-                return
-
             deadline = None
+            secs = None
             if "deadline" in payload:
-                deadline = float(payload["deadline"])
+                try:
+                    deadline = float(payload["deadline"])
+                except Exception:
+                    deadline = None
             elif "seconds" in payload:
-                # Construimos un deadline sintético para poder comparar duplicados
-                deadline = time.time() + float(payload["seconds"])
+                try:
+                    secs = float(payload["seconds"])
+                    deadline = time.time() + secs
+                except Exception:
+                    secs = None
 
-            if deadline is not None:
-                # Si ya armamos este mismo deadline y el overlay está activo, ignorar
-                if (_LAST_START_DEADLINE is not None
-                        and abs(_LAST_START_DEADLINE - deadline) < 0.5
-                        and _LC.remaining() > 0):
-                    log.info("Countdown START duplicado (deadline=%s) ignorado", deadline)
-                    return
-
-                _LC.arm_until(deadline, source="event")
-                _LAST_START_DEADLINE = deadline
-                log.info("Overlay armed by EVENT (deadline=%s)", deadline)
-            elif "seconds" in payload:
-                secs = float(payload["seconds"])
-                if _LC.remaining() > 0 and abs(_LC.remaining() - secs) < 0.5:
-                    log.info("Countdown START duplicado (seconds=%s) ignorado", secs)
-                    return
-                _LC.arm_for(secs, source="event")
-                _LAST_START_DEADLINE = None
-                log.info("Overlay armed by EVENT (seconds=%s)", secs)
+            if deadline:
+                rem = max(0, int(deadline - time.time()))
+                _LC.arm_until(float(deadline), source="event")
+                log.info("COUNTDOWN EVENT → START: deadline=%s (rem=%ss)", int(deadline), rem)
+            else:
+                log.warning("COUNTDOWN EVENT → START sin 'deadline/seconds'. meta=%r", payload)
 
         elif value == "stop":
             _LC.disarm()
-            _LAST_STOP_TS = time.time()
-            _LAST_START_DEADLINE = None
-            log.info("Overlay disarmed by EVENT")
-
+            globals()["_LAST_STOP_TS"] = time.time()
+            log.info("COUNTDOWN EVENT → STOP (timer local desarmado)")
     except Exception as e:
         log.warning("countdown-event error: %s", e)
+
 
 
 # --------------------------------------------------------------------
@@ -610,27 +595,33 @@ def _overlay_seconds_from_state(st: dict) -> int:
 
 def _safe_overlay_seconds() -> int:
     """
-    1) Primero, si está armado el temporizador local (pulsos start/stop), úsalo.
-    2) Si NO está armado, mira el state (play_countdown/scheduler) y arma SOLO lo que quede.
+    1) Si hay STOP reciente (3s), no rearma.
+    2) Primero timer local (eventos start/stop).
+    3) Si no hay, arma por STATE (play_countdown/scheduler) SOLO lo que falte.
     """
-    # Al inicio de _safe_overlay_seconds():
-    if _LAST_STOP_TS and (time.time() - _LAST_STOP_TS) < 3.0:
+    now = time.time()
+    if _LAST_STOP_TS and (now - _LAST_STOP_TS) < 3.0:
+        log.debug("[overlay] safe: bloqueado por ventana post-STOP (%.2fs)", now - _LAST_STOP_TS)
         return 0
-        # 1) Temporizador local (pista fiable porque viene de eventos start/stop)
-        n = _sec_from_local_timer()
-        
-    if n > 0:
-        return n
 
-    # 2) Fallback suave: lee state y arma por los segundos que falten (no usa deadline_ts)
+    n_local = _sec_from_local_timer()
+    if n_local > 0:
+        # Ya armado por EVENT
+        return n_local
+
     try:
         st = _storage_load_state() or {}
-        n = _overlay_seconds_from_state(st)  # << usa play_countdown/scheduler
-        if 0 < n <= 60:
-            _LC.arm_for(n, source="state")   # arma solo lo que falte
-            return _sec_from_local_timer()
-    except Exception:
-        pass
+        n_state = _overlay_seconds_from_state(st)  # lee play_countdown/scheduler
+        if 0 < n_state <= 60:
+            _LC.arm_for(n_state, source="state")
+            n2 = _sec_from_local_timer()
+            log.info("[overlay] armado por STATE: n=%s → rem=%.1fs", n_state, n2)
+            return n2
+        else:
+            if n_state != 0:
+                log.debug("[overlay] state no armó: n_state=%s", n_state)
+    except Exception as e:
+        log.debug("[overlay] safe: error leyendo state: %s", e)
 
     return 0
 
@@ -1027,10 +1018,12 @@ def overlay_loop(stop_ev: threading.Event):
                 # 1) Flash 10/5 min
                 ftxt, fsub = _flash_current()
                 if ftxt:
+                    if not visible:
+                        visible = True
+                        log.debug("OVERLAY→ show (flash)")
                     mgr.subtitle = fsub or default_subtitle
                     mgr.render_text(ftxt)
-                    visible = True
-                    last_n = -1  # no mezclar con número previo
+                    last_n = -1  # no mezclar con countdown previo
                     _pump()
                     time.sleep(SLEEP_ACTIVE)
                     continue
@@ -1038,11 +1031,13 @@ def overlay_loop(stop_ev: threading.Event):
                 # 2) Countdown último minuto
                 n = _safe_overlay_seconds()
                 if n > 0:
-                    mgr.subtitle = default_subtitle
                     if not visible:
                         visible = True
+                        log.debug("OVERLAY→ show (countdown)")
+                    mgr.subtitle = default_subtitle
                     if n != last_n:
                         mgr.render(n)
+                        log.debug("OVERLAY→ render n=%s", n)
                         last_n = n
                     _pump()
                     time.sleep(SLEEP_ACTIVE)
@@ -1051,6 +1046,7 @@ def overlay_loop(stop_ev: threading.Event):
                         mgr.hide()
                         visible = False
                         last_n = -1
+                        log.debug("OVERLAY→ hide (n=0 y sin flash)")
                     _pump()
                     time.sleep(SLEEP_IDLE)
         except Exception as e:
@@ -1067,7 +1063,6 @@ def overlay_loop(stop_ev: threading.Event):
                 pass
     else:
         log.info("Overlay usando fallback Tkinter (banner no disponible).")
-        # Fallback con soporte básico de flash
         if tk is None:
             return
         try:
@@ -1097,10 +1092,12 @@ def overlay_loop(stop_ev: threading.Event):
                     if not visible:
                         root.deiconify()
                         visible = True
+                        log.debug("OVERLAY(Tk)→ show (flash)")
                     if ftxt != last_txt:
                         label.config(text=str(ftxt))
                         sub.config(text=fsub or default_subtitle)
                         last_txt = ftxt
+                        log.debug("OVERLAY(Tk)→ render flash=%r", ftxt)
                     root.update_idletasks()
                     root.update()
                     time.sleep(SLEEP_ACTIVE)
@@ -1111,11 +1108,13 @@ def overlay_loop(stop_ev: threading.Event):
                     if not visible:
                         root.deiconify()
                         visible = True
+                        log.debug("OVERLAY(Tk)→ show (countdown)")
                     txt = str(n)
                     if txt != last_txt:
                         label.config(text=txt)
                         sub.config(text=default_subtitle)
                         last_txt = txt
+                        log.debug("OVERLAY(Tk)→ render n=%s", n)
                     root.update_idletasks()
                     root.update()
                     time.sleep(SLEEP_ACTIVE)
@@ -1124,6 +1123,7 @@ def overlay_loop(stop_ev: threading.Event):
                         root.withdraw()
                         visible = False
                         last_txt = None
+                        log.debug("OVERLAY(Tk)→ hide (n=0 y sin flash)")
                     time.sleep(SLEEP_IDLE)
         except Exception as e:
             log.warning("tk overlay error: %s", e)
@@ -1189,16 +1189,55 @@ def _sec_from_local_timer() -> int:
 
 # === “Flash” banner de 10/5 min (5s) =========================================
 _FLASH = {"text": None, "subtitle": None, "until": 0.0}
+_FLASH_LOCK = threading.Lock()
 
-def trigger_flash_banner(text: str, subtitle: str | None = None, seconds: float = 5.0):
-    _FLASH["text"] = str(text)
-    _FLASH["subtitle"] = subtitle
-    _FLASH["until"] = time.time() + float(seconds)
+def trigger_flash_banner(text: str, subtitle: str | None = None, ttl: float | None = None, *, seconds: float | None = None) -> None:
+    """
+    Activa un 'flash' temporal (p.ej. "10", "5") para que el overlay lo muestre unos segundos.
+    """
+    import time
+    try:
+        # Normaliza tiempo de vida
+        if ttl is None and seconds is not None:
+            ttl = seconds
+        if ttl is None:
+            ttl = 5.0  # por defecto
 
-def _flash_current():
-    if _FLASH["until"] > time.time() and _FLASH["text"]:
-        return _FLASH["text"], _FLASH["subtitle"]
+        t = str(text)
+        s = subtitle or ""
+        expiry = time.time() + float(ttl)
+
+        with _FLASH_LOCK:
+            _FLASH["text"] = t
+            _FLASH["subtitle"] = s
+            _FLASH["until"] = expiry
+
+        log.info("FLASH→ armed: text=%r, sub=%r, ttl=%.1fs (until=%.0f)",
+                 t, s, ttl, expiry)
+    except Exception as e:
+        log.warning("FLASH→ error al armar: %s", e)
+
+
+def _flash_current() -> tuple[str | None, str | None]:
+    """
+    Si hay un flash activo y no ha expirado, devuelve (texto, subtítulo).
+    """
+    import time
+    now = time.time()
+    with _FLASH_LOCK:
+        t = _FLASH.get("text")
+        u = float(_FLASH.get("until") or 0)
+        s = _FLASH.get("subtitle") or None
+        if t and now < u:
+            return t, s
+        if t and now >= u:
+            # expiró → limpia
+            log.debug("FLASH→ expired (text=%r).", t)
+            _FLASH["text"] = None
+            _FLASH["subtitle"] = None
+            _FLASH["until"] = 0
     return None, None
+
 
 
 
@@ -1251,19 +1290,28 @@ def main():
 
             # 2) NOTIFY: toasts + flash 10/5 min (5s)
             rows_nt = query_new_notifies(last_nt)
-            for rid, ts, title, body in rows_nt:
+            log.debug("DB→ poll: last_nt=%s, last_cd=%s, nt_rows=%d, cd_rows=%d",
+            last_nt, last_cd, len(rows_nt or []), len(rows_cd or []))
+            
+            for rid, ts, title, body in rows_nt or []:
+                
+                st_local["last_nt_id"] = rid
+                save_state_local(st_local)
+                
                 t = (title or "").strip()
                 b = (body or "").strip()
-                # Toast normal siempre
-                notify(t or "Aviso", b, duration=5)
+                log.info("DB→ NOTIFY id=%s | title=%r | body=%r", rid, t, b)
 
                 # Flash banner si es aviso de tiempo de juego (10/5 minutos)
                 if t.lower() == "tiempo de juego":
                     lb = b.lower()
-                    if "10 minutos" in lb:
+                    m10 = ("10 minutos" in lb)
+                    m5  = ("5 minutos"  in lb)
+                    log.info("FLASH check: title='Tiempo de juego' 10m=%s 5m=%s", m10, m5)
+                    if m10:
                         log.info("Flash 10m recibido → mostrar banner 10")
                         trigger_flash_banner("10", "Quedan 10 minutos", seconds=5.0)
-                    elif "5 minutos" in lb:
+                    elif m5:
                         log.info("Flash 5m recibido → mostrar banner 5")
                         trigger_flash_banner("5", "Quedan 5 minutos", seconds=5.0)
 

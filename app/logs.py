@@ -85,6 +85,19 @@ def _resolve_data_dir() -> Path:
                 return base
             except Exception:
                 pass
+    
+    # >>> NUEVO BLOQUE: preferir ProgramData si existe la instalación <<<
+    programdata = os.getenv("PROGRAMDATA")
+    if programdata:
+        pd_base = Path(programdata) / APP_VENDOR
+        # Si ya existe (instalación hecha) o hay ficheros clave, usarlo siempre
+        if pd_base.exists() or (pd_base / "installed.json").exists() or (pd_base / "guardian.db").exists():
+            try:
+                pd_base.mkdir(parents=True, exist_ok=True)
+                return pd_base
+            except Exception:
+                pass
+
 
     # 3) Usuario normal
     local_appdata = os.getenv("LOCALAPPDATA")

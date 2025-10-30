@@ -1,4 +1,9 @@
 # scheduler.py — Horarios y avisos (manual + tramos) con LOG centralizado
+# al inicio del archivo:
+#import os
+#from app import helperdb
+
+
 from datetime import datetime, time as dtime, timedelta
 from typing import Dict, List, Tuple, Optional
 
@@ -209,11 +214,17 @@ def check_playtime_alerts(state: dict, now: datetime, cfg: Optional[dict] = None
         pa["m10"] = True
         messages.append("⏳ Quedan 10 minutos de juego.")
         log.info("Emitido aviso de 10 minutos")
+        
+        #if (os.getenv("XH_ROLE") or "").lower() != "guardian":
+        #   helperdb.log_event("notify", "Tiempo de juego", "⏳ Quedan 10 minutos de juego.")
 
     if remaining <= M5 and not pa["m5"]:
         pa["m5"] = True
         messages.append("⏳ Quedan 5 minutos de juego.")
         log.info("Emitido aviso de 5 minutos")
+        
+        #if (os.getenv("XH_ROLE") or "").lower() != "guardian":
+        #   helperdb.log_event("notify", "Tiempo de juego", "⏳ Quedan 5 minutos de juego.")
 
     if remaining <= M1 and not pa["m1"]:
         pa["m1"] = True
