@@ -28,6 +28,12 @@ from app.logs import get_logger, install_exception_hooks
 log = get_logger("notifier")
 install_exception_hooks("notifier-crash")
 
+# === Overlay countdown: usar SIEMPRE lo que calcula scheduler/guardian ===
+try:
+    from app.scheduler import get_overlay_countdown as _sched_get_overlay_countdown
+except Exception:
+    _sched_get_overlay_countdown = None
+
 
 # --------------------------------------------------------------------
 # Identidad XiaoHack (centralizada)
@@ -429,6 +435,61 @@ def query_new_blocks(since_id: int):
     except Exception as e:
         log.error("Error SQLite: %s", e)
         return []
+    
+def query_new_countdown_events(since_id: int):
+    try:
+        con = sqlite3.connect(str(DB_PD))
+        cur = con.cursor()
+        cur.execute("""CREATE TABLE IF NOT EXISTS events(
+            id INTEGER PRIMARY KEY, ts INTEGER, type TEXT, value TEXT, meta TEXT
+        )""")
+        cur.execute("SELECT id, ts, value, meta FROM events WHERE type='countdown' AND id > ? ORDER BY id ASC", (since_id,))
+        rows = cur.fetchall()
+        con.close()
+        return rows
+    except Exception as e:
+        log.error("Error SQLite countdown: %s", e)
+        return []
+
+def query_new_notifies(since_id: int):
+    try:
+        con = sqlite3.connect(str(DB_PD))
+        cur = con.cursor()
+        cur.execute("""CREATE TABLE IF NOT EXISTS events(
+            id INTEGER PRIMARY KEY, ts INTEGER, type TEXT, value TEXT, meta TEXT
+        )""")
+        cur.execute("SELECT id, ts, value, meta FROM events WHERE type='notify' AND id > ? ORDER BY id ASC", (since_id,))
+        rows = cur.fetchall()
+        con.close()
+        return rows
+    except Exception as e:
+        log.error("Error SQLite notify: %s", e)
+        return []
+
+def _handle_countdown_event(value: str, meta: str):
+    """
+    value: "start" | "stop"
+    meta : JSON {"deadline": epoch} o {"seconds": n}
+    """
+    try:
+        payload = {}
+        if meta:
+            try:
+                payload = json.loads(meta)
+            except Exception:
+                payload = {}
+        if value == "start":
+            if "deadline" in payload:
+                _LC.arm_until(float(payload["deadline"]), source="event")
+                log.info("Overlay armed by EVENT (deadline=%s)", payload["deadline"])
+            elif "seconds" in payload:
+                _LC.arm_for(float(payload["seconds"]), source="event")
+                log.info("Overlay armed by EVENT (seconds=%s)", payload["seconds"])
+        elif value == "stop":
+            _LC.disarm()
+            log.info("Overlay disarmed by EVENT")
+    except Exception as e:
+        log.warning("countdown-event error: %s", e)
 
 # --------------------------------------------------------------------
 # Explorer Watch (como antes)
@@ -526,51 +587,48 @@ def _overlay_settings():
         return "banner", "top", 160, 0.92
 
 def _overlay_seconds_from_state(st: dict) -> int:
-    """
-    Devuelve 0..60 únicamente si:
-      - guardian/scheduler han escrito play_countdown > 0, o
-      - play_alerts.countdown_started == True y aún no pasó deadline_ts.
-    En cualquier otro caso -> 0 (NO se muestra nada).
-    """
-    import time as _t
-
-    # 1) Camino principal: contador explícito escrito por guardian (1..60)
+    """Devuelve 0..60. Preferir 'play_countdown' escrito por guardian/scheduler."""
+    # 1) Campo directo si existe (lo actualiza guardian cada segundo en último minuto)
     try:
         n = int(st.get("play_countdown", 0) or 0)
-        if 0 < n <= 60:
-            return n
+        return max(0, min(60, n))
     except Exception:
         pass
 
-    # 2) Camino alternativo: flag de cuenta atrás + deadline (sin scheduler)
-    try:
-        pa = st.get("play_alerts") or {}
-        if isinstance(pa, dict) and pa.get("countdown_started") is True:
-            deadline = (
-                pa.get("deadline_ts")
-                or (st.get("play_session") or {}).get("end_ts")
-                or st.get("play_end_ts")
-            )
-            if isinstance(deadline, (int, float)):
-                rem = int(max(0, deadline - _t.time()))
-                if 0 < rem <= 60:
-                    return rem
-    except Exception:
-        pass
+    # 2) Fallback al scheduler si está disponible
+    if _sched_get_overlay_countdown:
+        try:
+            n = int(_sched_get_overlay_countdown(st))
+            return max(0, min(60, n))
+        except Exception:
+            pass
 
     return 0
 
 
 def _safe_overlay_seconds() -> int:
-    """Lee state.json con tolerancia a bloqueos y devuelve 0..60; nunca lanza."""
+    """
+    Fuente principal: temporizador local (armado por eventos).
+    Respaldo: si no está armado y el estado tiene countdown_started+deadline_ts,
+              armamos localmente y devolvemos su valor.
+    """
+    n = _sec_from_local_timer()
+    if n > 0:
+        return n
+
+    # Fallback: arma desde state una sola vez si hay deadline_ts
     try:
         st = _storage_load_state() or {}
+        pa = st.get("play_alerts") or {}
+        if isinstance(pa, dict) and pa.get("countdown_started") is True:
+            dl = pa.get("deadline_ts")
+            if isinstance(dl, (int, float)):
+                _LC.arm_until(float(dl), source="deadline")
+                return _sec_from_local_timer()
     except Exception:
-        st = {}
-    try:
-        return _overlay_seconds_from_state(st)
-    except Exception:
-        return 0
+        pass
+    return 0
+
 
 WIN32_OVERLAY_OK = False
 _OVERLAY_IMPL = "none"
@@ -610,6 +668,7 @@ try:
             from ctypes import wintypes as WT
             GWL_WNDPROC = -4  # noqa: F841
             WNDPROC = ct.WINFUNCTYPE(ct.c_long, WT.HWND, ct.c_uint, WT.WPARAM, WT.LPARAM)
+            
 
             def _wndproc(hWnd, msg, wParam, lParam):
                 try:
@@ -633,6 +692,15 @@ try:
             win32gui.SetWindowPos(self.hwnd, win32con.HWND_TOPMOST, x, y, w, h,
                                   win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW)
             self.visible = True
+            
+        def set_subtitle(self, subtitle: str | None):
+            if subtitle is not None and subtitle != self.subtitle:
+                self.subtitle = subtitle
+                # Forzamos repintado si ya es visible
+                try:
+                    win32gui.InvalidateRect(self.hwnd, None, True)
+                except Exception:
+                    pass  
 
         def _on_paint(self, hwnd):
             hdc, ps = win32gui.BeginPaint(hwnd)
@@ -708,13 +776,34 @@ try:
             _HWND_MAP.pop(int(self.hwnd), None)
 
     class Win32OverlayManager:
+        """
+        Crea las ventanas del overlay solo cuando hace falta (lazy) y
+        las mantiene SIEMPRE ocultas al iniciar para evitar el flash inicial.
+        """
         def __init__(self):
             self.windows: list[_Win32OverlayWindow] = []
             self.subtitle = "Último minuto • Guarda tu partida"
             self.mode, self.position, self.height_px, self.opacity = _overlay_settings()
-            self._init_monitors()
+            self._ready = False           # ← aún no se han creado las ventanas
+            self._last_monitors = None    # firma simple para detectar cambios de monitores
 
-        def _init_monitors(self):
+        def _monitors_signature(self) -> tuple:
+            """Firma simple del layout de monitores para recrear si cambian."""
+            try:
+                sig = []
+                for _hMon, _hdc, (l1, t, r, b) in win32api.EnumDisplayMonitors():
+                    sig.append((l1, t, r, b))
+                return tuple(sig)
+            except Exception:
+                # primario
+                sw = win32api.GetSystemMetrics(0)
+                sh = win32api.GetSystemMetrics(1)
+                return ((0, 0, sw, sh),)
+
+        def _init_monitors(self, make_visible: bool = False):
+            """
+            Crea todas las ventanas. Si make_visible=False, las deja ocultas explícitamente.
+            """
             self.windows.clear()
             try:
                 mons = win32api.EnumDisplayMonitors()
@@ -723,9 +812,10 @@ try:
                     if self.mode == "banner":
                         hh = min(self.height_px, max(80, int(h * 0.22)))
                         y  = t if self.position == "top" else b - hh
-                        self.windows.append(_Win32OverlayWindow(l1, y, w, hh, self.subtitle, self.opacity))
+                        wnd = _Win32OverlayWindow(l1, y, w, hh, self.subtitle, self.opacity)
                     else:
-                        self.windows.append(_Win32OverlayWindow(l1, t, w, h, self.subtitle, self.opacity))
+                        wnd = _Win32OverlayWindow(l1, t, w, h, self.subtitle, self.opacity)
+                    self.windows.append(wnd)
             except Exception as e:
                 log.warning("EnumDisplayMonitors no disponible (%s), usando primario", e)
                 sw = win32api.GetSystemMetrics(0)
@@ -737,19 +827,80 @@ try:
                 else:
                     self.windows.append(_Win32OverlayWindow(0, 0, sw, sh, self.subtitle, self.opacity))
 
+            # MUY IMPORTANTE: ocultar todo inmediatamente al crear si no queremos visibilidad inicial
+            if not make_visible:
+                try:
+                    for w in self.windows:
+                        w.hide()
+                except Exception:
+                    pass
+
+            self._ready = True
+            self._last_monitors = self._monitors_signature()
+
+        def _ensure_ready(self, make_visible: bool = False):
+            """Crea las ventanas si aún no existen o si cambió la geometría de monitores."""
+            sig = self._monitors_signature()
+            if (not self._ready) or (self._last_monitors != sig):
+                # destruir lo anterior si existe
+                if self._ready:
+                    try:
+                        for w in self.windows:
+                            w.destroy()
+                    except Exception:
+                        pass
+                    self.windows.clear()
+                    self._ready = False
+                # crear nuevas (ocultas salvo que se pida lo contrario)
+                self._init_monitors(make_visible=make_visible)
+
         def render(self, n: int):
+            """
+            Pinta el número 'n'. Si no está listo, crea ventanas en modo OCULTO
+            y solo las muestra al hacer show(...).
+            """
+            if n <= 0:
+                self.hide()
+                return
+
+            self._ensure_ready(make_visible=False)
             txt = str(n)
             for w in self.windows:
+                # <<< clave: propagar el subtítulo actual a cada ventana
+                w.set_subtitle(self.subtitle)
                 w.show(txt)
 
-        def hide(self):
+        def render_text(self, text: str):
+            if not text:
+                self.hide()
+                return
+            self._ensure_ready(make_visible=False)
             for w in self.windows:
-                w.hide()
+                # <<< clave: propagar el subtítulo también en los flashes 10/5
+                w.set_subtitle(self.subtitle)
+                w.show(text)
+
+        def hide(self):
+            """Oculta todas las ventanas si existen."""
+            if not self._ready:
+                return
+            try:
+                for w in self.windows:
+                    w.hide()
+            except Exception:
+                pass
 
         def destroy(self):
-            for w in self.windows:
-                w.destroy()
+            """Destruye todas las ventanas y limpia estado."""
+            try:
+                for w in self.windows:
+                    w.destroy()
+            except Exception:
+                pass
             self.windows.clear()
+            self._ready = False
+            self._last_monitors = None
+
 
     WIN32_OVERLAY_OK = True
     _OVERLAY_IMPL = "win32"
@@ -809,11 +960,13 @@ def tk_overlay_loop(stop_ev: threading.Event):
 
 def overlay_loop(stop_ev: threading.Event):
     """
-    Muestra el banner solo si hay cuenta atrás (play_countdown > 0).
-    No depende del GUI; lee state.json mantenido por guardian.
+    Muestra:
+      - Flash 10/5 min (5s) si está activo.
+      - Si no hay flash: countdown del último minuto (n=60..1) desde el timer local/state.
     """
-    SLEEP_ACTIVE = 0.06   # ~16–20 FPS cuando hay overlay
-    SLEEP_IDLE   = 0.20   # reposo sin overlay
+    SLEEP_ACTIVE = 0.06
+    SLEEP_IDLE   = 0.20
+    default_subtitle = "Último minuto • Guarda tu partida"
 
     def _pump():
         try:
@@ -829,9 +982,21 @@ def overlay_loop(stop_ev: threading.Event):
         visible = False
         try:
             while not stop_ev.is_set():
-                n = _safe_overlay_seconds()  # <-- clave
+                # 1) Flash 10/5 min
+                ftxt, fsub = _flash_current()
+                if ftxt:
+                    mgr.subtitle = fsub or default_subtitle
+                    mgr.render_text(ftxt)
+                    visible = True
+                    last_n = -1  # no mezclar con número previo
+                    _pump()
+                    time.sleep(SLEEP_ACTIVE)
+                    continue
 
+                # 2) Countdown último minuto
+                n = _safe_overlay_seconds()
                 if n > 0:
+                    mgr.subtitle = default_subtitle
                     if not visible:
                         visible = True
                     if n != last_n:
@@ -860,7 +1025,139 @@ def overlay_loop(stop_ev: threading.Event):
                 pass
     else:
         log.info("Overlay usando fallback Tkinter (banner no disponible).")
-        tk_overlay_loop(stop_ev)
+        # Fallback con soporte básico de flash
+        if tk is None:
+            return
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            root.overrideredirect(True)
+            root.attributes("-topmost", True)
+            try:
+                root.attributes("-alpha", 0.92)
+            except Exception:
+                pass
+            sw = root.winfo_screenwidth()
+            sh = root.winfo_screenheight()
+            root.geometry(f"{sw}x{sh}+0+0")
+            frame = tk.Frame(root, bg="#000000")
+            frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+            label = tk.Label(frame, text="60", font=("Segoe UI", 140, "bold"), fg="#FFFFFF", bg="#000000")
+            label.place(relx=0.5, rely=0.45, anchor="center")
+            sub = tk.Label(frame, text=default_subtitle, font=("Segoe UI", 24), fg="#DDDDDD", bg="#000000")
+            sub.place(relx=0.5, rely=0.62, anchor="center")
+            visible = False
+            last_txt = None
+
+            while not stop_ev.is_set():
+                ftxt, fsub = _flash_current()
+                if ftxt:
+                    if not visible:
+                        root.deiconify()
+                        visible = True
+                    if ftxt != last_txt:
+                        label.config(text=str(ftxt))
+                        sub.config(text=fsub or default_subtitle)
+                        last_txt = ftxt
+                    root.update_idletasks()
+                    root.update()
+                    time.sleep(SLEEP_ACTIVE)
+                    continue
+
+                n = _safe_overlay_seconds()
+                if n > 0:
+                    if not visible:
+                        root.deiconify()
+                        visible = True
+                    txt = str(n)
+                    if txt != last_txt:
+                        label.config(text=txt)
+                        sub.config(text=default_subtitle)
+                        last_txt = txt
+                    root.update_idletasks()
+                    root.update()
+                    time.sleep(SLEEP_ACTIVE)
+                else:
+                    if visible:
+                        root.withdraw()
+                        visible = False
+                        last_txt = None
+                    time.sleep(SLEEP_IDLE)
+        except Exception as e:
+            log.warning("tk overlay error: %s", e)
+
+        
+        
+# === Timer interno (independiente de state por segundo) =======================
+class LocalCountdown:
+    HEARTBEAT_MAX_AGE = 35.0
+    MAX_LAST_MINUTE   = 60
+
+    def __init__(self):
+        self.armed = False
+        self.deadline = 0.0
+        self.source = ""   # "deadline" | "countdown" | "event"
+        self.armed_ts = 0.0
+
+    def disarm(self):
+        self.armed = False
+        self.deadline = 0.0
+        self.source = ""
+        self.armed_ts = 0.0
+
+    def arm_until(self, abs_deadline: float, source: str = "event"):
+        import time as _t
+        rem = float(abs_deadline) - _t.time()
+        if rem <= 0 or rem > self.MAX_LAST_MINUTE:
+            self.disarm()
+            return
+        self.armed = True
+        self.deadline = float(abs_deadline)
+        self.source = source
+        self.armed_ts = _t.time()
+
+    def arm_for(self, seconds_from_now: float, source: str = "event"):
+        import time as _t
+        self.arm_until(_t.time() + float(seconds_from_now), source=source)
+
+    def seconds_left(self) -> int:
+        import time as _t
+        import math
+        if not self.armed:
+            return 0
+        rem = self.deadline - _t.time()
+        if rem <= 0:
+            self.disarm()
+            return 0
+        if rem > self.MAX_LAST_MINUTE:
+            self.disarm()
+            return 0
+        return int(max(1, min(self.MAX_LAST_MINUTE, math.ceil(rem))))
+
+
+_LC = LocalCountdown()
+
+def _sec_from_local_timer() -> int:
+    try:
+        n = _LC.seconds_left()
+        return n if 1 <= n <= 60 else 0
+    except Exception:
+        return 0
+
+
+# === “Flash” banner de 10/5 min (5s) =========================================
+_FLASH = {"text": None, "subtitle": None, "until": 0.0}
+
+def trigger_flash_banner(text: str, subtitle: str | None = None, seconds: float = 5.0):
+    _FLASH["text"] = str(text)
+    _FLASH["subtitle"] = subtitle
+    _FLASH["until"] = time.time() + float(seconds)
+
+def _flash_current():
+    if _FLASH["until"] > time.time() and _FLASH["text"]:
+        return _FLASH["text"], _FLASH["subtitle"]
+    return None, None
+
 
 
 # --------------------------------------------------------------------
@@ -893,9 +1190,46 @@ def main():
             save_state_local(st_local)
             log.info("Saltado histórico hasta id=%s", last)
 
+        # Saltar histórico (compat: bloques/notifies/countdown con punteros separados)
+    st_local = load_state_local()
+    last_block = int(st_local.get("last_block_id", st_local.get("last_id", 0)) or 0)
+    last_cd    = int(st_local.get("last_cd_id", 0) or 0)
+    last_nt    = int(st_local.get("last_nt_id", 0) or 0)
+
     while True:
         try:
-            rows = query_new_blocks(last)
+            # 1) COUNTDOWN: arma/para timer interno
+            rows_cd = query_new_countdown_events(last_cd)
+            for rid, ts, val, meta in rows_cd:
+                _handle_countdown_event((val or "").strip().lower(), meta or "")
+                last_cd = rid
+                st_local["last_cd_id"] = last_cd
+            if rows_cd:
+                save_state_local(st_local)
+
+            # 2) NOTIFY: toasts + flash 10/5 min (5s)
+            rows_nt = query_new_notifies(last_nt)
+            for rid, ts, title, body in rows_nt:
+                t = (title or "").strip()
+                b = (body or "").strip()
+                # Toast normal siempre
+                notify(t or "Aviso", b, duration=5)
+
+                # Flash banner si es aviso de tiempo de juego (10/5 minutos)
+                if t.lower() == "tiempo de juego":
+                    lb = b.lower()
+                    if "10 minutos" in lb:
+                        trigger_flash_banner("10", "Quedan 10 minutos", seconds=5.0)
+                    elif "5 minutos" in lb:
+                        trigger_flash_banner("5", "Quedan 5 minutos", seconds=5.0)
+
+                last_nt = rid
+                st_local["last_nt_id"] = last_nt
+            if rows_nt:
+                save_state_local(st_local)
+
+            # 3) BLOCKS: igual que antes
+            rows = query_new_blocks(last_block)
             for rid, ts, val, meta in rows:
                 app, reason = (val or "").strip(), (meta or "").strip().lower()
                 if reason.startswith(("dir:", "self:", "arg:", "openfile:", "wnd:")):
@@ -904,12 +1238,16 @@ def main():
                     notify_once(f"dir:{dir_path}", "Carpeta bloqueada", f"No tienes permiso para abrir: {shown}", 6.0)
                 else:
                     notify_once(f"app:{app.lower()}", "Aplicación bloqueada", f"{app}\nNecesitas permiso del tutor para usarla.", 3.0)
-                last = rid
-                st_local["last_id"] = last
+                last_block = rid
+                st_local["last_block_id"] = last_block
+            if rows:
                 save_state_local(st_local)
+
         except Exception as e:
             log.error("Error en loop principal: %s", e)
-        time.sleep(0.3)
+
+        time.sleep(0.15)
+
 
 if __name__ == "__main__":
     if any(a.lower() in ("--test", "--test-toast") for a in sys.argv[1:]):

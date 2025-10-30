@@ -3,6 +3,8 @@
 # auto-protección opcional; detección instantánea por WMI; logs centralizados; heartbeat;
 # SINGLE-INSTANCE para evitar múltiples procesos.
 from __future__ import annotations
+import json
+import math
 import app._bootstrap  # noqa: F401
 
 import datetime
@@ -144,10 +146,14 @@ def _emit_notify(title: str, body: str = ""):
 def _playtime_tick(cfg: dict, st: dict, now_sec: int, now_dt):
     """
     - Emite avisos de 10/5/1 min y mensaje de 'comienza cuenta atrás'.
+    - Envía PULSO 'countdown start/stop' para que Notifier arme/paré su reloj interno.
     - Actualiza state['play_countdown'] (0..60) y persiste si cambió.
+    - Persiste también cuando cambie countdown_started (ON/OFF).
     - Emite 'inicio de horario' y 'fin de horario' al cambiar el permiso por franjas.
     """
     global _last_allowed_flag
+
+    persisted = False  # ← IMPORTANTE
 
     # 1) Detectar cambio de permitido por horario (independiente de sesión manual)
     allowed_now = is_within_allowed_hours(cfg, now_dt)
@@ -160,16 +166,50 @@ def _playtime_tick(cfg: dict, st: dict, now_sec: int, now_dt):
             _emit_notify("Horario finalizado", "Se acabó la franja permitida.")
         _last_allowed_flag = allowed_now
 
+    # === PULSO A NOTIFIER: detectar transición de cuenta atrás ===
+    pa = st.setdefault("play_alerts", {})
+    prev_started = bool(pa.get("countdown_started"))
+
     # 2) Avisos y cuenta atrás (manual o franja)
     msgs, countdown = check_playtime_alerts(st, now_dt, cfg)
-    persisted = False
+
+    # Recalcular restantes reales para construir deadline fiable
+    rem_total, _mode = remaining_play_seconds(st, now_dt, cfg)
+    now_started = bool(pa.get("countdown_started"))
+
+    # Enviar avisos 10/5/1
     if msgs:
         for m in msgs:
             _emit_notify("Tiempo de juego", m)
+        # check_playtime_alerts ha podido tocar flags → persiste
         persisted = True
 
-    # 3) Persistir countdown si cambió
-    if st.get("play_countdown", 0) != countdown:
+    # Transición: OFF -> ON  (entra en último minuto)
+    if now_started and not prev_started:
+        secs = 0
+        try:
+            c = int(countdown or 0)
+            if 1 <= c <= 60:
+                secs = c
+        except Exception:
+            pass
+        if secs == 0 and 1 <= rem_total <= 60:
+            secs = int(math.ceil(rem_total))
+        if secs > 0:
+            deadline = int(now_sec) + secs
+            _log_event("countdown", "start", json.dumps({"deadline": deadline}))
+            log.info("Pulso countdown START → deadline=%s", deadline)
+        persisted = True  # ← se han cambiado flags (countdown_started=True)
+
+    # Transición: ON -> OFF (sale del último minuto o termina)
+    elif (not now_started) and prev_started:
+        _log_event("countdown", "stop", "")
+        log.info("Pulso countdown STOP")
+        persisted = True  # ← se han cambiado flags (countdown_started=False)
+
+    # 3) Persistir countdown solo si cambió (opcional; puedes eliminarlo si no quieres I/O por segundo)
+    if int(st.get("play_countdown", 0) or 0) != int(countdown or 0):
+        st["play_countdown"] = int(countdown or 0)
         persisted = True
 
     if persisted:
