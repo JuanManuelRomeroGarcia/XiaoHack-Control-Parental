@@ -11,10 +11,10 @@ import sys
 import time
 import json
 import threading
-import sqlite3
 import html
 from pathlib import Path
 
+from app.helperdb import fetch_events_since
 from app.storage import (
     set_data_dir_forced as _storage_set_data_dir_forced,
     load_config as _storage_load_config,  # noqa: F401
@@ -422,55 +422,26 @@ def notify_once(key: str, title: str, msg: str, min_interval: float = 5.0):
 # SQLite: leer eventos nuevos (desde guardian.db)
 # --------------------------------------------------------------------
 def query_new_blocks(since_id: int):
-    try:
-        con = sqlite3.connect(str(DB_PD))
-        cur = con.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS events(
-            id INTEGER PRIMARY KEY, ts INTEGER, type TEXT, value TEXT, meta TEXT
-        )""")
-        cur.execute("SELECT id, ts, value, meta FROM events WHERE type='block' AND id > ? ORDER BY id ASC", (since_id,))
-        rows = cur.fetchall()
-        con.close()
-        return rows
-    except Exception as e:
-        log.error("Error SQLite: %s", e)
-        return []
-    
+    return fetch_events_since("block", since_id)
+
 def query_new_countdown_events(since_id: int):
-    try:
-        con = sqlite3.connect(str(DB_PD))
-        cur = con.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS events(
-            id INTEGER PRIMARY KEY, ts INTEGER, type TEXT, value TEXT, meta TEXT
-        )""")
-        cur.execute("SELECT id, ts, value, meta FROM events WHERE type='countdown' AND id > ? ORDER BY id ASC", (since_id,))
-        rows = cur.fetchall()
-        con.close()
-        return rows
-    except Exception as e:
-        log.error("Error SQLite countdown: %s", e)
-        return []
+    return fetch_events_since("countdown", since_id)
 
 def query_new_notifies(since_id: int):
-    try:
-        con = sqlite3.connect(str(DB_PD))
-        cur = con.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS events(
-            id INTEGER PRIMARY KEY, ts INTEGER, type TEXT, value TEXT, meta TEXT
-        )""")
-        cur.execute("SELECT id, ts, value, meta FROM events WHERE type='notify' AND id > ? ORDER BY id ASC", (since_id,))
-        rows = cur.fetchall()
-        con.close()
-        return rows
-    except Exception as e:
-        log.error("Error SQLite notify: %s", e)
-        return []
+    return fetch_events_since("notify", since_id)
+
+_LAST_STOP_TS = 0.0
+_LAST_START_DEADLINE = None
 
 def _handle_countdown_event(value: str, meta: str):
     """
     value: "start" | "stop"
     meta : JSON {"deadline": epoch} o {"seconds": n}
+    Reglas:
+      - Anti-rearme: si acabamos de parar (t<3s), ignorar 'start'
+      - Idempotencia: si llega un 'start' con el mismo deadline y ya está armado, ignorar
     """
+    global _LAST_STOP_TS, _LAST_START_DEADLINE
     try:
         payload = {}
         if meta:
@@ -478,18 +449,49 @@ def _handle_countdown_event(value: str, meta: str):
                 payload = json.loads(meta)
             except Exception:
                 payload = {}
+
         if value == "start":
+            # Ventana anti-rearme tras STOP
+            if _LAST_STOP_TS and (time.time() - _LAST_STOP_TS) < 3.0:
+                log.info("Countdown START ignorado (ventana tras STOP)")
+                return
+
+            deadline = None
             if "deadline" in payload:
-                _LC.arm_until(float(payload["deadline"]), source="event")
-                log.info("Overlay armed by EVENT (deadline=%s)", payload["deadline"])
+                deadline = float(payload["deadline"])
             elif "seconds" in payload:
-                _LC.arm_for(float(payload["seconds"]), source="event")
-                log.info("Overlay armed by EVENT (seconds=%s)", payload["seconds"])
+                # Construimos un deadline sintético para poder comparar duplicados
+                deadline = time.time() + float(payload["seconds"])
+
+            if deadline is not None:
+                # Si ya armamos este mismo deadline y el overlay está activo, ignorar
+                if (_LAST_START_DEADLINE is not None
+                        and abs(_LAST_START_DEADLINE - deadline) < 0.5
+                        and _LC.remaining() > 0):
+                    log.info("Countdown START duplicado (deadline=%s) ignorado", deadline)
+                    return
+
+                _LC.arm_until(deadline, source="event")
+                _LAST_START_DEADLINE = deadline
+                log.info("Overlay armed by EVENT (deadline=%s)", deadline)
+            elif "seconds" in payload:
+                secs = float(payload["seconds"])
+                if _LC.remaining() > 0 and abs(_LC.remaining() - secs) < 0.5:
+                    log.info("Countdown START duplicado (seconds=%s) ignorado", secs)
+                    return
+                _LC.arm_for(secs, source="event")
+                _LAST_START_DEADLINE = None
+                log.info("Overlay armed by EVENT (seconds=%s)", secs)
+
         elif value == "stop":
             _LC.disarm()
+            _LAST_STOP_TS = time.time()
+            _LAST_START_DEADLINE = None
             log.info("Overlay disarmed by EVENT")
+
     except Exception as e:
         log.warning("countdown-event error: %s", e)
+
 
 # --------------------------------------------------------------------
 # Explorer Watch (como antes)
@@ -608,26 +610,30 @@ def _overlay_seconds_from_state(st: dict) -> int:
 
 def _safe_overlay_seconds() -> int:
     """
-    Fuente principal: temporizador local (armado por eventos).
-    Respaldo: si no está armado y el estado tiene countdown_started+deadline_ts,
-              armamos localmente y devolvemos su valor.
+    1) Primero, si está armado el temporizador local (pulsos start/stop), úsalo.
+    2) Si NO está armado, mira el state (play_countdown/scheduler) y arma SOLO lo que quede.
     """
-    n = _sec_from_local_timer()
+    # Al inicio de _safe_overlay_seconds():
+    if _LAST_STOP_TS and (time.time() - _LAST_STOP_TS) < 3.0:
+        return 0
+        # 1) Temporizador local (pista fiable porque viene de eventos start/stop)
+        n = _sec_from_local_timer()
+        
     if n > 0:
         return n
 
-    # Fallback: arma desde state una sola vez si hay deadline_ts
+    # 2) Fallback suave: lee state y arma por los segundos que falten (no usa deadline_ts)
     try:
         st = _storage_load_state() or {}
-        pa = st.get("play_alerts") or {}
-        if isinstance(pa, dict) and pa.get("countdown_started") is True:
-            dl = pa.get("deadline_ts")
-            if isinstance(dl, (int, float)):
-                _LC.arm_until(float(dl), source="deadline")
-                return _sec_from_local_timer()
+        n = _overlay_seconds_from_state(st)  # << usa play_countdown/scheduler
+        if 0 < n <= 60:
+            _LC.arm_for(n, source="state")   # arma solo lo que falte
+            return _sec_from_local_timer()
     except Exception:
         pass
+
     return 0
+
 
 
 WIN32_OVERLAY_OK = False
@@ -754,10 +760,16 @@ try:
 
         def show(self, text: str):
             self._text = text
+            # Reimpone TOPMOST por si otra ventana topmost (tu panel) nos pasó por encima
+            win32gui.SetWindowPos(
+                self.hwnd, win32con.HWND_TOPMOST, self.x, self.y, self.w, self.h,
+                win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW
+            )
             win32gui.InvalidateRect(self.hwnd, None, True)
             if not self.visible:
                 win32gui.ShowWindow(self.hwnd, win32con.SW_SHOWNA)
                 self.visible = True
+
 
         def hide(self):
             if self.visible:
@@ -928,35 +940,65 @@ def tk_overlay_loop(stop_ev: threading.Event):
             root.attributes("-alpha", 0.92)
         except Exception:
             pass
+
         sw = root.winfo_screenwidth()
         sh = root.winfo_screenheight()
         root.geometry(f"{sw}x{sh}+0+0")
+
         frame = tk.Frame(root, bg="#000000")
         frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+        default_subtitle = "Último minuto • Guarda tu partida"
         label = tk.Label(frame, text="60", font=("Segoe UI", 140, "bold"), fg="#FFFFFF", bg="#000000")
         label.place(relx=0.5, rely=0.45, anchor="center")
-        sub = tk.Label(frame, text="Último minuto • Guarda tu partida", font=("Segoe UI", 24), fg="#DDDDDD", bg="#000000")
+        sub = tk.Label(frame, text=default_subtitle, font=("Segoe UI", 24), fg="#DDDDDD", bg="#000000")
         sub.place(relx=0.5, rely=0.62, anchor="center")
+
         visible = False
-        last_n = -1
+        last_txt = None
+
+        SLEEP_ACTIVE = 0.06
+        SLEEP_IDLE   = 0.20
+
         while not stop_ev.is_set():
-            n = _safe_overlay_seconds()  # <-- clave
+            # 1) Flash 10/5 min (5s)
+            ftxt, fsub = _flash_current()
+            if ftxt:
+                if not visible:
+                    root.deiconify()
+                    visible = True
+                if ftxt != last_txt:
+                    label.config(text=str(ftxt))
+                    sub.config(text=fsub or default_subtitle)
+                    last_txt = ftxt
+                root.update_idletasks()
+                root.update()
+                time.sleep(SLEEP_ACTIVE)
+                continue  # <- evita usar 'n' sin asignar
+
+            # 2) Countdown último minuto
+            n = _safe_overlay_seconds()
             if n > 0:
                 if not visible:
                     root.deiconify()
                     visible = True
-                if n != last_n:
-                    label.config(text=str(n))
-                    last_n = n
+                txt = str(n)
+                if txt != last_txt:
+                    label.config(text=txt)
+                    sub.config(text=default_subtitle)
+                    last_txt = txt
                 root.update_idletasks()
                 root.update()
+                time.sleep(SLEEP_ACTIVE)
             else:
                 if visible:
                     root.withdraw()
                     visible = False
-                time.sleep(0.20)
+                    last_txt = None
+                time.sleep(SLEEP_IDLE)
     except Exception as e:
         log.warning("tk overlay error: %s", e)
+
 
 def overlay_loop(stop_ev: threading.Event):
     """
@@ -1219,8 +1261,10 @@ def main():
                 if t.lower() == "tiempo de juego":
                     lb = b.lower()
                     if "10 minutos" in lb:
+                        log.info("Flash 10m recibido → mostrar banner 10")
                         trigger_flash_banner("10", "Quedan 10 minutos", seconds=5.0)
                     elif "5 minutos" in lb:
+                        log.info("Flash 5m recibido → mostrar banner 5")
                         trigger_flash_banner("5", "Quedan 5 minutos", seconds=5.0)
 
                 last_nt = rid

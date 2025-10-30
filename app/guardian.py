@@ -10,7 +10,6 @@ import app._bootstrap  # noqa: F401
 import datetime
 import os
 import time
-import sqlite3
 import traceback
 import threading
 import queue
@@ -32,7 +31,7 @@ from app.audit import AuditLogger
 from app.logs import get_logger, install_exception_hooks
 from app.storage import (
     load_config, load_state, now_epoch,
-    DB_PATH, LOGS_DIR, save_state,
+    LOGS_DIR, save_state,
     set_data_dir_forced as _storage_set_data_dir_forced,  # ⬅️ añadido
 )
 from app.scheduler import check_playtime_alerts, remaining_play_seconds, is_within_allowed_hours
@@ -117,20 +116,15 @@ def _looks_like_path(s: str) -> str | None:
     return None
 
 # =============================================================================
-# DB mínima de eventos (para notifier)
+# DB mínima de eventos (para notifier) — ESCRIBE SOLO GUARDIAN
 # =============================================================================
 def _log_event(kind: str, value: str, meta: str = ""):
-    """Registro auxiliar para notifier (guardian.db)."""
+    """
+    Registrar evento para Notifier en guardian.db (escritor único vía helperdb).
+    """
     try:
-        con = sqlite3.connect(str(DB_PATH))
-        cur = con.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS events(
-            id INTEGER PRIMARY KEY, ts INTEGER, type TEXT, value TEXT, meta TEXT
-        )""")
-        cur.execute("INSERT INTO events(ts,type,value,meta) VALUES(?,?,?,?)",
-                    (int(time.time()), kind, value, meta))
-        con.commit()
-        con.close()
+        from app.helperdb import log_event as _db_log_event
+        _db_log_event(kind, value, meta)
     except Exception as e:
         log.warning("Error escribiendo evento notifier: %s", e)
 
@@ -140,8 +134,9 @@ def _log_event(kind: str, value: str, meta: str = ""):
 _last_allowed_flag = None
 _last_play_rem_sent = {"m10": False, "m5": False, "m1": False}  # reservado
 def _emit_notify(title: str, body: str = ""):
-    # Usamos la misma tabla de eventos para notifier: type="notify"
+    log.info("NOTIFY → %s | %s", title, body)
     _log_event("notify", title, body)
+
 
 def _playtime_tick(cfg: dict, st: dict, now_sec: int, now_dt):
     """
