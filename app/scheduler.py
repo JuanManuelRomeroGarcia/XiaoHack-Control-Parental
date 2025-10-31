@@ -27,16 +27,32 @@ M10 = 10 * 60
 M5  = 5 * 60
 M1  = 60
 
-def _parse_time(s: str) -> dtime:
-    try:
-        h, m = map(int, s.split(":"))
-        return dtime(hour=h, minute=m)
-    except Exception:
-        log.warning("Hora inválida en _parse_time(%r)", s)
-        raise
 
-def _norm_days(days: List[str]) -> List[str]:
-    return [_DAY_ALIASES.get((d or "").lower()[:3], (d or "").lower()[:3]) for d in days]
+def _parse_time(s: str) -> Optional[dtime]:
+    try:
+        s = (s or "").strip()
+        h, m = map(int, s.split(":"))
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError("out of range")
+        return dtime(hour=h, minute=m)
+    except Exception as e:
+        log.warning("Hora inválida en _parse_time(%r): %s (ignoro tramo)", s, e)
+        return None
+    
+def _norm_days(days) -> List[str]:
+    # Acepta lista o cadena; filtra solo días válidos ['mon'..'sun']
+    if isinstance(days, str):
+        days = [d.strip() for d in days.replace(",", " ").split()]
+    if not isinstance(days, list):
+        return []
+    out = []
+    for d in days:
+        key3 = (d or "").strip().lower()[:3]
+        norm = _DAY_ALIASES.get(key3)
+        if norm in ("mon","tue","wed","thu","fri","sat","sun"):
+            out.append(norm)
+    return out
+
 
 def is_within_allowed_hours(cfg: dict, now: datetime) -> bool:
     """
@@ -53,6 +69,8 @@ def is_within_allowed_hours(cfg: dict, now: datetime) -> bool:
             continue
         t_from = _parse_time(sch["from"])
         t_to   = _parse_time(sch["to"])
+        if not t_from or not t_to:
+            continue
         if t_from <= t_to:
             # Tramo normal: dentro si t_from <= now <= t_to
             if t_from <= tnow <= t_to:
@@ -75,12 +93,16 @@ def current_allowed_window(cfg: dict, now: datetime) -> Optional[Tuple[datetime,
     for sch in cfg.get("schedules", []):
         if not sch or "from" not in sch or "to" not in sch:
             continue
+        
         days = _norm_days(sch.get("days", []))
         if day_code not in days:
             continue
 
         t_from = _parse_time(sch["from"])
         t_to   = _parse_time(sch["to"])
+        
+        if not t_from or not t_to:
+            continue
 
         if t_from <= t_to:
             # Tramo normal
@@ -234,7 +256,7 @@ def check_playtime_alerts(state: dict, now: datetime, cfg: Optional[dict] = None
 
     # Cuenta atrás visible (0..60)
     if pa.get("countdown_started", False):
-        countdown = max(0, min(60, remaining))
+        countdown = int(max(0, min(60, remaining)))
         state["play_countdown"] = countdown
         log.debug("Cuenta atrás activa: %s s", countdown)
         return messages, countdown

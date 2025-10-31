@@ -63,6 +63,8 @@ except Exception:
 # Config básica y logger
 # =============================================================================
 BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = LOGS_DIR.parent
+CONFIG_PATH = DATA_DIR / "config.json"
 PROTECT_SELF = False  # pon True si quieres blindar la carpeta de instalación
 
 # ⬇️ Forzar data dir único (ProgramData) respetando XH_DATA_DIR si viene del .bat
@@ -132,7 +134,6 @@ def _log_event(kind: str, value: str, meta: str = ""):
 # Notificaciones de tiempo de juego (avisos 10/5/1 min + cuenta atrás)
 # =============================================================================
 _last_allowed_flag = None
-_last_play_rem_sent = {"m10": False, "m5": False, "m1": False}  # reservado
 def _emit_notify(title: str, body: str = ""):
     log.info("NOTIFY → %s | %s", title, body)
     _log_event("notify", title, body)
@@ -147,8 +148,7 @@ def _playtime_tick(cfg: dict, st: dict, now_sec: int, now_dt):
     - Emite 'inicio de horario' y 'fin de horario' al cambiar el permiso por franjas.
     """
     global _last_allowed_flag
-
-    persisted = False  # ← IMPORTANTE
+    persisted = False 
 
     # 1) Detectar cambio de permitido por horario (independiente de sesión manual)
     allowed_now = is_within_allowed_hours(cfg, now_dt)
@@ -167,8 +167,6 @@ def _playtime_tick(cfg: dict, st: dict, now_sec: int, now_dt):
 
     # 2) Avisos y cuenta atrás (manual o franja)
     msgs, countdown = check_playtime_alerts(st, now_dt, cfg)
-
-    # Recalcular restantes reales para construir deadline fiable
     rem_total, _mode = remaining_play_seconds(st, now_dt, cfg)
     now_started = bool(pa.get("countdown_started"))
 
@@ -176,11 +174,11 @@ def _playtime_tick(cfg: dict, st: dict, now_sec: int, now_dt):
     if msgs:
         for m in msgs:
             _emit_notify("Tiempo de juego", m)
-        # check_playtime_alerts ha podido tocar flags → persiste
         persisted = True
 
     # Transición: OFF -> ON  (entra en último minuto)
     if now_started and not prev_started:
+        pa["ended_sent"] = False
         secs = 0
         try:
             c = int(countdown or 0)
@@ -193,14 +191,15 @@ def _playtime_tick(cfg: dict, st: dict, now_sec: int, now_dt):
         if secs > 0:
             deadline = int(now_sec) + secs
             _log_event("countdown", "start", json.dumps({"deadline": deadline}))
-            log.info("Pulso countdown START → deadline=%s", deadline)
-        persisted = True  # ← se han cambiado flags (countdown_started=True)
+            log.debug("Último minuto → ON (secs=%s, deadline=%s)", secs, deadline)
+        persisted = True 
 
     # Transición: ON -> OFF (sale del último minuto o termina)
     elif (not now_started) and prev_started:
         _log_event("countdown", "stop", "")
-        log.info("Pulso countdown STOP")
-        persisted = True  # ← se han cambiado flags (countdown_started=False)
+        log.debug("Último minuto → OFF (stop enviado)")
+
+        persisted = True  
 
     # 3) Persistir countdown solo si cambió (opcional; puedes eliminarlo si no quieres I/O por segundo)
     if int(st.get("play_countdown", 0) or 0) != int(countdown or 0):
@@ -216,7 +215,17 @@ def _playtime_tick(cfg: dict, st: dict, now_sec: int, now_dt):
     # 4) Notificación de fin de tiempo (cuando remaining <= 0 y veníamos con modo activo)
     rem, mode = remaining_play_seconds(st, now_dt, cfg)
     if rem <= 0 and st.get("play_alert_mode") in ("manual", "schedule"):
-        _emit_notify("Tiempo terminado", "El tiempo de juego ha finalizado.")
+        if not pa.get("ended_sent"):
+            _emit_notify("Tiempo terminado", "El tiempo de juego ha finalizado.")
+            pa["ended_sent"] = True
+            try:
+                save_state(st)
+            except Exception:
+                pass
+            
+    if rem <= 0 and pa.get("countdown_started"):
+        _log_event("countdown", "stop", "")
+        pa["countdown_started"] = False
         try:
             save_state(st)
         except Exception:
@@ -303,8 +312,11 @@ def _match_blocked(proc: psutil.Process, cfg, st,
 
     # Whitelist por juego
     play_until = int(st.get("play_until", 0) or 0)
-    allowed_by_manual = play_until > now_epoch()
-    allowed_by_schedule = is_within_allowed_hours(cfg, datetime.datetime.now())
+    now_sec = now_epoch()
+    allowed_by_manual = play_until > now_sec
+    now_dt = datetime.datetime.fromtimestamp(now_sec)
+
+    allowed_by_schedule = is_within_allowed_hours(cfg, now_dt)
     if allowed_by_manual or allowed_by_schedule:
         wl = set(_norm_name(x) for x in (st.get("play_whitelist") or cfg.get("game_whitelist", [])))
         if base in wl:
@@ -499,6 +511,11 @@ def main():
     audit = AuditLogger()
 
     try:
+        _cfg_mtime = CONFIG_PATH.stat().st_mtime
+    except FileNotFoundError:
+        _cfg_mtime = 0.0
+
+    try:
         me = psutil.Process(os.getpid())
         ancestor_pids = {p.pid for p in me.parents()}
     except Exception:
@@ -542,7 +559,6 @@ def main():
                      args=(q, stop_ev),
                      name="WMIWatch", daemon=True).start()
 
-    last_reload = 0
     log.info("Servicio XiaoHack Parental iniciado correctamente.")
     recently_blocked: dict[int, float] = {}
 
@@ -553,13 +569,11 @@ def main():
     while True:
         now = time.time()
         now_i = int(now)
-
+        
         # --- TICK de tiempo de juego (cada 1 s) ---
         try:
             if now_i != _last_play_tick:
                 _last_play_tick = now_i
-                # recarga rápida de cfg/state reciente (snapshot)
-                cfg = load_config()
                 st  = load_state()
                 _playtime_tick(cfg, st, _last_play_tick, datetime.datetime.fromtimestamp(_last_play_tick))
         except Exception as e:
@@ -619,17 +633,24 @@ def main():
                 except Exception:
                     pass
 
-        # 4) Recarga config/estado
-        if now - last_reload > 10:
-            cfg = load_config()
-            st = load_state()
-            blocked_names = set(_norm_name(x) for x in cfg.get("blocked_apps", []) if x)
-            blocked_execs = set(_normpath(x) for x in cfg.get("blocked_executables", []) if x)
-            blocked_dirs  = [_dirtrail(x) for x in (_normpath(p) for p in cfg.get("blocked_paths", []) if p)]
-            last_reload = now
-            log.debug("reload cfg: names=%s", ",".join(sorted(blocked_names)))
-            log.debug("reload cfg: execs=%s", ",".join(sorted(blocked_execs)))
-            log.debug("reload cfg: dirs=%s", ",".join(blocked_dirs + self_dirs))
+        # 4) Recarga de configuración al detectar cambio de archivo
+        try:
+            mtime = CONFIG_PATH.stat().st_mtime
+        except FileNotFoundError:
+            mtime = 0.0
+
+        if mtime != _cfg_mtime:
+            try:
+                new_cfg = load_config()
+            except Exception as e:
+                log.warning("Config: error al recargar, mantengo la anterior: %s", e)
+            else:
+                cfg = new_cfg
+                blocked_names = set(_norm_name(x) for x in cfg.get("blocked_apps", []) if x)
+                blocked_execs = set(_normpath(x) for x in cfg.get("blocked_executables", []) if x)
+                blocked_dirs  = [_dirtrail(x) for x in (_normpath(p) for p in cfg.get("blocked_paths", []) if p)]
+                _cfg_mtime = mtime
+                log.info("Config recargada (cambio detectado en archivo).")
 
         # reaccionar a cambios de applied
         try:

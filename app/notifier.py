@@ -20,7 +20,6 @@ from app.storage import (
     load_config as _storage_load_config,  # noqa: F401
     load_state as _storage_load_state,
     data_dir as _storage_data_dir,
-    DB_PATH as _STORAGE_DB_PATH,
 )
 from utils.runtime import parse_role, set_process_title, set_appusermodelid
 from app.logs import get_logger, install_exception_hooks
@@ -71,12 +70,9 @@ try:
 except Exception as e:
     log.warning("No se pudo forzar data_dir: %s", e)
 
-DB_PD = _STORAGE_DB_PATH
 CONFIG_PATH_PD = DATA_DIR_FORCED / "config.json"
 
-# Estado local por-usuario (para recordar último id de evento mostrado)
-APPDATA = Path(os.getenv("APPDATA", str(BASE)))
-STATE_DIR = APPDATA / "XiaoHackParental"
+STATE_DIR = DATA_DIR_FORCED
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = STATE_DIR / "notifier_state.json"
 
@@ -430,52 +426,43 @@ def query_new_countdown_events(since_id: int):
 def query_new_notifies(since_id: int):
     return fetch_events_since("notify", since_id)
 
-_LAST_STOP_TS = 0.0
+# Al tope del archivo (zona globals):
+_COUNTDOWN_ACTIVE_UNTIL = 0.0
 
 def _handle_countdown_event(value: str, meta: str):
-    """
-    value: "start" | "stop"
-    meta : JSON {"deadline": epoch} o {"seconds": n}
-    """
     import json
     import time
+    global _COUNTDOWN_ACTIVE_UNTIL
     try:
+        payload = json.loads(meta) if meta else {}
+    except Exception:
         payload = {}
-        if meta:
+
+    if value == "start":
+        deadline = None
+        if "deadline" in payload:
             try:
-                payload = json.loads(meta)
+                deadline = float(payload["deadline"])
             except Exception:
-                payload = {}
+                deadline = None
+        elif "seconds" in payload:
+            try:
+                deadline = time.time() + float(payload["seconds"])
+            except Exception:
+                deadline = None
 
-        if value == "start":
-            deadline = None
-            secs = None
-            if "deadline" in payload:
-                try:
-                    deadline = float(payload["deadline"])
-                except Exception:
-                    deadline = None
-            elif "seconds" in payload:
-                try:
-                    secs = float(payload["seconds"])
-                    deadline = time.time() + secs
-                except Exception:
-                    secs = None
+        if deadline:
+            _LC.arm_until(deadline, source="event")
+            _COUNTDOWN_ACTIVE_UNTIL = deadline + 1.0  # bloquea fallback por state durante el minuto
+            rem = max(0, int(deadline - time.time()))
+            log.info("COUNTDOWN EVENT → START: deadline=%s (rem=%ss)", int(deadline), rem)
+        else:
+            log.warning("COUNTDOWN EVENT → START sin deadline/seconds: %r", payload)
 
-            if deadline:
-                rem = max(0, int(deadline - time.time()))
-                _LC.arm_until(float(deadline), source="event")
-                log.info("COUNTDOWN EVENT → START: deadline=%s (rem=%ss)", int(deadline), rem)
-            else:
-                log.warning("COUNTDOWN EVENT → START sin 'deadline/seconds'. meta=%r", payload)
-
-        elif value == "stop":
-            _LC.disarm()
-            globals()["_LAST_STOP_TS"] = time.time()
-            log.info("COUNTDOWN EVENT → STOP (timer local desarmado)")
-    except Exception as e:
-        log.warning("countdown-event error: %s", e)
-
+    elif value == "stop":
+        _LC.disarm()
+        _COUNTDOWN_ACTIVE_UNTIL = 0.0
+        log.info("COUNTDOWN EVENT → STOP (timer local desarmado)")
 
 
 # --------------------------------------------------------------------
@@ -595,35 +582,42 @@ def _overlay_seconds_from_state(st: dict) -> int:
 
 def _safe_overlay_seconds() -> int:
     """
-    1) Si hay STOP reciente (3s), no rearma.
-    2) Primero timer local (eventos start/stop).
-    3) Si no hay, arma por STATE (play_countdown/scheduler) SOLO lo que falte.
+    1) Si hay un countdown por EVENT activo, siempre usamos su temporizador local.
+    2) Solo si NO hay evento activo, usamos el fallback por state (y armamos una vez).
     """
+    global _COUNTDOWN_ACTIVE_UNTIL
     now = time.time()
-    if _LAST_STOP_TS and (now - _LAST_STOP_TS) < 3.0:
-        log.debug("[overlay] safe: bloqueado por ventana post-STOP (%.2fs)", now - _LAST_STOP_TS)
+
+    # 1) Evento activo → usa SIEMPRE el temporizador local
+    if _COUNTDOWN_ACTIVE_UNTIL > now:
+        try:
+            rem = float(_LC.remaining())
+        except Exception:
+            rem = 0.0
+        if rem > 0.0:
+            # Redondeo 'bonito': al menos 1 cuando hay fracciones > 0
+            return int(rem) if rem >= 1.0 else 1
+        # El temporizador local se agotó → soltamos el candado del evento
+        _COUNTDOWN_ACTIVE_UNTIL = 0.0
+        # opcional: log.info("COUNTDOWN EVENT → END (local timer exhausted)")
         return 0
 
-    n_local = _sec_from_local_timer()
-    if n_local > 0:
-        # Ya armado por EVENT
-        return n_local
-
+    # 2) Sin evento activo → podemos caer al STATE (solo si 0<n<=60)
     try:
         st = _storage_load_state() or {}
-        n_state = _overlay_seconds_from_state(st)  # lee play_countdown/scheduler
+        n_state = _overlay_seconds_from_state(st)
         if 0 < n_state <= 60:
             _LC.arm_for(n_state, source="state")
-            n2 = _sec_from_local_timer()
-            log.info("[overlay] armado por STATE: n=%s → rem=%.1fs", n_state, n2)
-            return n2
-        else:
-            if n_state != 0:
-                log.debug("[overlay] state no armó: n_state=%s", n_state)
+            rem = _LC.remaining()
+            n = int(rem) if rem >= 1.0 else (1 if rem > 0 else 0)
+            if n > 0:
+                log.info("[overlay] armado por STATE: n=%s → rem=%.1fs", n_state, rem)
+            return n
     except Exception as e:
         log.debug("[overlay] safe: error leyendo state: %s", e)
 
     return 0
+
 
 
 
@@ -632,7 +626,6 @@ _OVERLAY_IMPL = "none"
 
 try:
     import ctypes
-    from ctypes import wintypes  # noqa: F401
     import win32con
     import win32api
     import win32gui  # type: ignore
@@ -647,7 +640,6 @@ try:
     LWA_ALPHA         = 0x00000002
 
     user32 = ctypes.windll.user32
-    _HWND_MAP: dict[int, "_Win32OverlayWindow"] = {}  # noqa: F722
 
     class _Win32OverlayWindow:
         def __init__(self, x, y, w, h, subtitle: str, opacity: float):
@@ -658,7 +650,6 @@ try:
 
             ex = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT
             self.hwnd = win32gui.CreateWindowEx(ex, "Static", None, WS_POPUP, x, y, w, h, 0, 0, 0, None)
-            _HWND_MAP[int(self.hwnd)] = self
 
             # Subclase con ctypes para click-through y pintura
             import ctypes as ct
@@ -776,7 +767,6 @@ try:
                 win32gui.DestroyWindow(self.hwnd)
             except Exception: 
                 pass
-            _HWND_MAP.pop(int(self.hwnd), None)
 
     class Win32OverlayManager:
         """
@@ -1063,76 +1053,11 @@ def overlay_loop(stop_ev: threading.Event):
                 pass
     else:
         log.info("Overlay usando fallback Tkinter (banner no disponible).")
-        if tk is None:
-            return
-        try:
-            root = tk.Tk()
-            root.withdraw()
-            root.overrideredirect(True)
-            root.attributes("-topmost", True)
-            try:
-                root.attributes("-alpha", 0.92)
-            except Exception:
-                pass
-            sw = root.winfo_screenwidth()
-            sh = root.winfo_screenheight()
-            root.geometry(f"{sw}x{sh}+0+0")
-            frame = tk.Frame(root, bg="#000000")
-            frame.place(relx=0, rely=0, relwidth=1, relheight=1)
-            label = tk.Label(frame, text="60", font=("Segoe UI", 140, "bold"), fg="#FFFFFF", bg="#000000")
-            label.place(relx=0.5, rely=0.45, anchor="center")
-            sub = tk.Label(frame, text=default_subtitle, font=("Segoe UI", 24), fg="#DDDDDD", bg="#000000")
-            sub.place(relx=0.5, rely=0.62, anchor="center")
-            visible = False
-            last_txt = None
+        return tk_overlay_loop(stop_ev)
 
-            while not stop_ev.is_set():
-                ftxt, fsub = _flash_current()
-                if ftxt:
-                    if not visible:
-                        root.deiconify()
-                        visible = True
-                        log.debug("OVERLAY(Tk)→ show (flash)")
-                    if ftxt != last_txt:
-                        label.config(text=str(ftxt))
-                        sub.config(text=fsub or default_subtitle)
-                        last_txt = ftxt
-                        log.debug("OVERLAY(Tk)→ render flash=%r", ftxt)
-                    root.update_idletasks()
-                    root.update()
-                    time.sleep(SLEEP_ACTIVE)
-                    continue
-
-                n = _safe_overlay_seconds()
-                if n > 0:
-                    if not visible:
-                        root.deiconify()
-                        visible = True
-                        log.debug("OVERLAY(Tk)→ show (countdown)")
-                    txt = str(n)
-                    if txt != last_txt:
-                        label.config(text=txt)
-                        sub.config(text=default_subtitle)
-                        last_txt = txt
-                        log.debug("OVERLAY(Tk)→ render n=%s", n)
-                    root.update_idletasks()
-                    root.update()
-                    time.sleep(SLEEP_ACTIVE)
-                else:
-                    if visible:
-                        root.withdraw()
-                        visible = False
-                        last_txt = None
-                        log.debug("OVERLAY(Tk)→ hide (n=0 y sin flash)")
-                    time.sleep(SLEEP_IDLE)
-        except Exception as e:
-            log.warning("tk overlay error: %s", e)
-
-        
         
 # === Timer interno (independiente de state por segundo) =======================
 class LocalCountdown:
-    HEARTBEAT_MAX_AGE = 35.0
     MAX_LAST_MINUTE   = 60
 
     def __init__(self):
@@ -1161,31 +1086,19 @@ class LocalCountdown:
     def arm_for(self, seconds_from_now: float, source: str = "event"):
         import time as _t
         self.arm_until(_t.time() + float(seconds_from_now), source=source)
-
-    def seconds_left(self) -> int:
-        import time as _t
-        import math
+        
+    def remaining(self) -> float:
+        """Segundos (float) restantes; 0.0 si no armado o fuera de rango (sanidad 1..60s)."""
+        import time
         if not self.armed:
-            return 0
-        rem = self.deadline - _t.time()
-        if rem <= 0:
+            return 0.0
+        rem = float(self.deadline - time.time())
+        if rem <= 0.0 or rem > self.MAX_LAST_MINUTE:
             self.disarm()
-            return 0
-        if rem > self.MAX_LAST_MINUTE:
-            self.disarm()
-            return 0
-        return int(max(1, min(self.MAX_LAST_MINUTE, math.ceil(rem))))
-
+            return 0.0
+        return rem
 
 _LC = LocalCountdown()
-
-def _sec_from_local_timer() -> int:
-    try:
-        n = _LC.seconds_left()
-        return n if 1 <= n <= 60 else 0
-    except Exception:
-        return 0
-
 
 # === “Flash” banner de 10/5 min (5s) =========================================
 _FLASH = {"text": None, "subtitle": None, "until": 0.0}
@@ -1208,12 +1121,13 @@ def trigger_flash_banner(text: str, subtitle: str | None = None, ttl: float | No
         expiry = time.time() + float(ttl)
 
         with _FLASH_LOCK:
+            if (_FLASH.get("text") == t and _FLASH.get("subtitle") == s and time.time() < float(_FLASH.get("until") or 0)):
+                return
             _FLASH["text"] = t
             _FLASH["subtitle"] = s
             _FLASH["until"] = expiry
 
-        log.info("FLASH→ armed: text=%r, sub=%r, ttl=%.1fs (until=%.0f)",
-                 t, s, ttl, expiry)
+        log.info("FLASH→ armed: text=%r, sub=%r, ttl=%.1fs (until=%.0f)",t, s, ttl, expiry)
     except Exception as e:
         log.warning("FLASH→ error al armar: %s", e)
 
@@ -1294,10 +1208,6 @@ def main():
             last_nt, last_cd, len(rows_nt or []), len(rows_cd or []))
             
             for rid, ts, title, body in rows_nt or []:
-                
-                st_local["last_nt_id"] = rid
-                save_state_local(st_local)
-                
                 t = (title or "").strip()
                 b = (body or "").strip()
                 log.info("DB→ NOTIFY id=%s | title=%r | body=%r", rid, t, b)
@@ -1307,7 +1217,7 @@ def main():
                     lb = b.lower()
                     m10 = ("10 minutos" in lb)
                     m5  = ("5 minutos"  in lb)
-                    log.info("FLASH check: title='Tiempo de juego' 10m=%s 5m=%s", m10, m5)
+                    log.debug("FLASH check: title='Tiempo de juego' 10m=%s 5m=%s", m10, m5)
                     if m10:
                         log.info("Flash 10m recibido → mostrar banner 10")
                         trigger_flash_banner("10", "Quedan 10 minutos", seconds=5.0)

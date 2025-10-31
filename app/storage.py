@@ -5,6 +5,7 @@
 from __future__ import annotations
 import json
 import os
+import copy
 import tempfile
 import time
 import threading
@@ -179,7 +180,7 @@ def _read_json(path: Path, default: Dict | list | None = None):
 
     # Último recurso
     log.warning("Devolviendo default para %s (no se pudo leer de forma segura).", path)
-    return default
+    return copy.deepcopy(default)
 
 
 # ==============================================================================
@@ -235,15 +236,29 @@ _ensure_present()
 # ==============================================================================
 def load_config() -> dict:
     cfg = _read_json(CONFIG_PATH, _DEFAULT_CFG)
-    # Normalización básica
+
+    # Normalización de listas
     for k in ("blocked_apps","blocked_executables","blocked_paths","game_whitelist","blocked_domains"):
-        cfg[k] = [x for x in cfg.get(k, []) if x]
-    # Asegurar flags presentes
-    cfg.setdefault("safesearch", False)
-    cfg.setdefault("apply_on_start", False)
-    # Normalización de dominios (limpia http(s):// y slashes) por si llegan del UI
+        xs = cfg.get(k, [])
+        if not isinstance(xs, list):
+            xs = []
+        cfg[k] = [x for x in xs if isinstance(x, str) and x.strip()]
+
+    # Booleanos
+    cfg["safesearch"] = bool(cfg.get("safesearch", False))
+    cfg["apply_on_start"] = bool(cfg.get("apply_on_start", False))
+    cfg["log_process_activity"] = bool(cfg.get("log_process_activity", False))
+
+    # Schedules: lista segura
+    sch = cfg.get("schedules", [])
+    if not isinstance(sch, list):
+        sch = []
+    cfg["schedules"] = sch
+
+    # Normalización de dominios (limpia http(s):// y slashes)
     cfg["blocked_domains"] = _norm_domain_list(cfg.get("blocked_domains", []))
     return cfg
+
 
 def save_config(cfg: dict):
     log.debug("Guardando configuración (%s entradas)", len(cfg))
@@ -255,6 +270,16 @@ def load_state() -> dict:
     st.setdefault("applied", False)
     st.setdefault("play_until", st.get("play_until", 0))
     st.setdefault("play_whitelist", st.get("play_whitelist", []))
+    pa = st.get("play_alerts")
+    if not isinstance(pa, dict):
+        pa = {}
+    pa.setdefault("enabled", True)
+    pa.setdefault("m10", False)
+    pa.setdefault("m5", False)
+    pa.setdefault("m1", False)
+    pa.setdefault("countdown_started", False)
+    st["play_alerts"] = pa
+    
     return st
 
 def save_state(st: dict):
@@ -341,6 +366,17 @@ def get_db_path() -> Path:
 def get_logs_dir_path() -> Path:
     return LOGS_DIR
 
+def get_config_mtime() -> float:
+    try:
+        return CONFIG_PATH.stat().st_mtime
+    except FileNotFoundError:
+        return 0.0
+
+def get_state_mtime() -> float:
+    try:
+        return STATE_PATH.stat().st_mtime
+    except FileNotFoundError:
+        return 0.0
 
 # ==============================================================================
 # Log resumen de entorno
