@@ -11,7 +11,9 @@ from datetime import datetime
 import ctypes  # AppUserModelID
 from . import prof
 # Almacenamiento / logs
-from app.storage import load_state, save_state, now_epoch, load_config, save_config
+# arriba, junto con el resto de imports de storage
+from app.storage import load_state, save_state, now_epoch, load_config, save_config, get_config_mtime
+
 from app.logs import (
     configure, install_exception_hooks, get_logger, get_log_file,
 )
@@ -85,7 +87,10 @@ def _read_version() -> str:
     # 3) Fallback
     return "0.0.0"
 
+#---------------- Constantes  ------------------------------
+
 APP_VERSION = _read_version()
+GUI_EMITS_TOASTS = False  # True si quisieras que la GUI también lance toasts
 
 
 
@@ -132,6 +137,8 @@ class TutorApp(tk.Tk):
 
         # Cargar config/tema
         self.cfg = load_config()
+        self._cfg_mtime = get_config_mtime()
+        
         self.ui_dark = tk.BooleanVar(value=self.cfg.get("ui_theme", "light") == "dark")
         try:
             apply_theme(self, "dark" if self.ui_dark.get() else "light")
@@ -354,6 +361,17 @@ class TutorApp(tk.Tk):
         self._subtitle = ttk.Label(header, text="", font=("", 10))
         title.pack(side="left", anchor="w")
         self._subtitle.pack(side="left", anchor="s", padx=(8, 0))
+        
+    def _maybe_reload_cfg(self):
+        try:
+            m = get_config_mtime()
+            if m != getattr(self, "_cfg_mtime", None):
+                self._cfg_mtime = m
+                self.cfg = load_config()
+                log.info("GUI: config recargada por cambio en disco.")
+        except Exception as e:
+            log.debug("GUI: fallo comprobando mtime config: %s", e)
+
 
     # ---------- Login ----------
     def _login(self) -> bool:
@@ -413,8 +431,12 @@ class TutorApp(tk.Tk):
     def _save_cfg(self, cfg: dict):
         try:
             save_config(cfg)
+            try:
+                self._cfg_mtime = get_config_mtime()
+            except Exception:
+                pass
         except Exception as e:
-            messagebox.showerror("Error", f"No se pudo guardar la configuración:\n{e}")
+                messagebox.showerror("Error", f"No se pudo guardar la configuración:\n{e}")
 
     def _save_apps_rules(self):
         if getattr(self, "page_apps", None) is None:
@@ -595,12 +617,27 @@ class TutorApp(tk.Tk):
         return True
 
     def _refresh_if_needed_on_enter(self, new_widget):
+        """
+        Se llama al entrar en una pestaña.
+        - Si entramos en Whitelist, recargamos desde disco y sincronizamos cfg+mtime.
+        """
         try:
-            if new_widget is getattr(self, "page_wl", None) and hasattr(self.page_wl, "reload_from_storage"):
-                self.page_wl.reload_from_storage()
+            if new_widget is getattr(self, "page_wl", None):
+                # 1) si la página expone reload_from_storage, úsalo
+                if hasattr(new_widget, "reload_from_storage"):
+                    new_widget.reload_from_storage()
+
+                # 2) recarga de config desde disco (una sola vez)
                 self.cfg = load_config()
-        except Exception:
-            pass
+
+                # 3) sincroniza mtime para evitar "recarga inmediata" en el siguiente tick
+                try:
+                    self._cfg_mtime = get_config_mtime()
+                except Exception:
+                    pass
+        except Exception as e:
+            log.debug("refresh_on_enter error: %s", e)
+
 
     def _on_nb_tab_changed(self, event):
         if self._switch_guard:
@@ -749,9 +786,10 @@ class TutorApp(tk.Tk):
 
     # ---------- Tick control de tiempo ----------
     def _tick_playtime(self):
-        log.debug("tick-start")
+        # log.debug("tick-start")
         try:
-            cfg = load_config()
+            self._maybe_reload_cfg()
+            cfg = self.cfg
             st = load_state()
             now = datetime.now()
             now_ts = now_epoch()
@@ -800,7 +838,7 @@ class TutorApp(tk.Tk):
                         key = "play:m1"
 
                     sent = False
-                    if notifier_mod:
+                    if GUI_EMITS_TOASTS and notifier_mod:
                         if hasattr(notifier_mod, "notify_once"):
                             try:
                                 notifier_mod.notify_once(key, title, m, min_interval=2.0)
@@ -813,9 +851,8 @@ class TutorApp(tk.Tk):
                                 sent = True
                             except Exception:
                                 sent = False
-                    if not sent:
-                        with contextlib.suppress(Exception):
-                            print("[ALERTA]", m)
+
+                    # Siempre mostrar el hint local del panel (no duplica los toasts del sistema)
                     self._show_hint_window(key, m, ttl_sec=10)
 
             play_until = int(st.get("play_until") or 0)
@@ -829,15 +866,15 @@ class TutorApp(tk.Tk):
                 self._hide_countdown_window()
                 if not ended_flag:
                     msg_end = "⛔ Se acabó el tiempo de juego."
-                    if notifier_mod and hasattr(notifier_mod, "notify_once"):
+                    if GUI_EMITS_TOASTS and notifier_mod and hasattr(notifier_mod, "notify_once"):
                         with contextlib.suppress(Exception):
                             notifier_mod.notify_once("play:end", "Tiempo de juego", msg_end, min_interval=2.0)
-                    else:
-                        with contextlib.suppress(Exception):
-                            print("[ALERTA]", msg_end)
+                    # (opcional) podrías mostrar también un hint local aquí si quieres:
+                    self._show_hint_window("play:end", msg_end, ttl_sec=10)
                     log.info("session-end")
                     st["play_end_notified"] = True
                     state_changed = True
+
             elif play_until > now_ts:
                 if ended_flag:
                     st["play_end_notified"] = False
@@ -882,63 +919,93 @@ class TutorApp(tk.Tk):
                 self.after(1000, self._tick_playtime)
 
     def _show_hint_window(self, key: str, text: str, ttl_sec: int = 10):
+        """
+        Muestra/actualiza un hint no intrusivo en la esquina inferior derecha.
+        Guarda la referencia del Label para no tener que buscarlo por nombre.
+        """
         import time
         now_ts = time.time()
 
-        if key in self._hint_windows:
-            win, _ = self._hint_windows[key]
+        found = self._hint_windows.get(key)
+        if found:
+            # Reutiliza ventana y Label existentes
+            win, _, msg_label = found
             try:
-                if win and win.winfo_exists():
-                    for child in win.winfo_children():
-                        if isinstance(child, ttk.Label) and child.cget("name") == "msg":
-                            child.configure(text=text)
-                    self._hint_windows[key] = (win, now_ts)
-                    return
+                msg_label.configure(text=text)
+                win.deiconify()
+                win.lift()
             except Exception:
                 pass
+            # resetear el timestamp para que el TTL cuente desde esta actualización
+            self._hint_windows[key] = (win, now_ts, msg_label)
+            return
 
-        w = tk.Toplevel(self)
-        w.withdraw()
-        w.overrideredirect(1)
+        # Crear nueva ventana
+        w = tk.Toplevel(self.root)
+        w.overrideredirect(True)
         w.attributes("-topmost", True)
-        w.attributes("-toolwindow", True)
+        try:
+            w.attributes("-alpha", 0.96)
+        except Exception:
+            pass
 
-        width, height, margin = 360, 90, 16
-        x = max(0, self.winfo_screenwidth() - width - margin)
-        y = max(0, self.winfo_screenheight() - height - margin*2)
+        # Posiciona abajo a la derecha (ajusta si ya tienes helper de geometría)
+        sw = w.winfo_screenwidth()
+        sh = w.winfo_screenheight()
+        width, height = 360, 96
+        x = sw - width - 24
+        y = sh - height - 60
         w.geometry(f"{width}x{height}+{x}+{y}")
 
         frm = ttk.Frame(w, padding=12)
         frm.pack(fill="both", expand=True)
-        title = ttk.Label(frm, text="Tiempo de juego", font=("", 11, "bold"))
-        msg = ttk.Label(frm, name="msg", text=text, font=("", 10))
-        title.pack(anchor="w")
-        msg.pack(anchor="w", pady=(6, 0))
 
-        w.deiconify()
-        self._hint_windows[key] = (w, now_ts)
+        title = ttk.Label(frm, text="Aviso", font=("", 11, "bold"))
+        title.pack(anchor="w", pady=(0, 4))
 
-        def _autoclose():
+        # ← guardamos la referencia directa al Label del mensaje
+        msg_label = ttk.Label(frm, text=text, font=("", 10), wraplength=width - 24, justify="left")
+        msg_label.pack(anchor="w", fill="x")
+
+        self._hint_windows[key] = (w, now_ts, msg_label)
+
+        # Arranca/continúa el autocierre periódico
+        try:
+            self.root.after(500, self._autoclose)
+        except Exception:
+            pass
+
+    def _autoclose(self):
+        """
+        Cierra hints caducados; mantiene el bucle si quedan abiertos.
+        """
+        import time
+        ttl = 10  
+        now_ts = time.time()
+
+        for key, triple in list(self._hint_windows.items()):
             try:
-                if key not in self._hint_windows:
-                    return
-                win, created = self._hint_windows[key]
-                if not win or not win.winfo_exists():
-                    self._hint_windows.pop(key, None)
-                    return
-                import time as _t
-                alive = (_t.time() - created) < ttl_sec
-                if alive:
-                    self.after(500, _autoclose)
-                else:
-                    try:
-                        win.destroy()
-                    except Exception:
-                        pass
-                    self._hint_windows.pop(key, None)
+                win, created_ts, _ = triple 
             except Exception:
+                try:
+                    win, created_ts = triple  
+                except Exception:
+                    self._hint_windows.pop(key, None)
+                    continue
+
+            if (now_ts - created_ts) >= ttl:
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
                 self._hint_windows.pop(key, None)
-        self.after(500, _autoclose)
+
+        if self._hint_windows:
+            try:
+                self.root.after(500, self._autoclose)
+            except Exception:
+                pass
+
 
     def _hide_all_hints(self):
         try:

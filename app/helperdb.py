@@ -4,7 +4,7 @@ import contextlib
 import sqlite3
 import threading
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, time
 
 # Usamos la misma ruta que storage
 from .storage import DB_PATH
@@ -102,7 +102,8 @@ def _ensure_schema(con: sqlite3.Connection):
                 raise
 
     # Índice (idemp.)
-    con.execute("CREATE INDEX IF NOT EXISTS idx_events_type_id ON events(type,id)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_events_type_id ON events(type, id)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_events_type_ts ON events(type, ts DESC)")
 
     # Vista humana: ahora ts ya está en local y es TEXT, no hace falta convertir
     con.execute("DROP VIEW IF EXISTS events_human")
@@ -154,5 +155,35 @@ def fetch_events_since(kind: str, last_id: int, limit: int = 500) -> list[tuple[
             with contextlib.suppress(Exception):
                 con.close()
 
+# helperdb.py
 
+# Límite de deduplicación (segundos). Ajusta si quieres 1–3 s.
+_DEDUP_WINDOW = 2
 
+def add_event_dedup(conn: sqlite3.Connection, ev_type: str, title: str, body: str, meta: str = "", key: str = "") -> int:
+    """
+    Inserta un evento pero evita duplicados muy recientes por 'key' (y título/cuerpo).
+    Devuelve el id del evento insertado (o el existente si dedupea).
+    """
+    now_ts = int(time.time())  # ya estás guardando en hora local en otras funciones, si prefieres usa tu helper localtime
+
+    cur = conn.cursor()
+    try:
+        if key:
+            # ¿Hay un evento igual en la ventana de dedupe?
+            cur.execute(
+                "SELECT id FROM events WHERE key=? AND title=? AND body=? AND (ts >= ?) ORDER BY id DESC LIMIT 1",
+                (key, title, body, now_ts - _DEDUP_WINDOW),
+            )
+            row = cur.fetchone()
+            if row:
+                return row[0]
+
+        cur.execute(
+            "INSERT INTO events (ts, type, title, body, meta, key) VALUES (?, ?, ?, ?, ?, ?)",
+            (now_ts, ev_type, title, body, meta or "", key or "")
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        cur.close()
