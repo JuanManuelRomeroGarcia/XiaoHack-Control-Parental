@@ -45,11 +45,10 @@ set_appusermodelid(APP_ID)
 set_process_title(XH_ROLE)
 
 try:
-    import logging
-    logging.getLogger().debug("XiaoHack process started (role=%s)", XH_ROLE)
+    import setproctitle
+    setproctitle.setproctitle("XiaoHack Control Parental — Notifier")
 except Exception:
     pass
-
 # --------------------------------------------------------------------
 # Rutas de instalación/datos (respetando variables de entorno de los .bat)
 # --------------------------------------------------------------------
@@ -1159,6 +1158,12 @@ def _flash_current() -> tuple[str | None, str | None]:
 # Main
 # --------------------------------------------------------------------
 def main():
+    try:
+        import logging
+        logging.getLogger().debug("XiaoHack process started (role=%s)", XH_ROLE)
+    except Exception:
+        pass
+
     log.info("Notifier iniciado. Overlay=%s", _OVERLAY_IMPL)
 
     # Asegurar AUMID listo ANTES de lanzar hilos o notificaciones

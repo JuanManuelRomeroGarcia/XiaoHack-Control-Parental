@@ -3,6 +3,7 @@
 # auto-protección opcional; detección instantánea por WMI; logs centralizados; heartbeat;
 # SINGLE-INSTANCE para evitar múltiples procesos.
 from __future__ import annotations
+import contextlib
 import json
 import math
 import app._bootstrap  # noqa: F401
@@ -58,6 +59,7 @@ try:
     logging.getLogger().info("XiaoHack process started (role=%s)", XH_ROLE)
 except Exception:
     pass
+
 
 # =============================================================================
 # Config básica y logger
@@ -293,35 +295,43 @@ EDITOR_LIKE = {
 
 def _match_blocked(proc: psutil.Process, cfg, st,
                    blocked_names, blocked_execs, blocked_dirs, self_dirs,
-                   ancestor_pids: set[int]) -> str | None:
+                   ancestor_pids: set[int],
+                   info: dict | None = None) -> str | None:
     try:
-        exe_path = _normpath(proc.exe() or "")
-        cwd_path = _normpath(proc.cwd() or "")
-        base     = _norm_name(os.path.basename(exe_path))
+        if info is not None:
+            exe_path = _normpath(info.get("exe") or "")
+            cwd_path = _normpath(info.get("cwd") or "")
+            base     = _norm_name(os.path.basename(exe_path)) or _norm_name(info.get("name") or "")
+        else:
+            exe_path = _normpath(proc.exe() or "")
+            cwd_path = _normpath(proc.cwd() or "")
+            base     = _norm_name(os.path.basename(exe_path))
     except (psutil.AccessDenied, psutil.NoSuchProcess):
         return None
+
     try:
         if proc.pid == os.getpid() or proc.pid in ancestor_pids:
             return None
     except Exception:
         pass
+
     try:
-        pname_low = (proc.info.get("name") or proc.name() or "").lower()
+        pname_low = (info.get("name") if (info and "name" in info) else proc.name() or "").lower()
     except Exception:
         pname_low = ""
 
-    # Whitelist por juego
+    # --- whitelist por juego (tal como ya lo tenías) ---
     play_until = int(st.get("play_until", 0) or 0)
     now_sec = now_epoch()
     allowed_by_manual = play_until > now_sec
     now_dt = datetime.datetime.fromtimestamp(now_sec)
-
     allowed_by_schedule = is_within_allowed_hours(cfg, now_dt)
     if allowed_by_manual or allowed_by_schedule:
         wl = set(_norm_name(x) for x in (st.get("play_whitelist") or cfg.get("game_whitelist", [])))
         if base in wl:
             return None
 
+    # --- name / exe exact / dir ---
     if base in blocked_names:
         return "name"
     if exe_path in blocked_execs:
@@ -333,11 +343,12 @@ def _match_blocked(proc: psutil.Process, cfg, st,
         if exe_path.startswith(d) or cwd_path.startswith(d):
             return f"self:{d}"
 
+    # --- argumentos (usa info si está) ---
     try:
-        args = proc.cmdline()
+        args = info.get("cmdline") if (info and "cmdline" in info) else proc.cmdline()
     except Exception:
         args = []
-    for a in args[1:]:
+    for a in (args[1:] or []):
         p_like = _looks_like_path(a)
         if not p_like:
             continue
@@ -348,6 +359,7 @@ def _match_blocked(proc: psutil.Process, cfg, st,
                     return None
                 return f"arg:{d}"
 
+    # --- ficheros abiertos: solo si es editor/office, y solo si no tenemos info rápida ---
     if base in EDITOR_LIKE:
         try:
             for f in proc.open_files():
@@ -365,6 +377,7 @@ def _match_blocked(proc: psutil.Process, cfg, st,
             if pname_low not in CORE_HOSTS:
                 return "wnd:notepad"
     return None
+
 
 # =============================================================================
 # WMI watcher: detección instantánea
@@ -410,7 +423,8 @@ def _explorer_watch_loop(get_blocked_dirs_callable, stop_ev: threading.Event):
     shell = None
     last_dirs: tuple[str, ...] = ()
     last_check = 0.0
-    backoff = 0.3
+    backoff = 1.0
+    last_close_by_hwnd: dict[int, float] = {}
 
     while not stop_ev.is_set():
         try:
@@ -446,6 +460,10 @@ def _explorer_watch_loop(get_blocked_dirs_callable, stop_ev: threading.Event):
                     for d in blocked_dirs:
                         if p.startswith(d):
                             hwnd = int(w.HWND)
+                            if now - last_close_by_hwnd.get(hwnd, 0) < 2.0:
+                                break
+                            last_close_by_hwnd[hwnd] = now
+
                             log.info("Cerrar Explorer hwnd=%s path=%s", hwnd, p)
                             try:
                                 win32gui.PostMessage(hwnd, WM_CLOSE, 0, 0)
@@ -461,12 +479,10 @@ def _explorer_watch_loop(get_blocked_dirs_callable, stop_ev: threading.Event):
         except Exception as e:
             log.error("ExplorerWatch loop error: %s", e)
             shell = None
+            
         time.sleep(backoff)
-    try:
+    with contextlib.suppress(Exception):
         pythoncom.CoUninitialize()
-    except Exception:
-        pass
-
 # =============================================================================
 # SINGLE-INSTANCE
 # =============================================================================
@@ -496,6 +512,12 @@ def _acquire_singleton() -> bool:
 # Main
 # =============================================================================
 def main():
+    try:
+        import setproctitle
+        setproctitle.setproctitle("XiaoHack Control Parental — Guardian")
+    except Exception:
+        pass
+    
     if not _acquire_singleton():
         log.warning("Otro guardian ya está ejecutándose — salgo")
         return
@@ -562,6 +584,8 @@ def main():
     log.info("Servicio XiaoHack Parental iniciado correctamente.")
     recently_blocked: dict[int, float] = {}
 
+    _last_scan_sec = -1     # último segundo en que se hizo escaneo completo
+    _last_scan_ts = 0.0
     _last_play_tick = 0      # marca en segundos
     _last_hb_sec = -1        # último segundo en que se emitió heartbeat (múltiplo de 30)
     _last_tel_sec = -1       # último segundo de telemetría (múltiplo de 5)
@@ -606,14 +630,16 @@ def main():
                     break
                 time.sleep(0.03)
 
-        # 2) Escaneo de respaldo
-        if now_i % 2 == 0:
-            for p in psutil.process_iter(attrs=["pid", "name"]):
+        # 2) Escaneo de respaldo con intervalo dinámico
+        scan_interval = 1.0 if (blocked_names or blocked_execs or blocked_dirs) else 3.0
+        if (now - _last_scan_ts) >= scan_interval:
+            _last_scan_ts = now
+            for p in psutil.process_iter(attrs=["pid", "name", "exe", "cwd", "cmdline"]):
                 try:
                     pid = p.info.get("pid")
                     if pid in recently_blocked and recently_blocked[pid] + 2.0 > now:
                         continue
-                    reason = _match_blocked(p, cfg, st, blocked_names, blocked_execs, blocked_dirs, self_dirs, ancestor_pids)
+                    reason = _match_blocked(p, cfg, st, blocked_names, blocked_execs, blocked_dirs, self_dirs, ancestor_pids, info=p.info)
                     if reason:
                         pname = p.info.get("name") or "?"
                         log.warning("BLOCK %s reason=%s", pname, reason)
@@ -623,6 +649,7 @@ def main():
                         recently_blocked[pid] = now
                 except Exception:
                     continue
+
 
         # 3) Telemetría opcional (throttle 1 vez cada 5 s)
         if cfg.get("log_process_activity", True) and (now_i % 5 == 0) and (_last_tel_sec != now_i):
@@ -682,7 +709,11 @@ def main():
             _last_hb_sec = now_i
             log.debug("heartbeat")
 
-        time.sleep(0.05)
+        # Idle adaptativo: más descanso cuando no hay trabajo pendiente
+        idle = 0.06
+        if not (blocked_names or blocked_execs or blocked_dirs):
+            idle = 0.10
+        time.sleep(idle)
 
 # =============================================================================
 if __name__ == "__main__":
