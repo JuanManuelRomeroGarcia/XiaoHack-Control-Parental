@@ -9,6 +9,9 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime
 import ctypes  # AppUserModelID
+import copy
+
+from app.scheduler import alerts_snapshot
 from . import prof
 # Almacenamiento / logs
 # arriba, junto con el resto de imports de storage
@@ -122,6 +125,7 @@ class TutorApp(tk.Tk):
         self.geometry("1024x900")
         self.minsize(1024, 720)
         self.resizable(True, True)
+        self.root = self
 
         # Icono
         try:
@@ -303,12 +307,8 @@ class TutorApp(tk.Tk):
         # Atajo Ctrl+S → guardar lo de la pestaña activa
         self.bind_all("<Control-s>", lambda e: self._save_current_tab())
 
-        # Ventanas auxiliares
-        self._countdown_win = None
-        self._hint_windows = {}
-        self._countdown_last = -1
-
         # Vigilancia de cambios en UI
+        self._hint_windows = {}
         self._tick_dirty_watch()
 
         # Profiler de latencia UI (opcional)
@@ -742,51 +742,8 @@ class TutorApp(tk.Tk):
         tk.Label(frame, text=f"La página '{name}' no está disponible (archivo faltante).",
                  justify="left").pack(anchor="w", padx=10, pady=10)
 
-    # -------- Ventana persistente de cuenta atrás (overlay local) --------
-    # Nota: el overlay real sobre juegos en pantalla completa lo gestiona notifier (Win32 layered).
-    def _show_countdown_window(self, seconds: int):
-        try:
-            if self._countdown_win is None or not self._countdown_win.winfo_exists():
-                w = tk.Toplevel(self)
-                w.withdraw()
-                w.overrideredirect(1)
-                w.attributes("-topmost", True)
-                w.attributes("-toolwindow", True)
-                w.geometry("300x120+{}+{}".format(
-                    max(0, (self.winfo_screenwidth()  - 300) // 2),
-                    max(0, (self.winfo_screenheight() - 120) // 4)
-                ))
-                frm = ttk.Frame(w, padding=12)
-                frm.pack(fill="both", expand=True)
-                self._cd_title = ttk.Label(frm, text="⏱ Cuenta atrás", font=("", 12, "bold"))
-                self._cd_value = ttk.Label(frm, text="60 s", font=("", 26))
-                self._cd_sub   = ttk.Label(frm, text="Se cerrará el juego", font=("", 10))
-                self._cd_title.pack(pady=(0, 6))
-                self._cd_value.pack()
-                self._cd_sub.pack(pady=(4, 0))
-                w.protocol("WM_DELETE_WINDOW", lambda: None)
-                w.deiconify()
-                self._countdown_win = w
-
-            if seconds != self._countdown_last:
-                self._cd_value.configure(text=f"{seconds:02d} s")
-                self._countdown_last = seconds
-        except Exception:
-            pass
-
-    def _hide_countdown_window(self):
-        try:
-            if self._countdown_win and self._countdown_win.winfo_exists():
-                self._countdown_win.destroy()
-        except Exception:
-            pass
-        finally:
-            self._countdown_win = None
-        self._countdown_last = -1
-
     # ---------- Tick control de tiempo ----------
     def _tick_playtime(self):
-        # log.debug("tick-start")
         try:
             self._maybe_reload_cfg()
             cfg = self.cfg
@@ -797,91 +754,72 @@ class TutorApp(tk.Tk):
             log.debug("tick enabled=%s", enabled)
 
             if not enabled:
-                self._hide_countdown_window()
+                # Limpia marcadores de juego cuando está deshabilitado
                 st.setdefault("play_alerts", {})
                 st["play_alerts"]["countdown_started"] = False
                 st["play_countdown"] = 0
                 st["play_end_notified"] = False
+
                 _, enf_changed = _compute_enforcement(cfg, st, allowed=False)
                 wl_changed = bool(st.get("play_whitelist"))
                 if wl_changed:
                     st["play_whitelist"] = []
+
                 if enf_changed or wl_changed or st.get("play_countdown", 0):
                     save_state(st)
+
                 try:
                     if getattr(self, "page_time", None) and hasattr(self.page_time, "_refresh_status_label"):
                         self.page_time._refresh_status_label()
                 except Exception:
                     pass
+
                 self.after(1000, self._tick_playtime)
                 log.debug("disabled-branch → blocklist-only")
                 return
 
-            msgs, countdown = (check_playtime_alerts(st, now, cfg) if check_playtime_alerts else ([], 0))
+            # >>> SOLO LECTURA: evaluar alertas sobre una COPIA del estado
+            st_view = copy.deepcopy(st)
+            msgs, countdown = (check_playtime_alerts(st_view, now, cfg) if check_playtime_alerts else ([], 0))
+            snap = alerts_snapshot(st, now, cfg)
+            countdown = snap.get("countdown", 0)
             log.debug("alerts msgs=%d countdown=%d", len(msgs), countdown)
 
-            if countdown > 0:
-                self._show_countdown_window(countdown)
-                self._subtitle.configure(text="")
-            else:
-                self._hide_countdown_window()
+            # Ya no mostramos ventana de cuenta atrás en la GUI.
+            # Si quieres, puedes usar el subtítulo del header para info, pero lo dejo vacío:
+            self._subtitle.configure(text="")
 
+            # Hints locales en el panel (no interfiere con los toasts del sistema)
             if msgs:
                 for m in msgs:
-                    title = "Tiempo de juego"
                     key = "play:generic"
-                    if "10 minutos" in m:
+                    lb = m.lower()
+                    if "10 minutos" in lb or "10 min" in lb or "10m" in lb:
                         key = "play:m10"
-                    elif "5 minutos" in m:
+                    elif "5 minutos" in lb or "5 min" in lb or "5m" in lb:
                         key = "play:m5"
-                    elif "Último minuto" in m or "cuenta atrás" in m:
+                    elif "último minuto" in lb or "cuenta atrás" in lb:
                         key = "play:m1"
-
-                    sent = False
-                    if GUI_EMITS_TOASTS and notifier_mod:
-                        if hasattr(notifier_mod, "notify_once"):
-                            try:
-                                notifier_mod.notify_once(key, title, m, min_interval=2.0)
-                                sent = True
-                            except Exception:
-                                sent = False
-                        if not sent and hasattr(notifier_mod, "notify"):
-                            try:
-                                notifier_mod.notify(title, m)
-                                sent = True
-                            except Exception:
-                                sent = False
-
-                    # Siempre mostrar el hint local del panel (no duplica los toasts del sistema)
-                    self._show_hint_window(key, m, ttl_sec=10)
+                    self._show_hint_window(key, m, ttl_sec=5)
 
             play_until = int(st.get("play_until") or 0)
             ended_flag = bool(st.get("play_end_notified", False))
             state_changed = False
 
+            # Fin de sesión (solo UI/hints; notificaciones del sistema las lleva notifier/guardian)
             if play_until > 0 and now_ts >= play_until:
-                st.setdefault("play_alerts", {})
-                st["play_alerts"]["countdown_started"] = False
-                st["play_countdown"] = 0
-                self._hide_countdown_window()
+                # NO tocar play_alerts ni play_countdown: lo gestiona el Guardian.
                 if not ended_flag:
-                    msg_end = "⛔ Se acabó el tiempo de juego."
-                    if GUI_EMITS_TOASTS and notifier_mod and hasattr(notifier_mod, "notify_once"):
-                        with contextlib.suppress(Exception):
-                            notifier_mod.notify_once("play:end", "Tiempo de juego", msg_end, min_interval=2.0)
-                    # (opcional) podrías mostrar también un hint local aquí si quieres:
-                    self._show_hint_window("play:end", msg_end, ttl_sec=10)
                     log.info("session-end")
                     st["play_end_notified"] = True
                     state_changed = True
-
             elif play_until > now_ts:
                 if ended_flag:
                     st["play_end_notified"] = False
                     state_changed = True
 
+            # Enforcement + whitelist (esto sí lo gestiona la GUI)
             allowed = is_play_allowed(cfg, st, now) if is_play_allowed else True
-
             desired_wl = cfg.get("game_whitelist", []) or []
             current_wl = st.get("play_whitelist", []) or []
             if allowed:
@@ -895,13 +833,13 @@ class TutorApp(tk.Tk):
 
             _, enf_changed = _compute_enforcement(cfg, st, allowed=allowed)
             log.debug("policy allowed=%s wl=%s mode=%s block=%s",
-                      allowed, len(desired_wl), st["enforcement"].get("mode"),
-                      len(st["enforcement"].get("block", [])))
+                    allowed, len(desired_wl), st["enforcement"].get("mode"),
+                    len(st["enforcement"].get("block", [])))
             if enf_changed:
                 state_changed = True
 
-            if st.get("play_countdown", 0) or msgs:
-                state_changed = True
+            # ⚠️ Importante: ya NO guardamos por 'msgs' ni por 'play_countdown'.
+            # Esos campos los actualiza el Guardian para evitar condiciones de carrera.
 
             if state_changed:
                 save_state(st)
@@ -917,6 +855,7 @@ class TutorApp(tk.Tk):
         finally:
             with contextlib.suppress(Exception):
                 self.after(1000, self._tick_playtime)
+
 
     def _show_hint_window(self, key: str, text: str, ttl_sec: int = 10):
         """

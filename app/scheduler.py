@@ -5,6 +5,7 @@
 
 
 from datetime import datetime, time as dtime, timedelta
+import os
 from typing import Dict, List, Tuple, Optional
 
 from app.logs import get_logger
@@ -197,6 +198,12 @@ def check_playtime_alerts(state: dict, now: datetime, cfg: Optional[dict] = None
       2) Tramo horario actual (si se provee cfg)
     Devuelve (mensajes, countdown_segundos). No guarda a disco.
     """
+    
+    origin = (os.getenv("XH_ROLE") or "").lower()
+    
+    M10, M5, M1 = 10*60, 5*60, 60
+    MARGIN = 3  # margen anti-tick tardío para no perder 10:00/5:00
+
     log.debug("check_playtime_alerts: play_until=%s now=%s", state.get("play_until"), int(now.timestamp()))
 
     pa = _ensure_alert_struct(state)
@@ -218,42 +225,69 @@ def check_playtime_alerts(state: dict, now: datetime, cfg: Optional[dict] = None
         log.debug("Alertas desactivadas por configuración")
         return messages, 0
 
-    # Cambio de modo o reinicio de sesión
-    last_mode = state.get("play_alert_mode")
-    last_until = state.get("_alerts_last_until", 0)
+    # --- Cambio de modo/sesión + siembra robusta por sesión ---
+    last_mode    = state.get("play_alert_mode")
+    last_until   = state.get("_alerts_last_until", 0)
     current_until = int(state.get("play_until") or 0)
-    if last_mode != mode or last_until != current_until:
+
+    SEED_KEY = "_alerts_seeded_for_until"
+    seeded_for = state.get(SEED_KEY)
+
+    changed_session = (last_mode != mode) or (last_until != current_until)
+    need_seed = changed_session or (seeded_for != current_until)
+
+    if changed_session:
         pa["m10"] = pa["m5"] = pa["m1"] = False
         pa["countdown_started"] = False
         state["play_alert_mode"] = mode
         state["_alerts_last_until"] = current_until
         log.debug("Reset de flags: last_mode=%s new_mode=%s", last_mode, mode)
 
+    if need_seed:
+        # IMPORTANTE: no queremos “matar” el aviso justo en 10:00 / 5:00.
+        # Solo sembramos si arrancas claramente por debajo del umbral.
+        if remaining < (M10 - MARGIN):
+            pa["m10"] = True
+        if remaining < (M5 - MARGIN):
+            pa["m5"] = True
+        # Para M1, no aplicamos margen: si arrancas en 59s, queremos countdown.
+        if remaining < M1:
+            pa["m1"] = True
+            pa["countdown_started"] = True
+        state[SEED_KEY] = current_until
+        log.debug("Seed aplicado para until=%s (remaining=%s)", current_until, remaining)
+
     log.debug("Tiempo restante=%s mode=%s flags=%s", remaining, mode, pa)
 
-    # Umbrales
+    # Umbrales: aquí mantenemos <= para disparar exactamente en 10:00 y 5:00
+    # 10 min
     if remaining <= M10 and not pa["m10"]:
         pa["m10"] = True
         messages.append("⏳ Quedan 10 minutos de juego.")
-        log.info("Emitido aviso de 10 minutos")
-        
-        #if (os.getenv("XH_ROLE") or "").lower() != "guardian":
-        #   helperdb.log_event("notify", "Tiempo de juego", "⏳ Quedan 10 minutos de juego.")
+        if origin == "guardian":
+            log.info("Emitido aviso de 10 minutos")
+        else:
+            log.debug("Emitido aviso de 10 minutos (vista GUI)")
 
+    # 5 min
     if remaining <= M5 and not pa["m5"]:
         pa["m5"] = True
         messages.append("⏳ Quedan 5 minutos de juego.")
-        log.info("Emitido aviso de 5 minutos")
-        
-        #if (os.getenv("XH_ROLE") or "").lower() != "guardian":
-        #   helperdb.log_event("notify", "Tiempo de juego", "⏳ Quedan 5 minutos de juego.")
+        if origin == "guardian":
+            log.info("Emitido aviso de 5 minutos")
+        else:
+            log.debug("Emitido aviso de 5 minutos (vista GUI)")
 
+    # 1 min
     if remaining <= M1 and not pa["m1"]:
         pa["m1"] = True
         pa["countdown_started"] = True
         messages.append("⚠️ ¡Último minuto! Comienza la cuenta atrás.")
-        log.warning("Último minuto: inicia cuenta atrás")
-
+        if origin == "guardian":
+            log.warning("Último minuto: inicia cuenta atrás")
+        else:
+            log.debug("Último minuto (vista GUI)")
+            
     # Cuenta atrás visible (0..60)
     if pa.get("countdown_started", False):
         countdown = int(max(0, min(60, remaining)))
@@ -263,6 +297,19 @@ def check_playtime_alerts(state: dict, now: datetime, cfg: Optional[dict] = None
 
     state["play_countdown"] = 0
     return messages, 0
+
+# snapshot de solo lectura para la GUI
+def alerts_snapshot(state: dict, now: datetime, cfg: Optional[dict] = None) -> dict:
+    rem, mode = remaining_play_seconds(state, now, cfg)
+    snap = {
+        "remaining": int(rem),
+        "mode": mode,
+        "m10": rem <= M10,
+        "m5":  rem <= M5,
+        "m1":  rem <= M1,
+        "countdown": int(max(0, min(60, rem))) if rem <= M1 else 0,
+    }
+    return snap
 
 # =========================
 # Helpers para OVERLAY
@@ -286,21 +333,6 @@ def should_show_overlay(state: dict) -> bool:
     """
     return get_overlay_countdown(state) > 0
 
-def alerts_snapshot(state: dict, now: datetime, cfg: Optional[dict] = None) -> Dict:
-    """
-    Snapshot útil para el notifier/overlay (no guarda nada).
-    Incluye flags de m10/m5/m1, segundos restantes y modo.
-    """
-    pa = state.get("play_alerts") or {}
-    rem, mode = remaining_play_seconds(state, now, cfg)
-    return {
-        "remaining": max(0, rem),
-        "mode": mode,  # "manual" | "schedule" | None
-        "m10": bool(pa.get("m10")),
-        "m5": bool(pa.get("m5")),
-        "m1": bool(pa.get("m1")),
-        "countdown": get_overlay_countdown(state),
-    }
 
 
 if __name__ == "__main__":

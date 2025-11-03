@@ -50,6 +50,7 @@ import sys
 from utils.runtime import parse_role, set_process_title, set_appusermodelid
 
 XH_ROLE = parse_role(sys.argv) or "guardian"
+os.environ["XH_ROLE"] = XH_ROLE
 set_appusermodelid("XiaoHack.Parental.Guardian")
 set_process_title(XH_ROLE)
 
@@ -140,19 +141,19 @@ def _emit_notify(title: str, body: str = ""):
     log.info("NOTIFY → %s | %s", title, body)
     _log_event("notify", title, body)
 
-
 def _playtime_tick(cfg: dict, st: dict, now_sec: int, now_dt):
     """
-    - Emite avisos de 10/5/1 min y mensaje de 'comienza cuenta atrás'.
-    - Envía PULSO 'countdown start/stop' para que Notifier arme/paré su reloj interno.
+    - Emite avisos de 10/5/1 min y 'comienza cuenta atrás'.
+    - Pulso 'countdown start/stop' (Notifier arma/para su reloj).
     - Actualiza state['play_countdown'] (0..60) y persiste si cambió.
     - Persiste también cuando cambie countdown_started (ON/OFF).
-    - Emite 'inicio de horario' y 'fin de horario' al cambiar el permiso por franjas.
+    - Emite 'inicio/fin de horario' al cambiar la franja permitida.
     """
+    
     global _last_allowed_flag
-    persisted = False 
+    persisted = False
 
-    # 1) Detectar cambio de permitido por horario (independiente de sesión manual)
+    # 1) Cambio de franja permitida (independiente de sesión manual)
     allowed_now = is_within_allowed_hours(cfg, now_dt)
     if _last_allowed_flag is None:
         _last_allowed_flag = allowed_now
@@ -163,7 +164,7 @@ def _playtime_tick(cfg: dict, st: dict, now_sec: int, now_dt):
             _emit_notify("Horario finalizado", "Se acabó la franja permitida.")
         _last_allowed_flag = allowed_now
 
-    # === PULSO A NOTIFIER: detectar transición de cuenta atrás ===
+    # === Estructura de alertas / flags ===
     pa = st.setdefault("play_alerts", {})
     prev_started = bool(pa.get("countdown_started"))
 
@@ -172,7 +173,7 @@ def _playtime_tick(cfg: dict, st: dict, now_sec: int, now_dt):
     rem_total, _mode = remaining_play_seconds(st, now_dt, cfg)
     now_started = bool(pa.get("countdown_started"))
 
-    # Enviar avisos 10/5/1
+    # Enviar avisos 10/5/1 → a BD (Notifier los recogerá)
     if msgs:
         for m in msgs:
             _emit_notify("Tiempo de juego", m)
@@ -194,16 +195,18 @@ def _playtime_tick(cfg: dict, st: dict, now_sec: int, now_dt):
             deadline = int(now_sec) + secs
             _log_event("countdown", "start", json.dumps({"deadline": deadline}))
             log.debug("Último minuto → ON (secs=%s, deadline=%s)", secs, deadline)
-        persisted = True 
+        persisted = True
 
     # Transición: ON -> OFF (sale del último minuto o termina)
     elif (not now_started) and prev_started:
-        _log_event("countdown", "stop", "")
-        log.debug("Último minuto → OFF (stop enviado)")
+        reason = "expired" if rem_total <= 0 else "cancelled"
+        _log_event("countdown", "stop", json.dumps({"reason": reason}))
+        log.debug("Último minuto → OFF (stop enviado) reason=%s", reason)
+        # Asegura flag abajo en memoria
+        pa["countdown_started"] = False
+        persisted = True
 
-        persisted = True  
-
-    # 3) Persistir countdown solo si cambió (opcional; puedes eliminarlo si no quieres I/O por segundo)
+    # 3) Persistir countdown solo si cambió
     if int(st.get("play_countdown", 0) or 0) != int(countdown or 0):
         st["play_countdown"] = int(countdown or 0)
         persisted = True
@@ -214,7 +217,7 @@ def _playtime_tick(cfg: dict, st: dict, now_sec: int, now_dt):
         except Exception:
             pass
 
-    # 4) Notificación de fin de tiempo (cuando remaining <= 0 y veníamos con modo activo)
+    # 4) Notificación de fin de tiempo (separada del STOP)
     rem, mode = remaining_play_seconds(st, now_dt, cfg)
     if rem <= 0 and st.get("play_alert_mode") in ("manual", "schedule"):
         if not pa.get("ended_sent"):
@@ -224,14 +227,6 @@ def _playtime_tick(cfg: dict, st: dict, now_sec: int, now_dt):
                 save_state(st)
             except Exception:
                 pass
-            
-    if rem <= 0 and pa.get("countdown_started"):
-        _log_event("countdown", "stop", "")
-        pa["countdown_started"] = False
-        try:
-            save_state(st)
-        except Exception:
-            pass
 
 # =============================================================================
 # Gestión de procesos
