@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import List
 
 from app.logs import get_logger
-from app.storage import load_state, save_state, now_epoch, load_config, save_config
+from app.storage import load_state, save_state, now_epoch, load_config, save_config, get_alerts_cfg
 
 # --- scheduler: soporta app.scheduler y fallback a scheduler de raíz ---
 try:
@@ -75,6 +75,8 @@ class TimePage(ttk.Frame):
                     self.cfg = cfg
                     self._reload_tree_from_cfg()
                     self._refresh_status_label()
+                    self._load_alerts_form()
+                    self._update_alerts_checkbox_label()
                     log.debug("Recarga completada (rev=%s)", rev_local)
                 after_safe(self, 0, _apply)
             except Exception as e:
@@ -88,71 +90,190 @@ class TimePage(ttk.Frame):
     # ---------------- Construcción UI ----------------
     def _build(self):
         pad = {"padx": 6, "pady": 6}
-        ttk.Label(self, text="Permitir jugar durante (minutos):").grid(row=0, column=0, sticky="w", **pad)
+
+        # --- Avisos ON/OFF ---
+        self.chk_alerts_var = tk.IntVar(value=1)
+        self.chk_alerts = ttk.Checkbutton(
+            self, text="Permitir avisos y cuenta atrás final", variable=self.chk_alerts_var
+        )
+        self.chk_alerts.grid(row=0, column=0, columnspan=2, sticky="w", **pad)
+
+        # === Alertas y banners (arriba) ===
+        lf_alerts = ttk.LabelFrame(self, text="Alertas y banners")
+        lf_alerts.grid(row=1, column=0, columnspan=4, sticky="ew", padx=6, pady=(6, 8))
+        lf_alerts.columnconfigure(1, weight=1)
+        lf_alerts.columnconfigure(3, weight=1)
+
+        ttk.Label(lf_alerts, text="Aviso 1 (min):").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        self.ent_aviso1 = ttk.Entry(lf_alerts, width=8)
+        self.ent_aviso1.grid(row=0, column=1, sticky="w", padx=6, pady=4)
+
+        ttk.Label(lf_alerts, text="Aviso 2 (min):").grid(row=0, column=2, sticky="w", padx=6, pady=4)
+        self.ent_aviso2 = ttk.Entry(lf_alerts, width=8)
+        self.ent_aviso2.grid(row=0, column=3, sticky="w", padx=6, pady=4)
+
+        ttk.Label(lf_alerts, text="TTL aviso (s):").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        self.ent_ttl_aviso = ttk.Entry(lf_alerts, width=8)
+        self.ent_ttl_aviso.grid(row=1, column=1, sticky="w", padx=6, pady=4)
+
+        ttk.Label(lf_alerts, text="TTL cierre (s):").grid(row=1, column=2, sticky="w", padx=6, pady=4)
+        self.ent_ttl_cierre = ttk.Entry(lf_alerts, width=8)
+        self.ent_ttl_cierre.grid(row=1, column=3, sticky="w", padx=6, pady=4)
+
+        ttk.Button(lf_alerts, text="Guardar alertas", command=self._save_alerts)\
+            .grid(row=2, column=3, sticky="e", padx=6, pady=(4, 2))
+
+        # Cargar valores actuales y actualizar etiqueta del check
+        self._load_alerts_form()
+        self._update_alerts_checkbox_label()
+
+        # --- Duración sesión manual ---
+        ttk.Label(self, text="Permitir jugar durante (minutos):").grid(row=2, column=0, sticky="w", **pad)
         self.ent_minutes = ttk.Entry(self, width=10)
         self.ent_minutes.insert(0, "90")
-        self.ent_minutes.grid(row=0, column=1, sticky="w", **pad)
+        self.ent_minutes.grid(row=2, column=1, sticky="w", **pad)
 
-        self.chk_alerts_var = tk.IntVar(value=1)
-        ttk.Checkbutton(self, text="Avisos 10/5/1 min y cuenta atrás final", variable=self.chk_alerts_var)\
-            .grid(row=1, column=0, columnspan=2, sticky="w", **pad)
-
+        # Nota informativa
         ttk.Label(self, text="(Usa la 'Lista blanca de juegos' de la pestaña Aplicaciones/Juegos.)")\
-            .grid(row=2, column=0, columnspan=2, sticky="w", **pad)
+            .grid(row=3, column=0, columnspan=2, sticky="w", **pad)
 
-        # Sesión manual
-        ttk.Button(self, text="Permitir jugar ahora", command=self._start).grid(row=3, column=0, sticky="w", **pad)
-        ttk.Button(self, text="Cancelar sesión", command=self._stop).grid(row=3, column=1, sticky="w", **pad)
-
-        # Botón de prueba de último minuto (fuerza overlay de cuenta atrás)
+        # --- Controles de sesión manual ---
+        ttk.Button(self, text="Permitir jugar ahora", command=self._start).grid(row=4, column=0, sticky="w", **pad)
+        ttk.Button(self, text="Cancelar sesión", command=self._stop).grid(row=4, column=1, sticky="w", **pad)
         ttk.Button(self, text="Prueba: último minuto (overlay)",
-                   command=self._start_last_minute_test).grid(row=3, column=2, sticky="w", **pad)
+                command=self._start_last_minute_test).grid(row=4, column=2, sticky="w", **pad)
 
-        ttk.Separator(self, orient="horizontal").grid(row=4, column=0, columnspan=4, sticky="ew", **pad)
+        ttk.Separator(self, orient="horizontal").grid(row=5, column=0, columnspan=4, sticky="ew", **pad)
 
+        # --- Toggle global de tiempo de juego ---
         self._playtime_enabled = tk.BooleanVar(value=bool(load_config().get("playtime_enabled", True)))
         self.btn_toggle = ttk.Button(self, text=self._toggle_btn_text(), command=self._toggle_playtime)
-        self.btn_toggle.grid(row=5, column=0, sticky="w", **pad)
+        self.btn_toggle.grid(row=6, column=0, sticky="w", **pad)
 
-        # Editor de horarios
-        ttk.Label(self, text="Horarios permitidos (edición):").grid(row=6, column=0, sticky="w", **pad)
+        # --- Editor de horarios (compacto) ---
+        ttk.Label(self, text="Horarios permitidos (edición):").grid(row=7, column=0, sticky="w", **pad)
         btns = ttk.Frame(self)
-        btns.grid(row=6, column=1, columnspan=3, sticky="e", **pad)
+        btns.grid(row=7, column=1, columnspan=3, sticky="e", **pad)
         ttk.Button(btns, text="Añadir tramo", command=self._add_schedule_dialog).pack(side="left", padx=3)
         ttk.Button(btns, text="Editar seleccionado", command=self._edit_selected_schedule).pack(side="left", padx=3)
         ttk.Button(btns, text="Eliminar seleccionado", command=self._delete_selected_schedule).pack(side="left", padx=3)
         ttk.Button(btns, text="Guardar horarios", command=self._save_schedules).pack(side="left", padx=3)
 
-        self.tree = ttk.Treeview(self, columns=("days", "from", "to"), show="headings", height=8)
+        self.tree = ttk.Treeview(self, columns=("days", "from", "to"), show="headings", height=6)  # compacto
         for c, t in zip(("days", "from", "to"), ("Días", "Desde", "Hasta")):
             self.tree.heading(c, text=t)
         self.tree.column("days", width=280, anchor="w")
         self.tree.column("from", width=90, anchor="center")
         self.tree.column("to", width=90, anchor="center")
-        self.tree.grid(row=7, column=0, columnspan=4, sticky="nsew", padx=6)
+        self.tree.grid(row=8, column=0, columnspan=4, sticky="nsew", padx=6)
         vs = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscroll=vs.set)
-        vs.grid(row=7, column=4, sticky="ns", pady=6)
+        vs.grid(row=8, column=4, sticky="ns", pady=6)
         self.tree.bind("<Double-1>", self._on_tree_double_click)
 
         ttk.Button(self, text="Refrescar estado ahora", command=self._signal_schedules_changed)\
-            .grid(row=8, column=3, sticky="e", **pad)
+            .grid(row=9, column=3, sticky="e", **pad)
 
         self.lbl_status = ttk.Label(self, text="")
-        self.lbl_status.grid(row=9, column=0, columnspan=4, sticky="w", **pad)
+        self.lbl_status.grid(row=10, column=0, columnspan=4, sticky="w", **pad)
 
         exf = ttk.Frame(self)
-        exf.grid(row=10, column=0, columnspan=4, sticky="w", **pad)
-        ttk.Button(exf, text="Cargar ejemplo (L–V 18–19 + S/D mañana/tarde)", command=self._load_example_schedules)\
-            .pack(side="left")
+        exf.grid(row=11, column=0, columnspan=4, sticky="w", **pad)
+        ttk.Button(exf, text="Cargar ejemplo (L–V 18–19 + S/D mañana/tarde)",
+                command=self._load_example_schedules).pack(side="left")
 
         self._reload_tree_from_cfg()
         self._refresh_status_label()
 
-        self.grid_rowconfigure(7, weight=1)
+        # Que el árbol pueda crecer si la ventana se agranda
+        self.grid_rowconfigure(8, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
+
     # ---------------- Schedules helpers ----------------
+    def _load_alerts_form(self):
+        """Rellena los campos de aviso/TTL desde config.json."""
+        try:
+            alerts = get_alerts_cfg(load_config())
+        except Exception:
+            alerts = {"aviso1_sec": 600, "aviso2_sec": 300, "aviso3_sec": 60,
+                      "flash_ttl": 7, "close_banner_ttl": 10}
+
+        a1_min = max(1, int(round(int(alerts.get("aviso1_sec", 600)) / 60)))
+        a2_min = max(1, int(round(int(alerts.get("aviso2_sec", 300)) / 60)))
+        ttl_av = int(alerts.get("flash_ttl", 7))
+        ttl_c  = int(alerts.get("close_banner_ttl", 10))
+
+        self.ent_aviso1.delete(0, tk.END)
+        self.ent_aviso1.insert(0, str(a1_min))
+        self.ent_aviso2.delete(0, tk.END)
+        self.ent_aviso2.insert(0, str(a2_min))
+        self.ent_ttl_aviso.delete(0, tk.END)
+        self.ent_ttl_aviso.insert(0, str(ttl_av))
+        self.ent_ttl_cierre.delete(0, tk.END)
+        self.ent_ttl_cierre.insert(0, str(ttl_c))
+
+    def _save_alerts(self):
+        """Valida y guarda en config.json. (El normalizado final lo hace storage.py)."""
+        try:
+            a1_min = int(self.ent_aviso1.get().strip())
+            a2_min = int(self.ent_aviso2.get().strip())
+            ttl_av = int(self.ent_ttl_aviso.get().strip())
+            ttl_c  = int(self.ent_ttl_cierre.get().strip())
+        except Exception:
+            messagebox.showerror("Error", "Valores inválidos. Usa números enteros.")
+            return
+
+        # Reglas básicas
+        if not (1 <= a1_min <= 1440 and 1 <= a2_min <= 1440):
+            messagebox.showerror("Error", "Avisos en minutos: 1–1440.")
+            return
+        if not (1 <= ttl_av <= 60 and 1 <= ttl_c <= 60):
+            messagebox.showerror("Error", "TTLs en segundos: 1–60.")
+            return
+        if a2_min > a1_min:
+            a2_min = a1_min  # mantener orden lógico
+
+        cfg = load_config()
+        alerts = dict(cfg.get("alerts") or {})
+        alerts.update({
+            "aviso1_sec": a1_min * 60,
+            "aviso2_sec": a2_min * 60,
+            "aviso3_sec": 60,            # último minuto fijo
+            "flash_ttl":  ttl_av,
+            "close_banner_ttl": ttl_c,
+        })
+        cfg["alerts"] = alerts
+        save_config(cfg)
+
+        # Señal suave para que guardian/notifier capten cambios pronto
+        try:
+            st = load_state()
+            st["alerts_changed_at"] = now_epoch()
+            save_state(st)
+        except Exception:
+            pass
+
+        self._update_alerts_checkbox_label()
+        messagebox.showinfo("OK", "Alertas guardadas.")
+
+        log.info("Alertas actualizadas: aviso1=%sm, aviso2=%sm, ttl_aviso=%ss, ttl_cierre=%ss",
+                 a1_min, a2_min, ttl_av, ttl_c)
+
+    def _update_alerts_checkbox_label(self):
+        """Actualiza etiqueta: 'Avisos X/Y/1 min y cuenta atrás final'."""
+        try:
+            alerts = get_alerts_cfg(load_config())
+            a1_min = max(1, int(round(int(alerts.get("aviso1_sec", 600)) / 60)))
+            a2_min = max(1, int(round(int(alerts.get("aviso2_sec", 300)) / 60)))
+            text = f"Avisos {a1_min}/{a2_min}/1 min y cuenta atrás final"
+        except Exception:
+            text = "Permitir avisos cuenta atrás final"
+        try:
+            self.chk_alerts.configure(text=text)
+        except Exception:
+            pass
+    
     def _reload_tree_from_cfg(self):
         try:
             self._pending_schedules = list(load_config().get("schedules", []))

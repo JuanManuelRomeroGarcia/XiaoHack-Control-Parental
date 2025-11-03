@@ -8,7 +8,7 @@ import app._bootstrap  # noqa: F401  # side-effects
 
 import os
 import sys
-import time
+import time as _t
 import json
 import threading
 import html
@@ -20,6 +20,7 @@ from app.storage import (
     load_config as _storage_load_config,  # noqa: F401
     load_state as _storage_load_state,
     data_dir as _storage_data_dir,
+    get_alerts_cfg as _storage_get_alerts_cfg,
 )
 from utils.runtime import parse_role, set_process_title, set_appusermodelid
 from app.logs import get_logger, install_exception_hooks
@@ -71,6 +72,10 @@ except Exception as e:
 
 CONFIG_PATH_PD = DATA_DIR_FORCED / "config.json"
 
+_AVISO1_SEC = 600
+_AVISO2_SEC = 300
+_AVISO3_SEC = 60
+
 STATE_DIR = DATA_DIR_FORCED
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = STATE_DIR / "notifier_state.json"
@@ -82,6 +87,7 @@ _DB_POLL_SEEN = False      # primer poll a la DB ya realizado
 _START_TS = 0.0 
 _LAST_TJ_EVENT_TS = 0.0
 _COUNTDOWN_ACTIVE_UNTIL = 0.0
+_SUPPRESS_FLASH_UNTIL = {"av1": 0.0, "av2": 0.0} 
 
 # --------------------------------------------------------------------
 # Estado local del notifier
@@ -102,44 +108,119 @@ def save_state_local(st):
     except Exception as e:
         log.error("Error al guardar notifier_state: %s", e)
         
-# notifier.py
+def _refresh_alerts_cfg():
+    """Carga alerts.* de config.json y actualiza globals (umbrales y TTLs)."""
+    global BANER_START_TTL, CLOSE_BANNER_TTL, _AVISO1_SEC, _AVISO2_SEC, _AVISO3_SEC
+    try:
+        alerts = _storage_get_alerts_cfg(_storage_load_config() or {})
+    except Exception:
+        alerts = {"aviso1_sec": 600, "aviso2_sec": 300, "aviso3_sec": 60, "flash_ttl": 7, "close_banner_ttl": 10}
+        
+    _AVISO1_SEC = int(alerts.get("aviso1_sec", 600))
+    _AVISO2_SEC = int(alerts.get("aviso2_sec", 300))
+    _AVISO3_SEC = int(alerts.get("aviso3_sec", 60))
+    BANER_START_TTL  = int(alerts.get("flash_ttl", 7))
+    CLOSE_BANNER_TTL = int(alerts.get("close_banner_ttl", 10))
+
+def _fmt_span(seconds: int) -> str:
+    """'X minutos' si múltiplo de 60; si no 'Y segundos'."""
+    seconds = int(max(0, seconds))
+    if seconds % 60 == 0:
+        m = seconds // 60
+        return f"{m} minuto{'s' if m != 1 else ''}"
+    return f"{seconds} segundos"
+
+def _secs_to_big_text(seconds: int) -> str:
+    """Texto grande del banner: minutos si es múltiplo de 60, si no los segundos."""
+    return str(seconds // 60) if seconds % 60 == 0 else str(seconds)
+
+def _parse_aviso_seconds(body_lower: str) -> int:
+    """
+    Extrae los segundos del texto 'quedan X minutos/segundos'.
+    Devuelve 0 si no se reconoce o si es el mensaje de 'último minuto'.
+    """
+    if "último minuto" in body_lower or "ultimo minuto" in body_lower:
+        return 0
+    import re
+    # ejemplos: "quedan 10 minutos", "quedan 8 min", "quedan 120 s/seg/segundos"
+    m = re.search(r"qued(?:a|an)\s+(\d+)\s*(m(?:in(?:s|utos)?)?|s(?:eg(?:s|undos)?)?)", body_lower, re.I)
+    if not m:
+        return 0
+    val = int(m.group(1))
+    unit = (m.group(2) or "").lower()
+    if unit.startswith("m"):
+        return val * 60
+    return val  # segundos
+
 def _flash_from_state_transitions(last_flags: dict) -> dict:
     """
     Fallback: si detecto transición False->True en play_alerts.m10/m5,
-    armo el banner de 10/5 min aunque no haya llegado el evento 'notify'.
-    Protegido para NO disparar si ya estamos en el último minuto.
+    armo el banner de aviso1/aviso2 aunque no haya llegado 'notify'.
+    Reglas anti-duplicados:
+      - No dispara si hay cuenta atrás activa (play_countdown>0).
+      - No dispara si estamos dentro del 'cooldown' posterior a un STOP o a un DB-notify reciente.
+      - No dispara si la última 'Tiempo de juego' llegó hace ≤ 12s.
+      - No dispara si el umbral concreto está suprimido (_SUPPRESS_FLASH_UNTIL['avX']).
     """
+
+    now = _t.time()
     try:
         st = _storage_load_state() or {}
         pa = (st.get("play_alerts") or {})
         m10 = bool(pa.get("m10"))
         m5  = bool(pa.get("m5"))
 
-        # 1) Si ya hay cuenta atrás activa en el state, no hacemos fallback 10/5
+        # 1) Si ya hay último minuto activo, jamás hacemos fallback
         if int(st.get("play_countdown", 0) or 0) > 0:
             return {"m10": m10, "m5": m5}
 
-        # 2) Calcular segundos restantes estimados y evitar fallback si <= 65s
+        # 2) No hagas fallback si venimos de STOP/END y aún corre el “bloqueo”
+        if now < _COUNTDOWN_ACTIVE_UNTIL:
+            return {"m10": m10, "m5": m5}
+
+        # 3) No hagas fallback si hace muy poco que llegó un NOTIFY de 'Tiempo de juego'
+        if (now - _LAST_TJ_EVENT_TS) <= 12.0:
+            return {"m10": m10, "m5": m5}
+
+        # 4) Evita eco si estamos ya al borde del último minuto
         try:
             play_until = int(st.get("play_until") or 0)
         except Exception:
             play_until = 0
-        now_ts = int(time.time())
-        remaining = (play_until - now_ts) if play_until > 0 else 999999
-
-        if remaining <= 65:
-            # Ya estamos en la zona del último minuto; no mostrar 10/5
+        if play_until > 0 and (play_until - int(now)) <= (_AVISO3_SEC + 5):
             return {"m10": m10, "m5": m5}
 
-        # 3) Transiciones m10/m5
+        # 5) Transiciones con supresión por umbral
+        fired = False
+
         if m10 and not last_flags.get("m10"):
-            log.info("FLASH state→10m (fallback por flags)")
-            trigger_flash_banner("10", "Quedan 10 minutos", seconds=BANER_START_TTL)
+            if now >= float(_SUPPRESS_FLASH_UNTIL.get("av1", 0.0) or 0.0):
+                big = _secs_to_big_text(_AVISO1_SEC)
+                sub = f"Quedan {_fmt_span(_AVISO1_SEC)}"
+                log.info("FLASH state→aviso1 (fallback por flags)")
+                trigger_flash_banner(big, sub, seconds=BANER_START_TTL)
+                _SUPPRESS_FLASH_UNTIL["av1"] = now + 90.0
+                fired = True
+
         if m5 and not last_flags.get("m5"):
-            log.info("FLASH state→5m (fallback por flags)")
-            trigger_flash_banner("5", "Quedan 5 minutos", seconds=BANER_START_TTL)
+            if now >= float(_SUPPRESS_FLASH_UNTIL.get("av2", 0.0) or 0.0):
+                big = _secs_to_big_text(_AVISO2_SEC)
+                sub = f"Quedan {_fmt_span(_AVISO2_SEC)}"
+                log.info("FLASH state→aviso2 (fallback por flags)")
+                trigger_flash_banner(big, sub, seconds=BANER_START_TTL)
+                _SUPPRESS_FLASH_UNTIL["av2"] = now + 90.0
+                fired = True
+
+        # Si disparamos alguno, empuja un pequeño “bloqueo general” para evitar rebotes
+        if fired and (_COUNTDOWN_ACTIVE_UNTIL < now + 2.0):
+            # esto NO impide count-down real (solo bloquea rearme por state durante ~2s)
+            try:
+                globals()["_COUNTDOWN_ACTIVE_UNTIL"] = now + 2.0
+            except Exception:
+                pass
 
         return {"m10": m10, "m5": m5}
+
     except Exception as e:
         log.debug("fallback flash por state: %s", e)
         return last_flags
@@ -265,7 +346,7 @@ def ensure_aumid_ready():
     except Exception as e:
         log.debug("ensure_appid_shortcut fallo: %s", e)
     _shell_notify_refresh()
-    time.sleep(0.2)
+    _t.sleep(0.2)
 
 def diagnose_notification_env(auto_fix: bool = False) -> dict:
     """
@@ -406,7 +487,7 @@ def _balloon_fallback(title: str, msg: str, icon_path: str | None = None, timeou
 
         Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid))
         Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
-        time.sleep(nid.uTimeoutOrVersion / 1000.0)
+        _t.sleep(nid.uTimeoutOrVersion / 1000.0)
         Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
         return True
     except Exception as e:
@@ -459,7 +540,7 @@ def notify(title: str, msg: str, duration=5):
 
 _TOAST_SEEN: dict[str, float] = {}
 def notify_once(key: str, title: str, msg: str, min_interval: float = 5.0):
-    now = time.time()
+    now = _t.time()
     if now - _TOAST_SEEN.get(key, 0) < min_interval:
         return False
     _TOAST_SEEN[key] = now
@@ -479,7 +560,6 @@ def query_new_notifies(since_id: int):
 
 def _handle_countdown_event(value: str, meta: str):
     import json
-    import time
     global _COUNTDOWN_ACTIVE_UNTIL
     try:
         payload = json.loads(meta) if meta else {}
@@ -495,14 +575,14 @@ def _handle_countdown_event(value: str, meta: str):
                 deadline = None
         elif "seconds" in payload:
             try:
-                deadline = time.time() + float(payload["seconds"])
+                deadline = _t.time() + float(payload["seconds"])
             except Exception:
                 deadline = None
 
         if deadline:
             _LC.arm_until(deadline, source="event")
             _COUNTDOWN_ACTIVE_UNTIL = deadline + 1.0  # bloquea fallback por state durante el minuto
-            rem = max(0, int(deadline - time.time()))
+            rem = max(0, int(deadline - _t.time()))
             log.info("COUNTDOWN EVENT → START: deadline=%s (rem=%ss)", int(deadline), rem)
         else:
             log.warning("COUNTDOWN EVENT → START sin deadline/seconds: %r", payload)
@@ -521,15 +601,12 @@ def _handle_countdown_event(value: str, meta: str):
         except Exception:
             pass
 
-        _COUNTDOWN_ACTIVE_UNTIL = time.time() + 2.5
+        _COUNTDOWN_ACTIVE_UNTIL = _t.time() + 1 # bloquea fallback por state durante el minuto
         log.info("COUNTDOWN EVENT → STOP (timer local desarmado) reason=%s", reason or "?")
 
         # Banner final SOLO si el tiempo se agotó de forma natural
         if reason == "expired":
             trigger_flash_banner("⛔", "Cerrando juegos y aplicaciones", seconds=CLOSE_BANNER_TTL)
-
-
-
 
 # --------------------------------------------------------------------
 # Explorer Watch (como antes)
@@ -568,7 +645,7 @@ def explorer_watch_loop(stop_ev: threading.Event):
                 pass
 
             if not blocked:
-                time.sleep(0.5)
+                _t.sleep(0.5)
                 continue
             if shell is None:
                 shell = win32com.client.Dispatch("Shell.Application")
@@ -584,18 +661,18 @@ def explorer_watch_loop(stop_ev: threading.Event):
                     if doc and getattr(getattr(doc, "Folder", None), "Self", None):
                         path = getattr(doc.Folder.Self, "Path", "")
                         for d in blocked:
-                            if path.lower().startswith(d.lower()) and time.time() - last_closed.get(hwnd, 0) > 1.5:
+                            if path.lower().startswith(d.lower()) and _t.time() - last_closed.get(hwnd, 0) > 1.5:
                                 log.info("Cerrar carpeta bloqueada: %s", path)
                                 win32gui.PostMessage(hwnd, WM_CLOSE, 0, 0)
                                 notify_once(f"dir:{d}", "Carpeta bloqueada", "Necesitas permiso del tutor para abrir esta carpeta.", 6.0)
-                                last_closed[hwnd] = time.time()
+                                last_closed[hwnd] = _t.time()
                                 break
                 except Exception as e:
                     log.debug("Error ventana Explorer: %s", e)
         except Exception as e:
             log.error("ExplorerWatch loop error: %s", e)
             shell = None
-        time.sleep(backoff)
+        _t.sleep(backoff)
     try:
         pythoncom.CoUninitialize()
     except Exception:
@@ -657,7 +734,7 @@ def _safe_overlay_seconds() -> int:
     2) Si NO hay evento activo, podemos caer al STATE (con gating anti-rearme).
     """
     global _COUNTDOWN_ACTIVE_UNTIL
-    now = time.time()
+    now = _t.time()
 
     # 1) Evento activo → usa SIEMPRE el temporizador local
     if _COUNTDOWN_ACTIVE_UNTIL > now:
@@ -1034,7 +1111,7 @@ def tk_overlay_loop(stop_ev: threading.Event):
                     last_txt = ftxt
                 root.update_idletasks()
                 root.update()
-                time.sleep(SLEEP_ACTIVE)
+                _t.sleep(SLEEP_ACTIVE)
                 continue  # <- evita usar 'n' sin asignar
 
             # 2) Countdown último minuto
@@ -1050,13 +1127,13 @@ def tk_overlay_loop(stop_ev: threading.Event):
                     last_txt = txt
                 root.update_idletasks()
                 root.update()
-                time.sleep(SLEEP_ACTIVE)
+                _t.sleep(SLEEP_ACTIVE)
             else:
                 if visible:
                     root.withdraw()
                     visible = False
                     last_txt = None
-                time.sleep(SLEEP_IDLE)
+                _t.sleep(SLEEP_IDLE)
     except Exception as e:
         log.warning("tk overlay error: %s", e)
 
@@ -1095,7 +1172,7 @@ def overlay_loop(stop_ev: threading.Event):
                     mgr.render_text(ftxt)
                     last_n = -1  # no mezclar con countdown previo
                     _pump()
-                    time.sleep(SLEEP_ACTIVE)
+                    _t.sleep(SLEEP_ACTIVE)
                     continue
 
                 # 2) Countdown último minuto
@@ -1110,7 +1187,7 @@ def overlay_loop(stop_ev: threading.Event):
                         log.debug("OVERLAY→ render n=%s", n)
                         last_n = n
                     _pump()
-                    time.sleep(SLEEP_ACTIVE)
+                    _t.sleep(SLEEP_ACTIVE)
                 else:
                     if visible:
                         mgr.hide()
@@ -1118,7 +1195,7 @@ def overlay_loop(stop_ev: threading.Event):
                         last_n = -1
                         log.debug("OVERLAY→ hide (n=0 y sin flash)")
                     _pump()
-                    time.sleep(SLEEP_IDLE)
+                    _t.sleep(SLEEP_IDLE)
         except Exception as e:
             log.warning("Overlay Win32 error: %s (fallback Tkinter)", e)
             try:
@@ -1153,7 +1230,6 @@ class LocalCountdown:
         self.armed_ts = 0.0
 
     def arm_until(self, abs_deadline: float, source: str = "event"):
-        import time as _t
         rem = float(abs_deadline) - _t.time()
         if rem <= 0 or rem > self.MAX_LAST_MINUTE:
             self.disarm()
@@ -1164,15 +1240,13 @@ class LocalCountdown:
         self.armed_ts = _t.time()
 
     def arm_for(self, seconds_from_now: float, source: str = "event"):
-        import time as _t
         self.arm_until(_t.time() + float(seconds_from_now), source=source)
         
     def remaining(self) -> float:
         """Segundos (float) restantes; 0.0 si no armado o fuera de rango (sanidad 1..60s)."""
-        import time
         if not self.armed:
             return 0.0
-        rem = float(self.deadline - time.time())
+        rem = float(self.deadline - _t.time())
         if rem <= 0.0 or rem > self.MAX_LAST_MINUTE:
             self.disarm()
             return 0.0
@@ -1188,7 +1262,6 @@ def trigger_flash_banner(text: str, subtitle: str | None = None, ttl: float | No
     """
     Activa un 'flash' temporal (p.ej. "10", "5") para que el overlay lo muestre unos segundos.
     """
-    import time
     try:
         # Normaliza tiempo de vida
         if ttl is None and seconds is not None:
@@ -1198,10 +1271,10 @@ def trigger_flash_banner(text: str, subtitle: str | None = None, ttl: float | No
 
         t = str(text)
         s = subtitle or ""
-        expiry = time.time() + float(ttl)
+        expiry = _t.time() + float(ttl)
 
         with _FLASH_LOCK:
-            if (_FLASH.get("text") == t and _FLASH.get("subtitle") == s and time.time() < float(_FLASH.get("until") or 0)):
+            if (_FLASH.get("text") == t and _FLASH.get("subtitle") == s and _t.time() < float(_FLASH.get("until") or 0)):
                 return
             _FLASH["text"] = t
             _FLASH["subtitle"] = s
@@ -1216,8 +1289,7 @@ def _flash_current() -> tuple[str | None, str | None]:
     """
     Si hay un flash activo y no ha expirado, devuelve (texto, subtítulo).
     """
-    import time
-    now = time.time()
+    now = _t.time()
     with _FLASH_LOCK:
         t = _FLASH.get("text")
         u = float(_FLASH.get("until") or 0)
@@ -1248,10 +1320,11 @@ def main():
         pass
 
     log.info("Notifier iniciado. Overlay=%s", _OVERLAY_IMPL)
+    _refresh_alerts_cfg()
 
     # Asegurar AUMID listo ANTES de lanzar hilos o notificaciones
     ensure_aumid_ready()
-    _START_TS = time.time()
+    _START_TS = _t.time()
     try:
         st0 = _storage_load_state() or {}
         pa0 = (st0.get("play_alerts") or {})
@@ -1311,33 +1384,45 @@ def main():
 
                 if t.lower() == "tiempo de juego":
                     saw_tiempo_event = True
-                    lb = b.lower()
-                    m10 = ("10 minutos" in lb) or ("10 min" in lb) or ("10m" in lb)
-                    m5  = ("5 minutos"  in lb) or ("5 min"  in lb) or ("5m"  in lb)
-                    log.debug("FLASH check: title='Tiempo de juego' 10m=%s 5m=%s", m10, m5)
-                    if m10:
-                        log.info("Flash 10m recibido → mostrar banner 10")
-                        trigger_flash_banner("10", "Quedan 10 minutos", seconds=BANER_START_TTL)
-                        _LAST_FLAGS["m10"] = True        # ← sincroniza flag
-                        _LAST_TJ_EVENT_TS = time.time()
-                    elif m5:
-                        log.info("Flash 5m recibido → mostrar banner 5")
-                        trigger_flash_banner("5", "Quedan 5 minutos", seconds=BANER_START_TTL)
-                        _LAST_FLAGS["m5"] = True
-                        _LAST_TJ_EVENT_TS = time.time()
+                    _LAST_TJ_EVENT_TS = _t.time()  # marca “acaba de llegar evento DB”
+
+                    # 1) ¿Es un aviso con “quedan X minutos/segundos”?
+                    secs = _parse_aviso_seconds(b.lower())
+                    if secs > 0:
+                        big = _secs_to_big_text(secs)
+                        sub = f"Quedan {_fmt_span(secs)}"
+                        log.info("Flash recibido → mostrar banner %s (%s)", big, sub)
+                        trigger_flash_banner(big, sub, seconds=BANER_START_TTL)
+
+                        # 2) Sube flags para anular fallback (siempre que el umbral coincida)
+                        #    y abre una ventana de supresión para ese umbral (anti-eco).
+                        try:
+                            if abs(secs - _AVISO1_SEC) <= 2:
+                                _LAST_FLAGS["m10"] = True
+                                _SUPPRESS_FLASH_UNTIL["av1"] = _t.time() + 90.0
+                            elif abs(secs - _AVISO2_SEC) <= 2:
+                                _LAST_FLAGS["m5"] = True
+                                _SUPPRESS_FLASH_UNTIL["av2"] = _t.time() + 90.0
+                        except Exception:
+                            pass
+
+                    # 3) Si es el mensaje del último minuto (o cualquier otro sin “secs”)
+                    #    no armamos flash aquí; el count-down vendrá por evento 'countdown start'
 
                 last_nt = rid
                 st_local["last_nt_id"] = last_nt
+
             if rows_nt:
                 save_state_local(st_local)
+
 
             # Marcar que YA hicimos primer poll
             _DB_POLL_SEEN = True
 
             # 2.5) Fallback SOLO si no hubo evento este tick, ya hubo poll y pasaron 3s
-            now_ts = time.time()
+            now_ts = _t.time()
             if (not saw_tiempo_event) and _DB_POLL_SEEN and (now_ts - _START_TS) > 3.0:
-                # evita “eco” si acabamos de procesar un NOTIFY
+                # evita eco si acabamos de procesar un NOTIFY
                 if (now_ts - _LAST_TJ_EVENT_TS) > 8.0:
                     _LAST_FLAGS = _flash_from_state_transitions(_LAST_FLAGS)
 
@@ -1360,7 +1445,7 @@ def main():
         except Exception as e:
             log.error("Error en loop principal: %s", e)
 
-        time.sleep(0.15)
+        _t.sleep(0.15)
 
 
 if __name__ == "__main__":

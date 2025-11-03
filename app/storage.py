@@ -80,6 +80,23 @@ LEGACY_DIRS = [
 # ==============================================================================
 # Defaults
 # ==============================================================================
+_DEFAULT_STATE: Dict = {
+    "play_until": 0,
+    "play_whitelist": [],
+    # Flag para indicar si el usuario ya aprobó aplicar reglas a nivel sistema
+    "applied": False,
+}
+
+# --- Defaults de alertas (configurables) ---
+_DEFAULT_ALERTS_CFG = {
+    "aviso1_sec": 600,        # antes "10 min"
+    "aviso2_sec": 300,        # antes "5 min"
+    "aviso3_sec": 60,         # último minuto (fijo por diseño)
+    "flash_ttl": 7,           # duración de banner de aviso (segundos)
+    "close_banner_ttl": 10,   # duración de "Cerrando juegos y aplicaciones"
+}
+
+
 _DEFAULT_CFG: Dict = {
     "parent_password_hash": "",
     # Por defecto NO aplicar nada:
@@ -100,15 +117,10 @@ _DEFAULT_CFG: Dict = {
     # Flag opcional por si la app quiere control explícito:
     "apply_on_start": False,
     "overlay": { "mode": "banner|fullscreen", "position": "top|bottom",
-                   "height": 160, "opacity": 0.92 }
+                   "height": 160, "opacity": 0.92 },
+    "alerts": _DEFAULT_ALERTS_CFG.copy(),
 }
 
-_DEFAULT_STATE: Dict = {
-    "play_until": 0,
-    "play_whitelist": [],
-    # Flag para indicar si el usuario ya aprobó aplicar reglas a nivel sistema
-    "applied": False,
-}
 
 def now_epoch() -> int:
     return int(time.time())
@@ -257,6 +269,10 @@ def load_config() -> dict:
 
     # Normalización de dominios (limpia http(s):// y slashes)
     cfg["blocked_domains"] = _norm_domain_list(cfg.get("blocked_domains", []))
+    
+    # Alerts (umbrales y TTLs)
+    cfg["alerts"] = _norm_alerts_cfg(cfg.get("alerts", {}))
+    
     return cfg
 
 
@@ -285,6 +301,39 @@ def load_state() -> dict:
 def save_state(st: dict):
     log.debug("Guardando estado (%s claves)", len(st))
     _atomic_write(STATE_PATH, st)
+    
+def get_alerts_cfg(cfg: dict | None = None) -> dict:
+    """
+    Devuelve los valores efectivos de alertas desde config.json,
+    con defaults y normalización aplicados.
+    """
+    if cfg is None:
+        cfg = load_config()
+    return _norm_alerts_cfg(cfg.get("alerts", {}))
+
+def update_alerts_cfg(mutator_or_dict) -> dict:
+    """
+    Actualiza solo la sección 'alerts' en config.json.
+    - Si pasas un dict, se fusiona y normaliza.
+    - Si pasas un callable, recibe el dict actual de alerts y debe mutarlo
+      o devolver uno nuevo. Luego se guarda.
+    Devuelve el alerts final persistido.
+    """
+    def _mut(cfg: dict):
+        curr = _norm_alerts_cfg(cfg.get("alerts", {}))
+        if callable(mutator_or_dict):
+            ret = mutator_or_dict(curr) or curr
+            cfg["alerts"] = _norm_alerts_cfg(ret)
+        else:
+            # fusión superficial
+            merged = dict(curr)
+            merged.update(mutator_or_dict or {})
+            cfg["alerts"] = _norm_alerts_cfg(merged)
+        return cfg
+
+    cfg = update_config(_mut)
+    return _norm_alerts_cfg(cfg.get("alerts", {}))
+
 
 # --- Normalizadores (para uso común en GUI/servicios) ---
 def _norm_list(xs):
@@ -303,6 +352,64 @@ def _norm_domain_list(xs):
         if x:
             out.append(x)
     return out
+
+def _parse_time_value(v, default: int) -> int:
+    """
+    Acepta int/float directamente (segundos) o str tipo "10m", "300s", "10".
+    Devuelve un entero >= 0; si no es válido, retorna default.
+    """
+    try:
+        if isinstance(v, (int, float)):
+            n = int(v)
+            return max(0, n)
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s.endswith("m"):
+                return max(0, int(float(s[:-1]) * 60))
+            if s.endswith("s"):
+                return max(0, int(float(s[:-1])))
+            return max(0, int(float(s)))
+    except Exception:
+        pass
+    return int(default)
+
+def _norm_alerts_cfg(alerts: dict | None) -> dict:
+    """
+    Devuelve un dict completo y consistente con claves:
+      aviso1_sec, aviso2_sec, aviso3_sec, flash_ttl, close_banner_ttl
+    - Forzamos aviso3 a 60 s (último minuto) por diseño.
+    - Garantizamos orden lógico: aviso1_sec >= aviso2_sec >= 60.
+    - Clampeamos a rangos razonables.
+    """
+    a = dict(_DEFAULT_ALERTS_CFG)
+    if isinstance(alerts, dict):
+        a["aviso1_sec"]       = _parse_time_value(alerts.get("aviso1_sec", a["aviso1_sec"]), a["aviso1_sec"])
+        a["aviso2_sec"]       = _parse_time_value(alerts.get("aviso2_sec", a["aviso2_sec"]), a["aviso2_sec"])
+        a["flash_ttl"]        = _parse_time_value(alerts.get("flash_ttl", a["flash_ttl"]), a["flash_ttl"])
+        a["close_banner_ttl"] = _parse_time_value(alerts.get("close_banner_ttl", a["close_banner_ttl"]), a["close_banner_ttl"])
+        # Si alguien configuró aviso3, lo ignoramos: es fijo (último minuto).
+        # Aun así, parseamos por cortesía y luego forzamos:
+        _ = _parse_time_value(alerts.get("aviso3_sec", a["aviso3_sec"]), a["aviso3_sec"])
+
+    # Forzar último minuto fijo
+    a["aviso3_sec"] = 60
+
+    # Clampeos razonables
+    # - avisos entre 60 s y 24 h (por si alguien quiere avisos raros),
+    # - ttl entre 1 y 60 s
+    a["aviso1_sec"] = min(max(a["aviso1_sec"], 60), 24*3600)
+    a["aviso2_sec"] = min(max(a["aviso2_sec"], 60), 24*3600)
+    a["flash_ttl"]  = min(max(a["flash_ttl"], 1), 60)
+    a["close_banner_ttl"] = min(max(a["close_banner_ttl"], 1), 60)
+
+    # Orden lógico: aviso1 ≥ aviso2 ≥ 60
+    if a["aviso2_sec"] > a["aviso1_sec"]:
+        a["aviso2_sec"] = a["aviso1_sec"]
+    if a["aviso2_sec"] < 60:
+        a["aviso2_sec"] = 60
+
+    return a
+
 
 # --- Updates transaccionales (evitan carreras entre hilos) ---
 def update_config(mutator):

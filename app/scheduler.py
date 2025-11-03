@@ -7,6 +7,8 @@
 from datetime import datetime, time as dtime, timedelta
 import os
 from typing import Dict, List, Tuple, Optional
+from app.storage import get_alerts_cfg
+
 
 from app.logs import get_logger
 log = get_logger("scheduler")
@@ -190,19 +192,23 @@ def remaining_play_seconds(state: dict, now: datetime, cfg: Optional[dict] = Non
             return rem, "schedule"
     return rem, None
 
+def _fmt_span(seconds: int) -> str:
+    """Devuelve 'X minutos' si es múltiplo de 60, si no 'Y segundos'."""
+    seconds = int(max(0, seconds))
+    if seconds % 60 == 0:
+        m = seconds // 60
+        return f"{m} minuto{'s' if m != 1 else ''}"
+    return f"{seconds} segundos"
+
+
 def check_playtime_alerts(state: dict, now: datetime, cfg: Optional[dict] = None) -> Tuple[List[str], int]:
-    """
-    Lanza avisos a 10/5/1 min y activa cuenta atrás (60→0) en el último minuto.
-    Prioridad:
-      1) Sesión manual (state['play_until'])
-      2) Tramo horario actual (si se provee cfg)
-    Devuelve (mensajes, countdown_segundos). No guarda a disco.
-    """
-    
     origin = (os.getenv("XH_ROLE") or "").lower()
-    
-    M10, M5, M1 = 10*60, 5*60, 60
-    MARGIN = 3  # margen anti-tick tardío para no perder 10:00/5:00
+    alerts = get_alerts_cfg(cfg)
+    A1 = int(alerts.get("aviso1_sec", 600))
+    A2 = int(alerts.get("aviso2_sec", 300))
+    A3 = int(alerts.get("aviso3_sec", 60))
+    MARGIN = 3
+    GRACE_START = 5
 
     log.debug("check_playtime_alerts: play_until=%s now=%s", state.get("play_until"), int(now.timestamp()))
 
@@ -211,7 +217,7 @@ def check_playtime_alerts(state: dict, now: datetime, cfg: Optional[dict] = None
 
     remaining, mode = remaining_play_seconds(state, now, cfg)
 
-    # Sin tiempo restante → reset
+    # Sin tiempo → reset duro
     if remaining <= 0:
         state["play_countdown"] = 0
         if state.get("play_alert_mode") in ("manual", "schedule"):
@@ -225,16 +231,51 @@ def check_playtime_alerts(state: dict, now: datetime, cfg: Optional[dict] = None
         log.debug("Alertas desactivadas por configuración")
         return messages, 0
 
-    # --- Cambio de modo/sesión + siembra robusta por sesión ---
-    last_mode    = state.get("play_alert_mode")
-    last_until   = state.get("_alerts_last_until", 0)
+    # --- Detectar cambio de UMBRALES (para reseed robusto) ---
+    prev_rev = state.get("_alerts_rev")
+    alerts_rev = f"{A1}:{A2}:{A3}"
+    config_changed = (prev_rev != alerts_rev)
+    if config_changed:
+        state["_alerts_rev"] = alerts_rev
+
+    # --- Detectar transición de HORARIO permitido (NO→SÍ / SÍ→NO) ---
+    try:
+        allowed_now = is_play_allowed(cfg, state, now)
+    except Exception:
+        allowed_now = (remaining > 0)  # fallback razonable
+
+    allowed_prev = state.get("_alerts_allowed_prev")
+    state["_alerts_allowed_prev"] = allowed_now  # persistimos el último visto
+
+    # --- Cambio de 'sesión' (manual/schedule) según estado previo ---
+    last_mode     = state.get("play_alert_mode")
+    last_until    = state.get("_alerts_last_until", 0)
     current_until = int(state.get("play_until") or 0)
+
+    changed_session = (last_mode != mode) or (last_until != current_until)
+
+    # Si el horario pasa de NO permitido → SÍ permitido, tratar como inicio de sesión
+    if (allowed_prev is not None) and allowed_now and (not allowed_prev):
+        changed_session = True
+        # Token de semilla para este “arranque por horario”
+        state["_alerts_seeded_for_until"] = int(now.timestamp())
+
+    # Si el horario pasa de SÍ → NO, hacemos un reset (por si no entró por remaining<=0)
+    if (allowed_prev is not None) and (not allowed_now) and allowed_prev:
+        pa["m10"] = pa["m5"] = pa["m1"] = False
+        pa["countdown_started"] = False
+        state["play_countdown"] = 0
+        state["play_alert_mode"] = None
+        log.debug("Horario desactivado → reset flags")
+        return messages, 0
 
     SEED_KEY = "_alerts_seeded_for_until"
     seeded_for = state.get(SEED_KEY)
+    # Nota: para horario usamos el timestamp del “arranque por horario” como token,
+    # para manual seguimos usando play_until.
+    seed_token = current_until if mode == "manual" else state.get(SEED_KEY, 0)
 
-    changed_session = (last_mode != mode) or (last_until != current_until)
-    need_seed = changed_session or (seeded_for != current_until)
+    need_seed = changed_session or (seeded_for != seed_token) or config_changed
 
     if changed_session:
         pa["m10"] = pa["m5"] = pa["m1"] = False
@@ -244,50 +285,62 @@ def check_playtime_alerts(state: dict, now: datetime, cfg: Optional[dict] = None
         log.debug("Reset de flags: last_mode=%s new_mode=%s", last_mode, mode)
 
     if need_seed:
-        # IMPORTANTE: no queremos “matar” el aviso justo en 10:00 / 5:00.
-        # Solo sembramos si arrancas claramente por debajo del umbral.
-        if remaining < (M10 - MARGIN):
+        # Sembrar segun dónde arrancamos respecto a los umbrales actuales
+        if remaining < (A1 - MARGIN):
             pa["m10"] = True
-        if remaining < (M5 - MARGIN):
+        else:
+            if config_changed:
+                pa["m10"] = False
+        if remaining < (A2 - MARGIN):
             pa["m5"] = True
-        # Para M1, no aplicamos margen: si arrancas en 59s, queremos countdown.
-        if remaining < M1:
+        else:
+            if config_changed:
+                pa["m5"] = False
+        if remaining < A3:
             pa["m1"] = True
             pa["countdown_started"] = True
-        state[SEED_KEY] = current_until
-        log.debug("Seed aplicado para until=%s (remaining=%s)", current_until, remaining)
+
+        # Guardar token de seed:
+        state[SEED_KEY] = seed_token if mode == "manual" else int(now.timestamp())
+
+        log.debug("Seed aplicado (cfg_changed=%s, mode=%s, remaining=%s)", config_changed, mode, remaining)
+
+        # Ventana de gracia en el arranque (manual o por horario) y también al cambiar umbrales
+        if abs(remaining - A1) <= GRACE_START and not pa["m10"]:
+            pa["m10"] = True
+            messages.append(f"⏳ Quedan {_fmt_span(A1)} de juego.")
+            if origin == "guardian":
+                log.info("Aviso1 (ventana %ss) por %s", GRACE_START, "inicio" if changed_session else "cambio umbrales")
+            else:
+                log.debug("Aviso1 (ventana %ss) por %s", GRACE_START, "inicio" if changed_session else "cambio umbrales")
+                
+        if abs(remaining - A2) <= GRACE_START and not pa["m5"]:
+            pa["m5"] = True
+            messages.append(f"⏳ Quedan {_fmt_span(A2)} de juego.")
+            if origin == "guardian":
+                log.info("Aviso2 (ventana %ss) por %s", GRACE_START, "inicio" if changed_session else "cambio umbrales")
+            else:  
+                log.debug("Aviso2 (ventana %ss) por %s", GRACE_START, "inicio" if changed_session else "cambio umbrales")
 
     log.debug("Tiempo restante=%s mode=%s flags=%s", remaining, mode, pa)
 
-    # Umbrales: aquí mantenemos <= para disparar exactamente en 10:00 y 5:00
-    # 10 min
-    if remaining <= M10 and not pa["m10"]:
+    # --- Disparos normales por cruce de umbral ---
+    if remaining <= A1 and not pa["m10"]:
         pa["m10"] = True
-        messages.append("⏳ Quedan 10 minutos de juego.")
-        if origin == "guardian":
-            log.info("Emitido aviso de 10 minutos")
-        else:
-            log.debug("Emitido aviso de 10 minutos (vista GUI)")
+        messages.append(f"⏳ Quedan {_fmt_span(A1)} de juego.")
+        (log.info if origin == "guardian" else log.debug)("Emitido aviso1")
 
-    # 5 min
-    if remaining <= M5 and not pa["m5"]:
+    if remaining <= A2 and not pa["m5"]:
         pa["m5"] = True
-        messages.append("⏳ Quedan 5 minutos de juego.")
-        if origin == "guardian":
-            log.info("Emitido aviso de 5 minutos")
-        else:
-            log.debug("Emitido aviso de 5 minutos (vista GUI)")
+        messages.append(f"⏳ Quedan {_fmt_span(A2)} de juego.")
+        (log.info if origin == "guardian" else log.debug)("Emitido aviso2")
 
-    # 1 min
-    if remaining <= M1 and not pa["m1"]:
+    if remaining <= A3 and not pa["m1"]:
         pa["m1"] = True
         pa["countdown_started"] = True
         messages.append("⚠️ ¡Último minuto! Comienza la cuenta atrás.")
-        if origin == "guardian":
-            log.warning("Último minuto: inicia cuenta atrás")
-        else:
-            log.debug("Último minuto (vista GUI)")
-            
+        (log.warning if origin == "guardian" else log.debug)("Último minuto: inicia cuenta atrás")
+
     # Cuenta atrás visible (0..60)
     if pa.get("countdown_started", False):
         countdown = int(max(0, min(60, remaining)))
@@ -298,18 +351,26 @@ def check_playtime_alerts(state: dict, now: datetime, cfg: Optional[dict] = None
     state["play_countdown"] = 0
     return messages, 0
 
+
+
 # snapshot de solo lectura para la GUI
 def alerts_snapshot(state: dict, now: datetime, cfg: Optional[dict] = None) -> dict:
+    alerts = get_alerts_cfg(cfg)
+    A1 = int(alerts.get("aviso1_sec", 600))
+    A2 = int(alerts.get("aviso2_sec", 300))
+    A3 = int(alerts.get("aviso3_sec", 60))
+
     rem, mode = remaining_play_seconds(state, now, cfg)
     snap = {
         "remaining": int(rem),
         "mode": mode,
-        "m10": rem <= M10,
-        "m5":  rem <= M5,
-        "m1":  rem <= M1,
-        "countdown": int(max(0, min(60, rem))) if rem <= M1 else 0,
+        "m10": rem <= A1,
+        "m5":  rem <= A2,
+        "m1":  rem <= A3,
+        "countdown": int(max(0, min(60, rem))) if rem <= A3 else 0,
     }
     return snap
+
 
 # =========================
 # Helpers para OVERLAY
