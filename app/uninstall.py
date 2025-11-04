@@ -48,13 +48,11 @@ except Exception:
 # --- RUTAS / POLÍTICA NUEVA ---
 PROGRAM_FILES = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
 PROGRAM_DATA  = Path(os.environ.get("ProgramData",  r"C:\ProgramData"))
-LOCALAPPDATA  = Path(os.environ.get("LOCALAPPDATA", Path.home()))
 
 APP_NAME      = "XiaoHackParental"
 
 INSTALL_DIR   = Path(__file__).resolve().parent                     # %ProgramFiles%\XiaoHackParental
-DATA_DIR_SYS  = PROGRAM_DATA / APP_NAME                             # %ProgramData%\XiaoHackParental
-DATA_DIR_USER = LOCALAPPDATA / APP_NAME                             # %LOCALAPPDATA%\XiaoHackParental
+DATA_DIR_SYS  = PROGRAM_DATA / APP_NAME                             # %ProgramData%\XiaoHackParental        
 
 # Config “real” ahora vive en ProgramData:
 CONFIG_PATH   = DATA_DIR_SYS / "config.json"
@@ -140,9 +138,32 @@ def verify_pin_gui(cfg: dict) -> bool:
     return (not plain) or (pin == plain)
 
 def schtasks_stop_delete():
+    # 1) Intento directo sobre nombres conocidos (por compat)
     for t in TASKS:
         run(["schtasks", "/End", "/TN", t])
         run(["schtasks", "/Delete", "/TN", t, "/F"])
+
+    # 2) Barrido amplio con PowerShell: cualquier tarea que huela a XiaoHack,
+    # Guardian o Notifier (incluye nombres personalizados).
+    ps = r'''
+try {
+  $ts = Get-ScheduledTask | Where-Object {
+    $_.TaskName -like '*XiaoHack*' -or
+    $_.TaskPath -like '\XiaoHack*' -or
+    $_.TaskName -like '*Guardian*' -or
+    $_.TaskName -like '*Notifier*'
+  }
+  foreach ($t in $ts) {
+    try { Stop-ScheduledTask     -TaskName $t.TaskName -TaskPath $t.TaskPath -ErrorAction SilentlyContinue } catch {}
+    try { Unregister-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+  }
+  'OK'
+} catch { 'ERR' }
+'''
+    try:
+        run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps])
+    except Exception:
+        pass
 
 def safe_rmtree(path: Path, retries=8, delay=0.8) -> bool:
     if not path.exists():
@@ -351,31 +372,36 @@ def _write_post_cleanup_bat(install_path: str):
     Crea el BAT de post-limpieza que remata:
       - venv, uninstall.* y la carpeta de instalación
       - %ProgramData%\XiaoHackParental
-      - %LOCALAPPDATA%\XiaoHackParental
+    (NO borra LOCALAPPDATA)
     """
     post_bat = Path(tempfile.gettempdir()) / "xh_post_cleanup.bat"
     progdata = str(DATA_DIR_SYS)
-    localdat = str(DATA_DIR_USER)
     parent   = str(Path(install_path).parent)
     bat = f"""@echo off
-timeout /t 6 >nul
-rem -- eliminar venv y scripts restantes
-cd /d "{install_path}"
-rmdir /s /q venv
-del /f /q uninstall.py
-del /f /q uninstall.bat
-rem -- borrar datos del sistema y del usuario
-rmdir /s /q "{progdata}"
-rmdir /s /q "{localdat}"
-rem -- borrar carpeta de instalación
-cd /d "{parent}"
-rmdir /s /q "{install_path}"
+setlocal
+rem Espera breve a que el proceso Python se cierre del todo
+ping 127.0.0.1 -n 4 >nul
+
+rem -- eliminar venv y scripts restantes (si existen)
+cd /d "{install_path}" 2>nul
+rmdir /s /q "venv"         2>nul
+del /f /q "uninstall.py"   2>nul
+del /f /q "uninstall.bat"  2>nul
+
+rem -- borrar datos del sistema
+if exist "{progdata}" rmdir /s /q "{progdata}" 2>nul
+
+rem -- borrar carpeta de instalación (desde el padre)
+cd /d "{parent}" 2>nul
+rmdir /s /q "{install_path}" 2>nul
+exit /b 0
 """
     try:
         post_bat.write_text(bat, encoding="ascii")
     except Exception:
         pass
     return post_bat
+
 
 def delete_folder_two_phase(install_path: str):
     root_dir = Path(install_path)
@@ -416,7 +442,6 @@ def gui_main():
     frm.pack(fill="both", expand=True)
     ttk.Label(frm, text=f"Carpeta de instalación: {install_path}").pack(anchor="w", pady=(0, 6))
     ttk.Label(frm, text=f"Datos (sistema): {DATA_DIR_SYS}").pack(anchor="w")
-    ttk.Label(frm, text=f"Datos (usuario): {DATA_DIR_USER}").pack(anchor="w", pady=(0, 6))
 
     cols = ("PID", "Nombre", "Comando")
     tree = ttk.Treeview(frm, columns=cols, show="headings", height=11)
@@ -494,7 +519,7 @@ def gui_main():
     def on_close():
         try:
             if POST_BAT and Path(POST_BAT).exists():
-                subprocess.Popen(["cmd", "/c", str(POST_BAT)], creationflags=0x08000000)
+                subprocess.Popen(["cmd", "/c", f'"{POST_BAT}"'], creationflags=0x08000000)
         except Exception as e:
             log.warning("No se pudo ejecutar post-cleanup: %s", e)
         root.destroy()
@@ -575,7 +600,7 @@ def console_main():
     # post-cleanup
     post_bat = _write_post_cleanup_bat(install_path)
     try:
-        subprocess.Popen(['cmd', '/c', str(post_bat)], creationflags=0x08000000)
+        subprocess.Popen(['cmd', '/c', f'"{post_bat}"'], creationflags=0x08000000)
     except Exception:
         pass
 
