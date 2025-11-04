@@ -1,6 +1,6 @@
 ﻿{
-  "version": "2025.10.11",
+  "version": "2025.10.12",
   "channel": "stable",
   "notes_url": "https://tus-release-notes",
-  "min_installer": "2025.10.11"
+  "min_installer": "2025.10.12"
 }
