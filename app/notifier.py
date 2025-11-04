@@ -4,6 +4,8 @@
 # Toasters WinRT/winotify/win10toast + ExplorerWatch
 
 from __future__ import annotations
+import getpass
+import subprocess
 import app._bootstrap  # noqa: F401  # side-effects
 
 import os
@@ -88,6 +90,144 @@ _START_TS = 0.0
 _LAST_TJ_EVENT_TS = 0.0
 _COUNTDOWN_ACTIVE_UNTIL = 0.0
 _SUPPRESS_FLASH_UNTIL = {"av1": 0.0, "av2": 0.0} 
+
+# --------------------------------------------------------------------
+#  Auto-provision per-user (schtasks), mutex y espera de shell
+# --------------------------------------------------------------------
+
+TASK_XML = INSTALL_DIR / "assets" / "tasks" / "task_notifier_user.xml"
+RUN_NOTIFIER_BAT = INSTALL_DIR / "run_notifier.bat"
+
+def _task_name_for_user() -> str:
+    # Nombre legible y único por usuario (sin TaskPath para no requerir permisos extra)
+    u = os.getenv("USERNAME") or getpass.getuser() or "User"
+    return f"XiaoHack Notifier - {u}"
+
+def _schtasks_exists(name: str) -> bool:
+    try:
+        subprocess.check_output(
+            ["schtasks", "/Query", "/TN", name],
+            stderr=subprocess.STDOUT, creationflags=0x08000000  # CREATE_NO_WINDOW
+        )
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+def _schtasks_create_from_xml(name: str, xml_path: str) -> None:
+    subprocess.check_call(
+        ["schtasks", "/Create", "/TN", name, "/XML", xml_path, "/F"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=0x08000000
+    )
+
+def _schtasks_run(name: str) -> None:
+    try:
+        subprocess.check_call(
+            ["schtasks", "/Run", "/TN", name],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=0x08000000
+        )
+    except Exception:
+        pass  # no es crítico
+
+def _remove_bootstrap_shortcuts():
+    """
+    Quita el .lnk de Inicio (común y del usuario) si apunta a run_notifier.bat.
+    No es obligatorio gracias al mutex, pero así dejamos el sistema limpio.
+    """
+    candidates = [
+        Path(os.getenv("PROGRAMDATA", r"C:\ProgramData")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "StartUp",
+        Path(os.getenv("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup",
+    ]
+    names = ("XiaoHack Notifier.lnk", "XiaoHackParental Notifier.lnk", "XiaoHack Parental Notifier.lnk")
+    for folder in candidates:
+        for n in names:
+            p = folder / n
+            if not p.exists():
+                continue
+            try:
+                import win32com.client  # type: ignore
+                ws = win32com.client.Dispatch("WScript.Shell")
+                sc = ws.CreateShortcut(str(p))
+                target = (sc.TargetPath or "").lower()
+                if target.endswith("run_notifier.bat") or target.endswith("run_notifier.cmd"):
+                    try:
+                        p.unlink()
+                        log.info("Eliminado bootstrap .lnk: %s", p)
+                    except Exception:
+                        pass
+            except Exception:
+                # Si no podemos leer el .lnk, intentamos borrarlo igualmente
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+
+def _maybe_provision_task_and_exit():
+    """
+    Si NO existe la tarea per-user, la crea desde el XML y la lanza,
+    luego transfiere el control a Task Scheduler saliendo de este proceso (LNK).
+    Si ya existe, solo limpia el .lnk si es posible y continúa.
+    """
+    try:
+        if not TASK_XML.exists():
+            log.warning("No se encuentra XML per-user: %s", TASK_XML)
+            return
+        name = _task_name_for_user()
+        if not _schtasks_exists(name):
+            log.info("Creando tarea per-user del Notifier: %s", name)
+            _schtasks_create_from_xml(name, str(TASK_XML))
+            log.info("Lanzando tarea per-user del Notifier: %s", name)
+            _schtasks_run(name)
+            # dejamos ordenado: el programador llevará la ejecución
+            _remove_bootstrap_shortcuts()
+            log.info("Hand-off al Programador de tareas (saliendo del bootstrap).")
+            os._exit(0)  # ← transferir control a la instancia lanzada por la tarea
+        else:
+            # Si ya existe, intentamos limpiar el .lnk (no crítico)
+            _remove_bootstrap_shortcuts()
+    except Exception as e:
+        log.warning("Auto-provision per-user fallida (%s). Continuamos con bootstrap por .lnk.", e)
+
+def _wait_for_shell_ready(timeout=30) -> bool:
+    """
+    Espera a que el shell esté listo (barra de tareas presente).
+    Evita toasts tempranos perdidos y problemas con el overlay.
+    """
+    try:
+        import ctypes
+        FindWindow = ctypes.windll.user32.FindWindowW
+        t0 = _t.time()
+        while _t.time() - t0 < timeout:
+            if FindWindow("Shell_TrayWnd", None):
+                return True
+            _t.sleep(1.0)
+    except Exception:
+        pass
+    return False
+
+def _ensure_single_instance() -> bool:
+    """
+    Mutex por usuario para evitar doble instancia (coincidencia LNK + tarea).
+    Devuelve True si esta instancia es la única; False si ya hay otra (y debes salir).
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes as WT
+        name = f"Local\\XH_Notifier_{os.getenv('USERNAME') or getpass.getuser() or 'User'}"
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        CreateMutex = k32.CreateMutexW
+        CreateMutex.argtypes = [WT.LPVOID, WT.BOOL, WT.LPCWSTR]
+        CreateMutex.restype = WT.HANDLE
+        h = CreateMutex(None, False, name)
+        if not h:
+            return True  # no podemos asegurar nada; seguimos
+        existed = ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
+        if existed:
+            log.info("Otra instancia del Notifier ya está activa (mutex). Saliendo.")
+            return False
+    except Exception:
+        pass
+    return True
+
 
 # --------------------------------------------------------------------
 # Estado local del notifier
@@ -1304,14 +1444,18 @@ def _flash_current() -> tuple[str | None, str | None]:
             _FLASH["until"] = 0
     return None, None
 
-
-
-
 # --------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------
 def main():
     global _LAST_FLAGS, _DB_POLL_SEEN, _START_TS, _LAST_TJ_EVENT_TS
+    
+    # 0) Single-instance (evita doble arranque si coinciden .LNK y la tarea)
+    if not _ensure_single_instance():
+        return
+
+    # 0.5) Espera a que el shell esté listo para no perder toasts iniciales
+    _wait_for_shell_ready(30)
     
     try:
         import logging
@@ -1460,5 +1604,8 @@ if __name__ == "__main__":
         res = diagnose_notification_env(auto_fix=auto_fix)
         print(json.dumps(res, ensure_ascii=False))
         sys.exit(0)
+
+    # Auto-provisión per-user (si falta la tarea) y hand-off al Scheduler
+    _maybe_provision_task_and_exit()
 
     main()
