@@ -162,11 +162,6 @@ def _remove_bootstrap_shortcuts():
                     pass
 
 def _maybe_provision_task_and_exit():
-    """
-    Si NO existe la tarea per-user, la crea desde el XML y la lanza,
-    luego transfiere el control a Task Scheduler saliendo de este proceso (LNK).
-    Si ya existe, solo limpia el .lnk si es posible y continúa.
-    """
     try:
         if not TASK_XML.exists():
             log.warning("No se encuentra XML per-user: %s", TASK_XML)
@@ -177,13 +172,11 @@ def _maybe_provision_task_and_exit():
             _schtasks_create_from_xml(name, str(TASK_XML))
             log.info("Lanzando tarea per-user del Notifier: %s", name)
             _schtasks_run(name)
-            # dejamos ordenado: el programador llevará la ejecución
-            _remove_bootstrap_shortcuts()
-            log.info("Hand-off al Programador de tareas (saliendo del bootstrap).")
-            os._exit(0)  # ← transferir control a la instancia lanzada por la tarea
+            # ⛔️ NO borrar el .LNK común: otros usuarios aún lo necesitan
+            os._exit(0)  # hand-off a la instancia de la tarea
         else:
-            # Si ya existe, intentamos limpiar el .lnk (no crítico)
-            _remove_bootstrap_shortcuts()
+            # ya existe: no hagas limpieza global del .LNK común
+            pass
     except Exception as e:
         log.warning("Auto-provision per-user fallida (%s). Continuamos con bootstrap por .lnk.", e)
 
