@@ -11,8 +11,8 @@
     </LogonTrigger>
     <SessionStateChangeTrigger>
       <Enabled>true</Enabled>
-      <StateChange>SessionUnlock</StateChange>
       <Delay>PT5S</Delay>
+      <StateChange>SessionUnlock</StateChange>
     </SessionStateChangeTrigger>
   </Triggers>
   <Principals>

@@ -539,7 +539,7 @@ def main():
         ancestor_pids = set()
 
     # aplicar reglas sólo si el usuario lo ha aprobado (state.applied=True)
-    _applied_last = bool(st.get("applied", False))
+    _applied_last = bool(st.get("applied", True))
     if _applied_last:
         try:
             # aplicar con cfg efectiva (sin dominios si domains_enabled=False)
