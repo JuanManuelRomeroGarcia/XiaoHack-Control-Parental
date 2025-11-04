@@ -369,31 +369,38 @@ def kill_related(install_path: str, list_only=False):
 # ----------------------- borrado en dos fases ---------------------------------
 def _write_post_cleanup_bat(install_path: str):
     r"""
-    Crea el BAT de post-limpieza que remata:
-      - venv, uninstall.* y la carpeta de instalación
-      - %ProgramData%\XiaoHackParental
-    (NO borra LOCALAPPDATA)
+    Post-limpieza robusta y silenciosa:
+      - Se ejecuta desde %TEMP% (evita locks de CWD).
+      - Borra %ProgramData%\XiaoHackParental.
+      - Borra la carpeta de instalación completa.
+      - NO toca LOCALAPPDATA.
+      - Reintenta varias veces y no muestra mensajes.
     """
     post_bat = Path(tempfile.gettempdir()) / "xh_post_cleanup.bat"
-    progdata = str(DATA_DIR_SYS)
-    parent   = str(Path(install_path).parent)
+    progdata = str(DATA_DIR_SYS)         # C:\ProgramData\XiaoHackParental
+    install  = str(install_path)         # C:\Program Files\XiaoHackParental
+
     bat = f"""@echo off
-setlocal
-rem Espera breve a que el proceso Python se cierre del todo
-ping 127.0.0.1 -n 4 >nul
+setlocal enableextensions
+REM Ir a TEMP para no tener CWD en la carpeta a borrar
+pushd "%TEMP%" >nul 2>&1
 
-rem -- eliminar venv y scripts restantes (si existen)
-cd /d "{install_path}" 2>nul
-rmdir /s /q "venv"         2>nul
-del /f /q "uninstall.py"   2>nul
-del /f /q "uninstall.bat"  2>nul
+REM Esperar a que pythonw.exe termine del todo
+ping 127.0.0.1 -n 6 >nul
 
-rem -- borrar datos del sistema
-if exist "{progdata}" rmdir /s /q "{progdata}" 2>nul
+REM ---- ProgramData ----
+for /l %%i in (1,1,3) do (
+  if exist "{progdata}" rmdir /s /q "{progdata}" >nul 2>&1
+  if exist "{progdata}" ping 127.0.0.1 -n 2 >nul
+)
 
-rem -- borrar carpeta de instalación (desde el padre)
-cd /d "{parent}" 2>nul
-rmdir /s /q "{install_path}" 2>nul
+REM ---- Carpeta de instalación ----
+for /l %%i in (1,1,6) do (
+  if exist "{install}" rmdir /s /q "{install}" >nul 2>&1
+  if exist "{install}" ping 127.0.0.1 -n 2 >nul
+)
+
+popd >nul 2>&1
 exit /b 0
 """
     try:
@@ -401,6 +408,7 @@ exit /b 0
     except Exception:
         pass
     return post_bat
+
 
 
 def delete_folder_two_phase(install_path: str):
