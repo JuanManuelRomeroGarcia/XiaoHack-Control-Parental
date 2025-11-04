@@ -128,57 +128,27 @@ def _schtasks_run(name: str) -> None:
     except Exception:
         pass  # no es crítico
 
-def _remove_bootstrap_shortcuts():
-    """
-    Quita el .lnk de Inicio (común y del usuario) si apunta a run_notifier.bat.
-    No es obligatorio gracias al mutex, pero así dejamos el sistema limpio.
-    """
-    candidates = [
-        Path(os.getenv("PROGRAMDATA", r"C:\ProgramData")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "StartUp",
-        Path(os.getenv("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup",
-    ]
-    names = ("XiaoHack Notifier.lnk", "XiaoHackParental Notifier.lnk", "XiaoHack Parental Notifier.lnk")
-    for folder in candidates:
-        for n in names:
-            p = folder / n
-            if not p.exists():
-                continue
-            try:
-                import win32com.client  # type: ignore
-                ws = win32com.client.Dispatch("WScript.Shell")
-                sc = ws.CreateShortcut(str(p))
-                target = (sc.TargetPath or "").lower()
-                if target.endswith("run_notifier.bat") or target.endswith("run_notifier.cmd"):
-                    try:
-                        p.unlink()
-                        log.info("Eliminado bootstrap .lnk: %s", p)
-                    except Exception:
-                        pass
-            except Exception:
-                # Si no podemos leer el .lnk, intentamos borrarlo igualmente
-                try:
-                    p.unlink()
-                except Exception:
-                    pass
 
-def _maybe_provision_task_and_exit():
+def _maybe_provision_task_and_exit() -> bool:
+    """
+    Crea la tarea per-user si no existe y devuelve True si debemos salir
+    (handover al Programador). Si ya existe o hay error, devuelve False.
+    """
     try:
         if not TASK_XML.exists():
             log.warning("No se encuentra XML per-user: %s", TASK_XML)
-            return
+            return False
+
         name = _task_name_for_user()
         if not _schtasks_exists(name):
             log.info("Creando tarea per-user del Notifier: %s", name)
             _schtasks_create_from_xml(name, str(TASK_XML))
-            log.info("Lanzando tarea per-user del Notifier: %s", name)
-            _schtasks_run(name)
-            # ⛔️ NO borrar el .LNK común: otros usuarios aún lo necesitan
-            os._exit(0)  # hand-off a la instancia de la tarea
-        else:
-            # ya existe: no hagas limpieza global del .LNK común
-            pass
+            log.info("Tarea creada. Handover al Programador (no ejecuto).")
+            return True  # el caller debe salir para evitar dobles
     except Exception as e:
-        log.warning("Auto-provision per-user fallida (%s). Continuamos con bootstrap por .lnk.", e)
+        log.warning("Auto-provision per-user fallida (%s). Continuamos.", e)
+
+    return False
 
 def _wait_for_shell_ready(timeout=30) -> bool:
     """
@@ -357,6 +327,43 @@ def _flash_from_state_transitions(last_flags: dict) -> dict:
     except Exception as e:
         log.debug("fallback flash por state: %s", e)
         return last_flags
+
+def _log_overlay_and_alerts():
+    """Registra configuración de overlay y umbrales de avisos."""
+    # Asegura que tenemos valores actualizados desde config.json
+    _refresh_alerts_cfg()
+    mode, pos, height, opacity = _overlay_settings()
+    log.info("overlay cfg: mode=%s position=%s height=%spx opacity=%.2f",
+             mode, pos, height, opacity)
+    log.info("alerts cfg: aviso1=%ss aviso2=%ss aviso3=%ss flash_ttl=%ss close_banner_ttl=%ss",
+             _AVISO1_SEC, _AVISO2_SEC, _AVISO3_SEC, BANER_START_TTL, CLOSE_BANNER_TTL)
+
+def _log_task_introspection():
+    """Registra estado del XML y la tarea per-user."""
+    try:
+        tn = _task_name_for_user()
+        log.info("task xml: %s (exists=%s)", TASK_XML, TASK_XML.exists())
+        log.info("task name: %s (exists=%s)", tn, _schtasks_exists(tn))
+    except Exception as e:
+        log.debug("task introspection error: %s", e)
+
+def _log_startup_banner():
+    """Banner de arranque, similar al del Guardian."""
+    try:
+        import psutil  # opcional; si no está instalado, seguimos
+        ppid = psutil.Process().ppid()
+    except Exception:
+        ppid = 0
+
+    log.info("Notifier START pid=%s user=%s ppid=%s", os.getpid(), (getpass.getuser() or "?"), ppid)
+    log.info("install_dir=%s", INSTALL_DIR)
+    log.info("assets_dir=%s", ASSETS_DIR)
+    log.info("data_dir forced=%s → effective=%s", DATA_DIR_FORCED, _storage_data_dir())
+    _log_task_introspection()
+    _log_overlay_and_alerts()
+
+def _log_shell_ready(waited: bool):
+    log.info("shell ready: %s", "yes" if waited else "timeout/no-shell")
 
 
 
@@ -1446,9 +1453,13 @@ def main():
     # 0) Single-instance (evita doble arranque si coinciden .LNK y la tarea)
     if not _ensure_single_instance():
         return
+    
+    if _maybe_provision_task_and_exit():
+        return
 
     # 0.5) Espera a que el shell esté listo para no perder toasts iniciales
-    _wait_for_shell_ready(30)
+    waited = _wait_for_shell_ready(30)
+    _log_shell_ready(waited) 
     
     try:
         import logging
