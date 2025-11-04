@@ -51,7 +51,7 @@ def _get_env_flag(name: str) -> bool:
 
 
 def _resolve_data_dir() -> Path:
-    """
+    r"""
     Determina el directorio base de datos/logs para la app.
     Prioridad:
       0) _OVERRIDE_DATA_DIR (si se llamó set_data_dir)
@@ -153,7 +153,7 @@ def get_logs_dir() -> str:
 
 
 def _resolve_log_path() -> str:
-    """
+    r"""
     Devuelve la ruta del archivo de log asegurando que es escribible.
     Prioridad:
       0) ENV XIAOHACK_LOG_FILE (ruta absoluta)

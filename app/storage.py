@@ -35,7 +35,7 @@ log = get_logger("storage")
 # Selección de directorio de datos (fuente única: logs.get_data_dir)
 # ==============================================================================
 def _get_data_dir() -> Path:
-    """
+    r"""
     Devuelve la carpeta de datos activa de la app.
     Corrige el caso en que por error llegue ...\XiaoHackParental\logs.
     """
@@ -199,7 +199,7 @@ def _read_json(path: Path, default: Dict | list | None = None):
 # Migración inicial (una sola vez)
 # ==============================================================================
 def _migrate_if_needed():
-    """
+    r"""
     Si no existen config/state en DATA_DIR, intenta migrar desde ubicaciones legacy:
       - Directorio del código (instalaciones antiguas).
       - %AppData%\XiaoHackParental (builds previas).
