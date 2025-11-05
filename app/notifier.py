@@ -1461,6 +1461,14 @@ def main():
     waited = _wait_for_shell_ready(30)
     _log_shell_ready(waited) 
     
+    _log_startup_banner()  # rutas, tarea/XML, overlay y umbrales
+    env = diagnose_notification_env(auto_fix=True)
+    log.info("notify env: winrt=%s has_shortcut=%s toast_enabled=%s app_enabled=%s dnd=%s data_dir=%s",
+             env.get("winrt_available"), env.get("has_shortcut"),
+             env.get("toast_enabled"),   env.get("app_enabled"),
+             env.get("quiet_hours_active"), env.get("data_dir"))
+    
+    
     try:
         import logging
         logging.getLogger().debug("XiaoHack process started (role=%s)", XH_ROLE)
@@ -1608,8 +1616,5 @@ if __name__ == "__main__":
         res = diagnose_notification_env(auto_fix=auto_fix)
         print(json.dumps(res, ensure_ascii=False))
         sys.exit(0)
-
-    # Auto-provisión per-user (si falta la tarea) y hand-off al Scheduler
-    _maybe_provision_task_and_exit()
 
     main()

@@ -336,71 +336,40 @@ def run_updater_apply_ui() -> None:
         messagebox.showinfo("Actualización", "Podrás abrir el Panel más tarde desde el acceso directo.")
 
 
-
-# ---------------------------------------------------------------------------
-# Uninstaller
-# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Uninstaller (rutas nuevas y fallback)
 # ---------------------------------------------------------------------------
 def launch_uninstaller_ui() -> None:
-    r"""
-    Lanza el desinstalador con prioridad:
-      1) uninstall.bat en la carpeta de instalación (sin consola)
-      2) venv\pythonw.exe -m app.uninstall (fallback moderno)
-      3) venv\pythonw.exe app\uninstall.py (fallback legacy)
+    """
+    Lanza el desinstalador priorizando pythonw -m app.uninstall (sin consola, con UAC dentro).
+    Fallback: uninstall.bat si existe.
     """
     base = find_install_root()
-
-    # 1) Preferimos el BAT creado por el instalador (evita consolas y lleva su lógica propia)
-    bat = base / "uninstall.bat"
-    if bat.exists():
-        try:
-            comspec = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
-            subprocess.Popen([comspec, "/c", "start", "", str(bat)],
-                             cwd=str(base),
-                             creationflags=0x08000000)  # CREATE_NO_WINDOW
-            return
-        except Exception as e:
-            messagebox.showerror("Desinstalar", f"No se pudo ejecutar uninstall.bat:\n{e}")
-            return
-
-    # 2) app\uninstall.py como módulo
-    pyw = Path(python_for_windowed())
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
 
-    uni_mod_cmd = [str(pyw), "-m", "app.uninstall"]
-    uni_file = base / "app" / "uninstall.py"
-    if uni_file.exists():
-        try:
-            subprocess.Popen(uni_mod_cmd, cwd=str(base), env=env,
-                             creationflags=0x08000000)
-            return
-        except Exception as e:
-            messagebox.showerror("Desinstalar", f"No se pudo iniciar el desinstalador:\n{e}")
-            return
+    try:
+        pyw = Path(python_for_windowed())
+    except Exception:
+        pyw = None
 
-    # 3) Último recurso: raíz legacy
-    uni_legacy = base / "uninstall.py"
-    if uni_legacy.exists():
-        try:
-            subprocess.Popen([str(pyw), str(uni_legacy)], cwd=str(base), env=env,
-                             creationflags=0x08000000)
-            return
-        except Exception as e:
-            messagebox.showerror("Desinstalar", f"No se pudo iniciar el desinstalador (legacy):\n{e}")
-            return
+    # 1) Preferir pythonw -m app.uninstall (silencioso, GUI)
+    if pyw and pyw.exists():
+        subprocess.Popen([str(pyw), "-m", "app.uninstall"],
+                         cwd=str(base), env=env, creationflags=0x08000000)
+        return
 
-    # Si llegamos aquí, no hay desinstalador en la instalación actual
-    messagebox.showerror(
-        "Desinstalar",
-        "No se encontró el desinstalador.\n"
-        f"Buscado en:\n  {bat}\n  {uni_file}\n  {uni_legacy}\n\n"
-        "Reinstala con el instalador actual y vuelve a intentarlo."
-    )
+    # 2) Fallback: uninstall.bat (con start para no dejar consola)
+    bat = base / "uninstall.bat"
+    if bat.exists():
+        comspec = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
+        subprocess.Popen([comspec, "/c", "start", "", f'"{bat}"'],
+                         cwd=str(base), creationflags=0x08000000)
+        return
 
+    messagebox.showerror("Desinstalar",
+                         "No se encontró el desinstalador.\nReinstala con el instalador actual y vuelve a intentarlo.")
 
 
 # ---------------------------------------------------------------------------
