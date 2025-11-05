@@ -497,11 +497,12 @@ def kill_related(install_path: str, list_only=False):
 
 def _write_post_cleanup_bat(install_path: str):
     """
-    Fase 2 desde %TEMP%:
-      - Mata cualquier proceso cuyo ExecutablePath/CommandLine apunte a la instalación.
-      - Quita atributos, toma propiedad, da permisos a Administrators.
-      - Borrado con PowerShell (Remove-Item) + rmdir, con reintentos.
-      - Si aún queda, agenda una tarea ONSTART con SYSTEM para borrarlo al arrancar.
+    Fase 2 desde %TEMP% con reintentos y fixes de parser:
+      - Mata procesos que usen la ruta de instalación.
+      - Quita atributos, takeown/icacls (ACE entrecomillado para (OI)(CI)).
+      - Borra ficheros que suelen bloquear (guardian.db*, control.log, uninstall*).
+      - Remove-Item + rmdir con reintentos (sin comas en for).
+      - Si aún queda, agenda limpieza al arranque (SYSTEM).
     """
     post_bat = Path(tempfile.gettempdir()) / "xh_post_cleanup.bat"
     progdata = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "XiaoHackParental")
@@ -511,43 +512,114 @@ def _write_post_cleanup_bat(install_path: str):
 setlocal enableextensions
 pushd "%TEMP%" >nul 2>&1
 
-rem --- Mata procesos que apunten a la ruta de instalación (por si algo quedó) ---
+rem --- mata procesos colgados que apunten a la instalación ---
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$b='{install}'.ToLower(); Get-CimInstance Win32_Process | ?{{ (($_.ExecutablePath+'') -and $_.ExecutablePath.ToLower().StartsWith($b)) -or (($_.CommandLine+'').ToLower().Contains($b)) }} | %%{{ try {{ Stop-Process -Id $_.ProcessId -Force }} catch {{}} }}" >nul 2>&1
 ping 127.0.0.1 -n 3 >nul
 
 set "SIDADM=S-1-5-32-544"
 
-call :DELONE "{progdata}"
-call :DELONE "{install}"
+for %%D in ("{progdata}" "{install}") do call :CLEAN "%%~fD"
 goto :EOF
 
-:DELONE
+:CLEAN
 set "_TARGET=%~1"
 if not exist "%_TARGET%" exit /b 0
 
+rem quitar atributos
 attrib -r -s -h "%_TARGET%\\*" /s /d >nul 2>&1
-for /l %%i in (1,1,8) do (
+
+rem reintentos de borrado con takeown/icacls + delete de ficheros duros
+for /l %%i in (1 1 8) do (
   if exist "%_TARGET%" (
     takeown /f "%_TARGET%" /r /d y >nul 2>&1
-    icacls "%_TARGET%" /grant *%SIDADM%:(OI)(CI)F /t /c /q >nul 2>&1
+    icacls "%_TARGET%" /grant "*%SIDADM%:(OI)(CI)F" /t /c /q >nul 2>&1
+
+    rem ficheros que suelen bloquear
+    del /f /q "%_TARGET%\\guardian.db"       >nul 2>&1
+    del /f /q "%_TARGET%\\guardian.db-wal"   >nul 2>&1
+    del /f /q "%_TARGET%\\guardian.db-shm"   >nul 2>&1
+    del /f /q "%_TARGET%\\logs\\control.log" >nul 2>&1
+    del /f /q "%_TARGET%\\uninstall*"        >nul 2>&1
+
     powershell -NoProfile -ExecutionPolicy Bypass -Command "Remove-Item -LiteralPath '%_TARGET%' -Recurse -Force -ErrorAction SilentlyContinue" >nul 2>&1
     rmdir /s /q "%_TARGET%" >nul 2>&1
     if exist "%_TARGET%" ping 127.0.0.1 -n 2 >nul
   )
 )
 
+rem último recurso: agenda limpieza al arranque (SYSTEM)
 if exist "%_TARGET%" (
-  rem último recurso: agenda borrado al arrancar con SYSTEM
   powershell -NoProfile -ExecutionPolicy Bypass -Command "$act=New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/c rmdir /s /q \"{progdata}\" & rmdir /s /q \"{install}\"'; $trg=New-ScheduledTaskTrigger -AtStartup; Register-ScheduledTask -TaskName 'XiaoHack_FinalCleanup' -Action $act -Trigger $trg -RunLevel Highest -Force -User 'SYSTEM' | Out-Null" >nul 2>&1
 )
 exit /b 0
 """
     try:
-        post_bat.write_text(bat, encoding="ascii")
+        post_bat.write_text(bat, encoding="ascii", newline="\r\n")
     except Exception:
         pass
     return post_bat
 
+
+
+def _launch_post_cleanup(post_bat_path: str, install_path: str):
+    """
+    Lanza el BAT si tiene contenido; si está vacío o no existe, ejecuta un fallback PowerShell inline
+    con la misma lógica (matar procesos, permisos, borrar ficheros duros, reintentos y tarea al arranque).
+    """
+    try:
+        p = Path(post_bat_path)
+        sz = p.stat().st_size if p.exists() else 0
+    except Exception:
+        sz = 0
+
+    if sz >= 32:
+        try:
+            subprocess.Popen(["cmd", "/c", f'"{post_bat_path}"'], creationflags=0x08000000)
+            return
+        except Exception as e:
+            log.warning("No se pudo ejecutar post-cleanup .bat: %s", e)
+
+    # Fallback: PowerShell inline (equivalente al BAT)
+    progdata = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "XiaoHackParental")
+    install  = str(install_path)
+    ps = rf'''
+$b = "{install}".ToLower()
+try {{
+  Get-CimInstance Win32_Process | ?{{ (($_.ExecutablePath+'') -and $_.ExecutablePath.ToLower().StartsWith($b)) -or (($_.CommandLine+'').ToLower().Contains($b)) }} |
+    %%{{ try {{ Stop-Process -Id $_.ProcessId -Force }} catch {{}} }}
+}} catch {{}}
+$paths = @("{progdata}","{install}")
+foreach ($t in $paths) {{
+  if (-not (Test-Path $t)) {{ continue }}
+  try {{ attrib -r -s -h "$t\*" /s /d }} catch {{}}
+  for ($i=0; $i -lt 8; $i++) {{
+    try {{ takeown /f "$t" /r /d y | Out-Null }} catch {{}}
+    try {{ icacls "$t" /grant "*S-1-5-32-544:(OI)(CI)F" /t /c /q | Out-Null }} catch {{}}
+    # ficheros duros
+    foreach ($f in @("guardian.db","guardian.db-wal","guardian.db-shm","logs\\control.log")) {{
+      try {{ Remove-Item -LiteralPath (Join-Path $t $f) -Force -ErrorAction SilentlyContinue }} catch {{}}
+    }}
+    try {{ Remove-Item -LiteralPath $t -Recurse -Force -ErrorAction SilentlyContinue }} catch {{}}
+    if (Test-Path $t) {{ Start-Sleep -Milliseconds 800 }} else {{ break }}
+  }}
+  if (Test-Path $t) {{
+    # último recurso: tarea al arranque con SYSTEM
+    try {{
+      $arg = "/c rmdir /s /q ""{progdata}"" & rmdir /s /q ""{install}"""
+      $act = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $arg
+      $trg = New-ScheduledTaskTrigger -AtStartup
+      Register-ScheduledTask -TaskName "XiaoHack_FinalCleanup" -Action $act -Trigger $trg -RunLevel Highest -Force -User "SYSTEM" | Out-Null
+    }} catch {{}}
+  }}
+}}
+'''
+    try:
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", ps],
+            creationflags=0x08000000
+        )
+    except Exception as e:
+        log.error("Fallback PS inline también falló: %s", e)
 
 
 def delete_folder_two_phase(install_path: str):
@@ -694,7 +766,7 @@ def gui_main():
 
         # Lanzar ya el post-bat y cerrar (el BAT espera unos segundos y borra todo)
         try:
-            subprocess.Popen(["cmd", "/c", f'"{POST_BAT}"'], creationflags=0x08000000)
+            _launch_post_cleanup(POST_BAT, install_path)
         except Exception as e:
             log.warning("No se pudo ejecutar post-cleanup: %s", e)
         # Cerrar la GUI tras un breve margen
@@ -704,7 +776,7 @@ def gui_main():
         # Si por lo que sea no se lanzó aún el bat, lánzalo aquí
         try:
             if POST_BAT and Path(POST_BAT).exists():
-                subprocess.Popen(["cmd", "/c", f'"{POST_BAT}"'], creationflags=0x08000000)
+                _launch_post_cleanup(POST_BAT, install_path)
         except Exception as e:
             log.warning("No se pudo ejecutar post-cleanup en cierre: %s", e)
         root.destroy()
@@ -785,9 +857,9 @@ def console_main():
             pass
 
     # Fase 2: post-cleanup y salida
-    post_bat = _write_post_cleanup_bat(install_path)
+    POST_BAT = _write_post_cleanup_bat(install_path)
     try:
-        subprocess.Popen(['cmd', '/c', f'"{post_bat}"'], creationflags=0x08000000)
+        _launch_post_cleanup(POST_BAT, install_path)
     except Exception:
         pass
 
