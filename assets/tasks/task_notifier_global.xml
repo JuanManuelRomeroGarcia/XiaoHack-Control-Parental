@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>XiaoHack Notifier para todos los usuarios.</Description>
+    <URI>\XiaoHackParental\Notificador</URI>
+  </RegistrationInfo>
+
+  <Triggers>
+    <!-- Al iniciar sesión del usuario -->
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT60S</Delay>
+    </LogonTrigger>
+    <!-- Al desbloquear sesión -->
+    <SessionStateChangeTrigger>
+      <Enabled>true</Enabled>
+      <StateChange>SessionUnlock</StateChange>
+      <Delay>PT60S</Delay>
+    </SessionStateChangeTrigger>
+    <!-- Vigilancia: cada 5 min todo el día. Si ya está corriendo, se ignora. -->
+    <CalendarTrigger>
+      <StartBoundary>2000-01-01T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
+      <Repetition>
+        <Interval>PT5M</Interval>
+        <Duration>P1D</Duration>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </CalendarTrigger>
+  </Triggers>
+
+  <Principals>
+    <Principal id="Users">
+      <GroupId>S-1-5-32-545</GroupId>          <!-- Grupo "Users" -->
+      <LogonType>InteractiveToken</LogonType>  <!-- En la sesión interactiva -->
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>  <!-- sin límite -->
+    <AllowHardTerminate>false</AllowHardTerminate>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>  <!-- usa PT1M por compatibilidad -->
+      <Count>999</Count>
+    </RestartOnFailure>
+    <Hidden>true</Hidden> <!-- la oculta en la UI, suma fricción -->
+  </Settings>
+
+  <Actions Context="Users">
+    <Exec>
+      <Command>C:\Program Files\XiaoHackParental\run_notifier.bat</Command>
+      <WorkingDirectory>C:\Program Files\XiaoHackParental</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
