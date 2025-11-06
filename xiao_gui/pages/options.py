@@ -1,7 +1,6 @@
-# xiao_gui/pages/options.py — XiaoHack GUI: pestaña Opciones (limpia y consolidada)
+# xiao_gui/pages/options.py — XiaoHack GUI: pestaña Opciones (limpia y consolidada, Guardian SYSTEM + Notificador GLOBAL)
 from __future__ import annotations
 
-import getpass
 import json
 import os
 from pathlib import Path
@@ -43,13 +42,20 @@ from xiao_gui.services import (
     notifier_test_toast,
     run_updater_apply_ui,
     launch_uninstaller_ui,
-    query_task_state, start_service, stop_service,
+    start_service, stop_service,
     open_control_log,
     diagnose_notifications,
 )
 
 log = get_logger("gui.options")
 
+# --- Constantes locales ---
+CREATE_NO_WINDOW = 0x08000000
+TASK_PATH   = "\\XiaoHackParental\\"      # coincide con el instalador
+NOTIF_NAME  = "Notificador"
+GUARDIAN_NAME = "Guardian"
+NOTIF_TN    = TASK_PATH + NOTIF_NAME      # "\\XiaoHackParental\\Notificador"
+GUARDIAN_TN    = TASK_PATH + GUARDIAN_NAME
 
 # ---------------------------------------------------------------------------
 # utilidades locales
@@ -88,7 +94,6 @@ def _read_version_fallback() -> str:
     except Exception:
         pass
     return "0.0.0"
-
 
 
 # =====================================================================
@@ -145,26 +150,31 @@ class OptionsPage(ttk.Frame):
         row += 1
 
         # --- Servicio Guardian ---
-        ttk.Label(self, text="Servicio (tarea programada): XiaoHackParental\\Guardian").grid(row=row, column=0, sticky="w", **pad)
+        ttk.Label(self, text="Tarea Guardian (SYSTEM)").grid(row=row, column=0, sticky="w", **pad)
         row += 1
 
         self.var_srv = tk.StringVar(value="Estado: (desconocido)")
+        self.var_srv2 = tk.StringVar(value="")
         ttk.Label(self, textvariable=self.var_srv).grid(row=row, column=0, sticky="w", **pad)
         row += 1
+        ttk.Label(self, textvariable=self.var_srv2).grid(row=row, column=0, sticky="w", padx=6, pady=(0,6))
+        row += 1
+
 
         btns_srv = ttk.Frame(self)
         btns_srv.grid(row=row, column=0, sticky="w", **pad)
-        ttk.Button(btns_srv, text="Iniciar servicio", command=self._start_service).grid(row=0, column=0, padx=4)
-        ttk.Button(btns_srv, text="Detener servicio", command=self._stop_service).grid(row=0, column=1, padx=4)
-        ttk.Button(btns_srv, text="Reiniciar servicio", command=self._restart_guardian).grid(row=0, column=2, padx=4)
-        ttk.Button(btns_srv, text="Refrescar estado", command=self.refresh_service).grid(row=0, column=3, padx=4)
-        ttk.Button(btns_srv, text="Abrir Programador de tareas", command=self._open_task_scheduler).grid(row=0, column=4, padx=4)
+        ttk.Button(btns_srv, text="Recrear desde XML", command=self._recreate_guardian_task).grid(row=0, column=0, padx=4)
+        ttk.Button(btns_srv, text="Ejecutar ahora", command=self._start_service).grid(row=0, column=1, padx=4)
+        ttk.Button(btns_srv, text="Detener", command=self._stop_service).grid(row=0, column=2, padx=4)
+        ttk.Button(btns_srv, text="Rearmar (Detener+Ejecutar)", command=self._rearm_guardian).grid(row=0, column=3, padx=4)
+        ttk.Button(btns_srv, text="Refrescar", command=self.refresh_service).grid(row=0, column=4, padx=4)
+        ttk.Button(btns_srv, text="Abrir Programador de tareas", command=self._open_task_scheduler).grid(row=0, column=5, padx=4)
         row += 1
         
-        # --- Tarea Notifier (per-user; Task Scheduler) ---
+        # --- Tarea Notificador (GLOBAL) ---
         ttk.Separator(self).grid(row=row, column=0, sticky="ew", padx=6, pady=(10,6))
         row += 1
-        ttk.Label(self, text="Tarea Notifier (per-user)").grid(row=row, column=0, sticky="w", padx=6, pady=2)
+        ttk.Label(self, text="Tarea Notificador (global)").grid(row=row, column=0, sticky="w", padx=6, pady=2)
         row += 1
 
         self.var_notif_task = tk.StringVar(value="Tarea: (desconocido)")
@@ -179,9 +189,11 @@ class OptionsPage(ttk.Frame):
         ttk.Button(btns_nt_task, text="Recrear desde XML", command=self._recreate_notifier_task).grid(row=0, column=0, padx=4)
         ttk.Button(btns_nt_task, text="Ejecutar ahora", command=self._run_notifier_task).grid(row=0, column=1, padx=4)
         ttk.Button(btns_nt_task, text="Detener", command=self._end_notifier_task).grid(row=0, column=2, padx=4)
-        ttk.Button(btns_nt_task, text="Abrir Programador", command=self._open_task_scheduler).grid(row=0, column=3, padx=4)
+        ttk.Button(btns_nt_task, text="Rearmar (Detener+Ejecutar)", command=self._rearm_notifier_task).grid(row=0, column=3, padx=4)
+        ttk.Button(btns_nt_task, text="Abrir Programador de tareas", command=self._open_task_scheduler).grid(row=0, column=4, padx=4)
         row += 1
-         # --- Diagnóstico de notificaciones ---
+
+        # --- Diagnóstico de notificaciones ---
         row += 1
         diag_frm = ttk.Frame(self)
         diag_frm.grid(row=row, column=0, sticky="w", padx=6, pady=(0,6))
@@ -189,6 +201,7 @@ class OptionsPage(ttk.Frame):
         ttk.Checkbutton(diag_frm, text="Auto-arreglar si es posible", variable=self.var_diag_fix).grid(row=0, column=0, padx=(0,8))
         ttk.Button(diag_frm, text="Diagnosticar notificaciones", command=self._on_diag_notifs).grid(row=0, column=1)
         row += 1
+
         # --- Herramientas Notifier ---
         row += 1
         tools_frm = ttk.Frame(self)
@@ -253,25 +266,46 @@ class OptionsPage(ttk.Frame):
         submit_limited(self._task_refresh_service, rev)
 
     def _task_refresh_service(self, rev=None):
+        ps = (
+        f"$tn='{GUARDIAN_NAME}'; $tp='{TASK_PATH}';"
+        "try{ $t=Get-ScheduledTask -TaskName $tn -TaskPath $tp -ErrorAction Stop }"
+        "catch{ $t=$null };"
+        "if(-not $t){ $t=Get-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue | Select-Object -First 1 };"
+        "if(-not $t){'NX'} else { $i=$t|Get-ScheduledTaskInfo; "
+        "'{0}|{1}|{2}|{3}' -f $t.State, $i.LastRunTime, $i.NextRunTime, $i.LastTaskResult }"
+        )
         try:
-            st = query_task_state("guardian")
-            if isinstance(st, dict):
-                state = st.get("State") or st.get("Estado") or ("Running" if st.get("Exists") else "No instalada")
-            else:
-                state = str(st)
-            text = f"Estado: {state}"
+            proc = subprocess.run(
+                ["powershell","-NoProfile","-ExecutionPolicy","Bypass","-Command", ps],
+                capture_output=True, text=True, timeout=15, creationflags=CREATE_NO_WINDOW
+            )
+            out = (proc.stdout or "").strip()
         except Exception as e:
-            text = f"Estado: error ({type(e).__name__})"
-            log.error("Error leyendo estado servicio: %s", e, exc_info=True)
+            out = f"ERR|{type(e).__name__}|"
 
         def _apply():
-            if rev is not None and not self._gate.is_current(rev):
+            if rev is not None and not self._gate.is_current(rev): 
                 return
             if not self.winfo_exists():
                 return
-            self.var_srv.set(text)
-
+            title = f"Tarea: {GUARDIAN_TN}"
+            if out == "NX":
+                self.var_srv.set(f"{title} — (no existe)")
+                if hasattr(self, "var_srv2"):
+                    self.var_srv2.set("Usa el instalador para crearla.")
+                return
+            if out.startswith("ERR|"):
+                self.var_srv.set(f"{title} — (error)")
+                if hasattr(self, "var_srv2"):
+                    self.var_srv2.set(out)
+                return
+            st, last, nxt, code = (out.split("|", 3) + ["", "", "", ""])[:4]
+            self.var_srv.set(f"{title} — Estado: {st}")
+            if hasattr(self, "var_srv2"):
+                self.var_srv2.set(f"Última ejecución: {last}  •  Próxima: {nxt}  •  Código: {code}")
         after_safe(self, 0, _apply)
+
+
 
     def _start_service(self):
         log.info("Iniciando servicio…")
@@ -307,10 +341,45 @@ class OptionsPage(ttk.Frame):
             self.after(0, _post)
         submit_limited(_work)
 
-    def _restart_guardian(self):
-        log.info("Reiniciando servicio…")
-        self._stop_service()
-        self.after(900, self._start_service)
+    def _rearm_guardian(self):
+        ps = (
+            f"$tn='{GUARDIAN_NAME}'; $tp='{TASK_PATH}';"
+            "try{ Stop-ScheduledTask -TaskName $tn -TaskPath $tp -ErrorAction SilentlyContinue }catch{};"
+            "Start-Sleep -Milliseconds 300;"
+            "try{ Start-ScheduledTask -TaskName $tn -TaskPath $tp -ErrorAction Stop; 'OK' }catch{ 'ERR' }"
+        )
+        try:
+            cp = subprocess.run(
+                ["powershell","-NoProfile","-ExecutionPolicy","Bypass","-Command", ps],
+                capture_output=True, text=True, timeout=20, creationflags=CREATE_NO_WINDOW
+            )
+            ok = (cp.stdout or "").strip().endswith("OK")
+        except Exception:
+            ok = False
+        if ok:
+            self.after(900, self.refresh_service)
+            messagebox.showinfo("OK", "Rearmado: detenido y vuelto a iniciar.")
+        else:
+            messagebox.showerror("Error", "No se pudo rearmar la tarea.")
+            self.after(200, self.refresh_service)
+            
+    def _recreate_guardian_task(self):
+        root = find_install_root()
+        xml = Path(root) / "assets" / "tasks" / "task_guardian.xml"
+        if not xml.exists():
+            messagebox.showerror("Guardian", f"Falta el XML:\n{xml}")
+            return
+        try:
+            subprocess.run(["schtasks","/Create","/TN", r"\XiaoHackParental\Guardian", "/XML", str(xml), "/F"],
+                        check=True, capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
+            subprocess.run(["schtasks","/Run","/TN", r"\XiaoHackParental\Guardian"],
+                        check=False, capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
+            messagebox.showinfo("Guardian", "Tarea creada/actualizada.")
+        except subprocess.CalledProcessError as e:
+            messagebox.showerror("Guardian", f"No se pudo crear la tarea:\n{e.stderr or e.stdout or e}")
+        finally:
+            self.after(300, self.refresh_service)
+
 
     def _open_task_scheduler(self):
         _open_task_scheduler_local()
@@ -321,6 +390,101 @@ class OptionsPage(ttk.Frame):
         except Exception:
             messagebox.showerror("Error", "No se pudo abrir el control.log")
 
+    # ---------------- Notificador (GLOBAL) ----------------
+    def refresh_notifier_task_info(self):
+        """Consulta la tarea GLOBAL vía PowerShell y actualiza etiquetas."""
+        rev = self._gate.next_rev()
+        def _work():
+            ps = (
+                f"$tn='{NOTIF_NAME}'; $tp='{TASK_PATH}';"
+                "try{ $t=Get-ScheduledTask -TaskName $tn -TaskPath $tp -ErrorAction Stop;"
+                "     $i=$t|Get-ScheduledTaskInfo;"
+                "     '{0}|{1}|{2}' -f $t.State, $i.LastRunTime, $i.LastTaskResult }"
+                "catch{ 'NX' }"
+            )
+            try:
+                proc = subprocess.run(
+                    ["powershell","-NoProfile","-ExecutionPolicy","Bypass","-Command", ps],
+                    capture_output=True, text=True, timeout=15, creationflags=CREATE_NO_WINDOW
+                )
+                out = (proc.stdout or "").strip()
+            except Exception as e:
+                out = f"ERR|{type(e).__name__}|"
+
+            def _ui():
+                if not self._gate.is_current(rev) or not self.winfo_exists():
+                    return
+                title = f"Tarea: {NOTIF_TN}"
+                if out == "NX":
+                    self.var_notif_task.set(f"{title} — (no existe)")
+                    self.var_notif_task2.set("Pulsa «Recrear desde XML».")
+                    return
+                if out.startswith("ERR|"):
+                    self.var_notif_task.set(f"{title} — (error)")
+                    self.var_notif_task2.set(out)
+                    return
+                parts = out.split("|", 2)
+                state = parts[0] if len(parts) > 0 else "?"
+                last  = parts[1] if len(parts) > 1 else "?"
+                code  = parts[2] if len(parts) > 2 else "?"
+                self.var_notif_task.set(f"{title} — Estado: {state}")
+                self.var_notif_task2.set(f"Última ejecución: {last}  •  Código: {code}")
+            self.after(0, _ui)
+        submit_limited(_work)
+
+    def _recreate_notifier_task(self):
+        """Crea/actualiza la tarea GLOBAL desde el XML del paquete y la ejecuta una vez."""
+        root = find_install_root()
+        xml = Path(root) / "assets" / "tasks" / "task_notifier_global.xml"
+        if not xml.exists():
+            messagebox.showerror("Notificador", f"Falta el XML:\n{xml}")
+            return
+        try:
+            subprocess.run(["schtasks","/Create","/TN", NOTIF_TN, "/XML", str(xml), "/F"],
+                           check=True, capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
+            subprocess.run(["schtasks","/Run","/TN", NOTIF_TN],
+                           check=False, capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
+            messagebox.showinfo("Notificador", "Tarea creada/actualizada.")
+        except subprocess.CalledProcessError as e:
+            messagebox.showerror("Notificador", f"No se pudo crear la tarea:\n{e.stderr or e.stdout or e}")
+        finally:
+            self.after(300, self.refresh_notifier_task_info)
+
+    def _run_notifier_task(self):
+        try:
+            subprocess.run(["schtasks","/Run","/TN", NOTIF_TN],
+                           check=True, capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
+            self.after(800, self.refresh_notifier_task_info)
+        except subprocess.CalledProcessError as e:
+            messagebox.showerror("Notificador", f"No se pudo ejecutar la tarea:\n{e.stderr or e.stdout or e}")
+
+    def _end_notifier_task(self):
+        try:
+            subprocess.run(["schtasks","/End","/TN", NOTIF_TN],
+                           check=False, capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
+        finally:
+            self.after(600, self.refresh_notifier_task_info)
+
+    def _rearm_notifier_task(self):
+        ps = (
+            f"$tn='{NOTIF_NAME}'; $tp='{TASK_PATH}';"
+            "try{ Stop-ScheduledTask -TaskName $tn -TaskPath $tp -ErrorAction SilentlyContinue }catch{};"
+            "Start-Sleep -Milliseconds 300;"
+            "try{ Start-ScheduledTask -TaskName $tn -TaskPath $tp -ErrorAction Stop; 'OK' }catch{ 'ERR' }"
+        )
+        try:
+            cp = subprocess.run(["powershell","-NoProfile","-ExecutionPolicy","Bypass","-Command", ps],
+                                 capture_output=True, text=True, timeout=20, creationflags=CREATE_NO_WINDOW)
+            ok = (cp.stdout or "").strip().endswith("OK")
+        except Exception:
+            ok = False
+        if ok:
+            self.after(900, self.refresh_notifier_task_info)
+            messagebox.showinfo("Notificador", "Rearmado: detenido y vuelto a ejecutar.")
+        else:
+            messagebox.showerror("Notificador", "No se pudo rearmar la tarea.")
+            self.after(200, self.refresh_notifier_task_info)
+            
     # ---------------- Notifier ----------------
         
     def _on_diag_notifs(self):
@@ -365,7 +529,7 @@ class OptionsPage(ttk.Frame):
 
                 advice = []
                 if not aumid_ok:
-                    advice.append("➤ Falta el acceso directo en Menú Inicio. Pulsa “Iniciar Notifier” para regenerarlo o reinicia Notifier.")
+                    advice.append("➤ Falta el acceso directo en Menú Inicio. Pulsa «Recrear desde XML» y luego «Ejecutar ahora».")
                 if toast_g == 0:
                     advice.append("➤ Las notificaciones globales están desactivadas. Actívalas en Configuración → Sistema → Notificaciones.")
                 if toast_app == 0:
@@ -423,91 +587,7 @@ class OptionsPage(ttk.Frame):
                 messagebox.showinfo("Regenerar AppID/atajo", "\n".join([s for s in lines if s]))
             self.after(0, ui)
         threading.Thread(target=work, daemon=True).start()
-
-    # =============== Gestión de tarea Notifier (per-user) =================
-
-    def _notifier_task_name(self) -> str:
-        u = os.getenv("USERNAME") or getpass.getuser() or "User"
-        return f"XiaoHack Notifier - {u}"
-
-    def refresh_notifier_task_info(self):
-        """Consulta la tarea per-user vía PowerShell y actualiza etiquetas."""
-        rev = self._gate.next_rev()
-        def _work():
-            name = self._notifier_task_name()
-            # PowerShell para obtener State, LastRunTime y LastTaskResult
-            ps = (
-                f"$n='{name}';"
-                "$t=Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue;"
-                "if(-not $t){'NX'}"
-                "else{ $s=$t.State; $i=$t|Get-ScheduledTaskInfo; "
-                "'{0}|{1}|{2}' -f $s, $i.LastRunTime, $i.LastTaskResult }"
-            )
-            try:
-                proc = subprocess.run(
-                    ["powershell","-NoProfile","-ExecutionPolicy","Bypass","-Command", ps],
-                    capture_output=True, text=True, timeout=15, creationflags=0x08000000
-                )
-                out = (proc.stdout or "").strip()
-            except Exception as e:
-                out = f"ERR|{type(e).__name__}|"
-
-            def _ui():
-                if not self._gate.is_current(rev) or not self.winfo_exists():
-                    return
-                name = self._notifier_task_name()
-                if out == "NX":
-                    self.var_notif_task.set(f"Tarea: {name} — (no existe)")
-                    self.var_notif_task2.set("Pulsa «Recrear desde XML».")
-                    return
-                if out.startswith("ERR|"):
-                    self.var_notif_task.set(f"Tarea: {name} — (error)")
-                    self.var_notif_task2.set(out)
-                    return
-                # Esperado: "State|LastRunTime|LastTaskResult"
-                parts = out.split("|", 2)
-                state = parts[0] if len(parts) > 0 else "?"
-                last  = parts[1] if len(parts) > 1 else "?"
-                code  = parts[2] if len(parts) > 2 else "?"
-                self.var_notif_task.set(f"Tarea: {name} — Estado: {state}")
-                self.var_notif_task2.set(f"Última ejecución: {last}  •  Código: {code}")
-            self.after(0, _ui)
-        submit_limited(_work)
-
-    def _recreate_notifier_task(self):
-        """Crea/actualiza la tarea per-user desde el XML del paquete."""
-        root = find_install_root()
-        xml = Path(root) / "assets" / "tasks" / "task_notifier_global.xml"
-        name = self._notifier_task_name()
-        if not xml.exists():
-            messagebox.showerror("Notifier", f"Falta el XML:\n{xml}")
-            return
-        try:
-            subprocess.run(["schtasks","/Create","/TN", name, "/XML", str(xml), "/F"],
-                           check=True, capture_output=True, text=True, creationflags=0x08000000)
-            messagebox.showinfo("Notifier", "Tarea creada/actualizada.")
-        except subprocess.CalledProcessError as e:
-            messagebox.showerror("Notifier", f"No se pudo crear la tarea:\n{e.stderr or e.stdout or e}")
-        finally:
-            self.after(300, self.refresh_notifier_task_info)
-
-    def _run_notifier_task(self):
-        name = self._notifier_task_name()
-        try:
-            subprocess.run(["schtasks","/Run","/TN", name],
-                           check=True, capture_output=True, text=True, creationflags=0x08000000)
-            self.after(800, self.refresh_notifier_task_info)
-        except subprocess.CalledProcessError as e:
-            messagebox.showerror("Notifier", f"No se pudo ejecutar la tarea:\n{e.stderr or e.stdout or e}")
-
-    def _end_notifier_task(self):
-        name = self._notifier_task_name()
-        try:
-            subprocess.run(["schtasks","/End","/TN", name],
-                           check=False, capture_output=True, text=True, creationflags=0x08000000)
-        finally:
-            self.after(600, self.refresh_notifier_task_info)
-
+    
 
     # ---------------- Actualizaciones ----------------
     def _set_upd_busy(self, busy: bool, msg: str | None = None):
@@ -556,7 +636,7 @@ class OptionsPage(ttk.Frame):
             proc = subprocess.run(
                 cmd, cwd=str(base), env=env,
                 capture_output=True, text=True, timeout=180,
-                creationflags=0x08000000  # oculta ventana
+                creationflags=CREATE_NO_WINDOW  # oculta ventana
             )
             out = (proc.stdout or "")
             err = (proc.stderr or "")
@@ -635,7 +715,6 @@ class OptionsPage(ttk.Frame):
 
     # ---------------- Desinstalar ----------------
     def _uninstall_from_app(self):
-        
         if messagebox.askyesno("Desinstalar", "¿Quieres abrir el desinstalador de XiaoHack?"):
             try:
                 launch_uninstaller_ui()
