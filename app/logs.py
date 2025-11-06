@@ -295,7 +295,7 @@ def _ensure_initialized(level: Optional[Union[int, str]] = None,
         base.addHandler(_CONSOLE_HANDLER)
 
     _INITIALIZED = True
-    base.info("Logger inicializado → %s", _LOG_FILE)
+    base.debug("Logger inicializado → %s", _LOG_FILE)
 
 
 def close_all() -> None:
@@ -444,7 +444,7 @@ def install_exception_hooks(logger_name: str = "crash") -> None:
     sys.excepthook = _excepthook
     if hasattr(threading, "excepthook"):
         threading.excepthook = _thread_excepthook  # type: ignore[attr-defined]
-    lg.info("exception-hooks-installed")
+    lg.debug("exception-hooks-installed")
 
 
 # ==============================================================================

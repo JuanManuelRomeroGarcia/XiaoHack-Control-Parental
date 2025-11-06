@@ -33,7 +33,7 @@ from app.logs import get_logger, install_exception_hooks
 from app.storage import (
     load_config, load_state, now_epoch,
     LOGS_DIR, save_state,
-    set_data_dir_forced as _storage_set_data_dir_forced,  # ⬅️ añadido
+    set_data_dir_forced as _storage_set_data_dir_forced,
 )
 from app.scheduler import check_playtime_alerts, remaining_play_seconds, is_within_allowed_hours
 
@@ -54,14 +54,6 @@ os.environ["XH_ROLE"] = XH_ROLE
 set_appusermodelid("XiaoHack.Parental.Guardian")
 set_process_title(XH_ROLE)
 
-# Log útil al arrancar (root)
-try:
-    import logging
-    logging.getLogger().info("XiaoHack process started (role=%s)", XH_ROLE)
-except Exception:
-    pass
-
-
 # =============================================================================
 # Config básica y logger
 # =============================================================================
@@ -70,13 +62,13 @@ DATA_DIR = LOGS_DIR.parent
 CONFIG_PATH = DATA_DIR / "config.json"
 PROTECT_SELF = False  # pon True si quieres blindar la carpeta de instalación
 
-# ⬇️ Forzar data dir único (ProgramData) respetando XH_DATA_DIR si viene del .bat
+# Forzar data dir único (ProgramData) respetando XH_DATA_DIR si viene en entorno
 try:
     _data_env = os.getenv("XH_DATA_DIR")
     if _data_env:
-        _storage_set_data_dir_forced(Path(_data_env))
+        _storage_set_data_dir_forced(str(Path(_data_env)))
     else:
-        _storage_set_data_dir_forced(Path(os.getenv("ProgramData", r"C:\ProgramData")) / "XiaoHackParental")
+        _storage_set_data_dir_forced(str(Path(os.getenv("ProgramData", r"C:\ProgramData")) / "XiaoHackParental"))
 except Exception:
     # no impedimos el arranque si falla el forzado
     pass
@@ -149,7 +141,6 @@ def _playtime_tick(cfg: dict, st: dict, now_sec: int, now_dt):
     - Persiste también cuando cambie countdown_started (ON/OFF).
     - Emite 'inicio/fin de horario' al cambiar la franja permitida.
     """
-    
     global _last_allowed_flag
     persisted = False
 
@@ -202,7 +193,6 @@ def _playtime_tick(cfg: dict, st: dict, now_sec: int, now_dt):
         reason = "expired" if rem_total <= 0 else "cancelled"
         _log_event("countdown", "stop", json.dumps({"reason": reason}))
         log.debug("Último minuto → OFF (stop enviado) reason=%s", reason)
-        # Asegura flag abajo en memoria
         pa["countdown_started"] = False
         persisted = True
 
@@ -212,10 +202,8 @@ def _playtime_tick(cfg: dict, st: dict, now_sec: int, now_dt):
         persisted = True
 
     if persisted:
-        try:
+        with contextlib.suppress(Exception):
             save_state(st)
-        except Exception:
-            pass
 
     # 4) Notificación de fin de tiempo (separada del STOP)
     rem, mode = remaining_play_seconds(st, now_dt, cfg)
@@ -223,10 +211,8 @@ def _playtime_tick(cfg: dict, st: dict, now_sec: int, now_dt):
         if not pa.get("ended_sent"):
             _emit_notify("Tiempo terminado", "El tiempo de juego ha finalizado.")
             pa["ended_sent"] = True
-            try:
+            with contextlib.suppress(Exception):
                 save_state(st)
-            except Exception:
-                pass
 
 # =============================================================================
 # Gestión de procesos
@@ -234,17 +220,13 @@ def _playtime_tick(cfg: dict, st: dict, now_sec: int, now_dt):
 def _kill_tree(proc: psutil.Process):
     try:
         for c in proc.children(recursive=True):
-            try:
+            with contextlib.suppress(Exception):
                 c.terminate()
-            except Exception:
-                pass
         proc.terminate()
         psutil.wait_procs([proc], timeout=1.0)
         if proc.is_running():
-            try:
+            with contextlib.suppress(Exception):
                 proc.kill()
-            except Exception:
-                pass
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         pass
 
@@ -315,7 +297,7 @@ def _match_blocked(proc: psutil.Process, cfg, st,
     except Exception:
         pname_low = ""
 
-    # --- whitelist por juego (tal como ya lo tenías) ---
+    # --- whitelist por juego ---
     play_until = int(st.get("play_until", 0) or 0)
     now_sec = now_epoch()
     allowed_by_manual = play_until > now_sec
@@ -338,7 +320,7 @@ def _match_blocked(proc: psutil.Process, cfg, st,
         if exe_path.startswith(d) or cwd_path.startswith(d):
             return f"self:{d}"
 
-    # --- argumentos (usa info si está) ---
+    # --- argumentos ---
     try:
         args = info.get("cmdline") if (info and "cmdline" in info) else proc.cmdline()
     except Exception:
@@ -354,7 +336,7 @@ def _match_blocked(proc: psutil.Process, cfg, st,
                     return None
                 return f"arg:{d}"
 
-    # --- ficheros abiertos: solo si es editor/office, y solo si no tenemos info rápida ---
+    # --- ficheros abiertos (editores/office) ---
     if base in EDITOR_LIKE:
         try:
             for f in proc.open_files():
@@ -400,10 +382,8 @@ def _wmi_watch_loop(q: "queue.Queue[tuple[int,str]]", stop_ev: threading.Event):
             log.warning("WMI watcher reinicio por error: %s", e)
             time.sleep(2)
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 pythoncom.CoUninitialize()
-            except Exception:
-                pass
 
 # =============================================================================
 # Explorer Watch
@@ -411,10 +391,8 @@ def _wmi_watch_loop(q: "queue.Queue[tuple[int,str]]", stop_ev: threading.Event):
 def _explorer_watch_loop(get_blocked_dirs_callable, stop_ev: threading.Event):
     if not (win32com and win32gui):
         return
-    try:
+    with contextlib.suppress(Exception):
         pythoncom.CoInitialize()
-    except Exception:
-        pass
     shell = None
     last_dirs: tuple[str, ...] = ()
     last_check = 0.0
@@ -463,10 +441,8 @@ def _explorer_watch_loop(get_blocked_dirs_callable, stop_ev: threading.Event):
                             try:
                                 win32gui.PostMessage(hwnd, WM_CLOSE, 0, 0)
                             except Exception:
-                                try:
+                                with contextlib.suppress(Exception):
                                     w.Quit()
-                                except Exception:
-                                    pass
                             _log_event("block", "explorer.exe", f"dir:{d}")
                             break
                 except Exception:
@@ -474,10 +450,10 @@ def _explorer_watch_loop(get_blocked_dirs_callable, stop_ev: threading.Event):
         except Exception as e:
             log.error("ExplorerWatch loop error: %s", e)
             shell = None
-            
         time.sleep(backoff)
     with contextlib.suppress(Exception):
         pythoncom.CoUninitialize()
+
 # =============================================================================
 # SINGLE-INSTANCE
 # =============================================================================
@@ -495,10 +471,8 @@ def _acquire_singleton() -> bool:
         try:
             os.write(fd, str(os.getpid()).encode("ascii", "ignore"))
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 os.close(fd)
-            except Exception:
-                pass
         return True
     except FileExistsError:
         return False
@@ -512,16 +486,17 @@ def main():
         setproctitle.setproctitle("XiaoHack Control Parental — Guardian")
     except Exception:
         pass
-    
+
     if not _acquire_singleton():
         log.warning("Otro guardian ya está ejecutándose — salgo")
         return
 
+    log.info("------------------------------------------------")
+    log.info("TAREA GUARDIAN INICIADA")
+    log.info("------------------------------------------------")
     log.info("Guardian START pid=%s", os.getpid())
-    try:
+    with contextlib.suppress(Exception):
         psutil.Process(os.getpid()).nice(psutil.HIGH_PRIORITY_CLASS)  # type: ignore[attr-defined]
-    except Exception:
-        pass
 
     cfg = load_config()
     st  = load_state()
@@ -542,7 +517,6 @@ def main():
     _applied_last = bool(st.get("applied", True))
     if _applied_last:
         try:
-            # aplicar con cfg efectiva (sin dominios si domains_enabled=False)
             cfg_eff = dict(cfg)
             if not cfg_eff.get("domains_enabled", True):
                 cfg_eff["blocked_domains"] = []
@@ -558,9 +532,9 @@ def main():
     blocked_dirs  = [_dirtrail(x) for x in (_normpath(p) for p in cfg.get("blocked_paths", []) if p)]
     self_dirs: list[str] = [_dirtrail(str(BASE_DIR))] if PROTECT_SELF else []
 
-    log.info("cfg names=%s", ",".join(sorted(blocked_names)))
-    log.info("cfg execs=%s", ",".join(sorted(blocked_execs)))
-    log.info("cfg dirs=%s", ",".join(blocked_dirs + self_dirs))
+    log.debug("cfg names=%s", ",".join(sorted(blocked_names)))
+    log.debug("cfg execs=%s", ",".join(sorted(blocked_execs)))
+    log.debug("cfg dirs=%s", ",".join(blocked_dirs + self_dirs))
 
     def _get_blocked_dirs_snapshot():
         return blocked_dirs + self_dirs
@@ -579,16 +553,15 @@ def main():
     log.info("Servicio XiaoHack Parental iniciado correctamente.")
     recently_blocked: dict[int, float] = {}
 
-    _last_scan_sec = -1     # último segundo en que se hizo escaneo completo
     _last_scan_ts = 0.0
-    _last_play_tick = 0      # marca en segundos
-    _last_hb_sec = -1        # último segundo en que se emitió heartbeat (múltiplo de 30)
-    _last_tel_sec = -1       # último segundo de telemetría (múltiplo de 5)
+    _last_play_tick = 0       # marca en segundos
+    _last_hb_sec = -1         # último segundo en que se emitió heartbeat (múltiplo de 30)
+    _last_tel_sec = -1        # último segundo de telemetría (múltiplo de 5)
 
     while True:
         now = time.time()
         now_i = int(now)
-        
+
         # --- TICK de tiempo de juego (cada 1 s) ---
         try:
             if now_i != _last_play_tick:
@@ -645,15 +618,12 @@ def main():
                 except Exception:
                     continue
 
-
         # 3) Telemetría opcional (throttle 1 vez cada 5 s)
         if cfg.get("log_process_activity", True) and (now_i % 5 == 0) and (_last_tel_sec != now_i):
             _last_tel_sec = now_i
             for p in psutil.process_iter(attrs=["name"]):
-                try:
+                with contextlib.suppress(Exception):
                     audit.log_seen(p.info["name"])
-                except Exception:
-                    pass
 
         # 4) Recarga de configuración al detectar cambio de archivo
         try:
@@ -679,18 +649,15 @@ def main():
             new_applied = bool(st.get("applied", False))
             if new_applied != _applied_last:
                 if new_applied:
-                    # aplicar con cfg efectiva (sin dominios si domains_enabled=False)
                     cfg_eff = dict(cfg)
                     if not cfg_eff.get("domains_enabled", True):
                         cfg_eff["blocked_domains"] = []
                     ensure_hosts_rules(cfg_eff)
                     log.info("Reglas aplicadas tras activación desde la app (state.applied=True).")
                 else:
-                    # limpiar bloque parental del hosts si estaba presente
                     try:
                         removed = remove_parental_block()
-                        log.info("Bloque parental %s por applied=False.",
-                                 "eliminado" if removed else "no presente")
+                        log.info("Bloque parental %s por applied=False.", "eliminado" if removed else "no presente")
                     except PermissionError:
                         log.warning("Sin permisos para limpiar hosts (applied=False).")
                 _applied_last = new_applied

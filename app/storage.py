@@ -233,10 +233,10 @@ def _ensure_present():
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         if not CONFIG_PATH.exists():
             _atomic_write(CONFIG_PATH, _DEFAULT_CFG)
-            log.info("Creado config.json con defaults NO-OP (safesearch=False, blocked_domains=[])")
+            log.debug("Creado config.json con defaults NO-OP (safesearch=False, blocked_domains=[])")
         if not STATE_PATH.exists():
             _atomic_write(STATE_PATH, _DEFAULT_STATE)
-            log.info("Creado state.json con defaults (applied=False)")
+            log.debug("Creado state.json con defaults (applied=False)")
     except Exception as e:
         log.error("Error creando ficheros iniciales: %s", e, exc_info=True)
 
@@ -458,7 +458,7 @@ def set_data_dir_forced(path: Union[str, os.PathLike[str], Path]) -> None:
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
-    log.info("Data dir forzado a: %s", DATA_DIR)
+    log.debug("Data dir forzado a: %s", DATA_DIR)
 
 # --- Path getters (reutilizables) ---
 def get_config_path() -> Path:
@@ -488,5 +488,5 @@ def get_state_mtime() -> float:
 # ==============================================================================
 # Log resumen de entorno
 # ==============================================================================
-log.info("Directorio de datos: %s", DATA_DIR)
-log.info("Archivos: config=%s, state=%s, db=%s", CONFIG_PATH, STATE_PATH, DB_PATH)
+log.debug("Directorio de datos: %s", DATA_DIR)
+log.debug("Archivos: config=%s, state=%s, db=%s", CONFIG_PATH, STATE_PATH, DB_PATH)

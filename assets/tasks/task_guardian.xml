@@ -11,16 +11,15 @@
     </BootTrigger>
   </Triggers>
   <Principals>
-    <Principal id="Author">
+    <Principal id="System">
       <UserId>S-1-5-18</UserId> <!-- SYSTEM -->
       <RunLevel>HighestAvailable</RunLevel>
     </Principal>
   </Principals>
   <Settings>
-    <MultipleInstancesPolicy>StopExisting</MultipleInstancesPolicy>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>true</AllowHardTerminate>
     <StartWhenAvailable>true</StartWhenAvailable>
     <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
     <IdleSettings>
@@ -33,12 +32,16 @@
     <RunOnlyIfIdle>false</RunOnlyIfIdle>
     <WakeToRun>false</WakeToRun>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Priority>5</Priority>
+    <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>PT5M</Interval>
+      <Count>4</Count>
+    </RestartOnFailure>
   </Settings>
-  <Actions Context="Author">
+  <Actions Context="System">
     <Exec>
-      <Command>cmd.exe</Command>
-      <Arguments>/c "C:\Program Files\XiaoHackParental\run_guardian.bat"</Arguments>
+      <Command>C:\Program Files\XiaoHackParental\venv\Scripts\python.exe</Command>
+      <Arguments>-m app.guardian --xh-role guardian --no-ui</Arguments>
       <WorkingDirectory>C:\Program Files\XiaoHackParental</WorkingDirectory>
     </Exec>
   </Actions>

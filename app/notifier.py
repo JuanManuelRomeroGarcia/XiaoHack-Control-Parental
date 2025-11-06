@@ -68,7 +68,7 @@ else:
 
 try:
     _storage_set_data_dir_forced(str(DATA_DIR_FORCED))
-    log.info("Notifier data_dir forzado: %s", _storage_data_dir())
+    log.debug("Notifier data_dir forzado: %s", _storage_data_dir())
 except Exception as e:
     log.warning("No se pudo forzar data_dir: %s", e)
 
@@ -82,21 +82,20 @@ STATE_DIR = DATA_DIR_FORCED
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = STATE_DIR / "notifier_state.json"
 
-BANER_START_TTL = 7 # Segundos
-CLOSE_BANNER_TTL = 10 # Segundos
+BANER_START_TTL = 7  # Segundos
+CLOSE_BANNER_TTL = 10  # Segundos
 _LAST_FLAGS = {"m10": False, "m5": False}
 _DB_POLL_SEEN = False      # primer poll a la DB ya realizado
-_START_TS = 0.0 
+_START_TS = 0.0
 _LAST_TJ_EVENT_TS = 0.0
 _COUNTDOWN_ACTIVE_UNTIL = 0.0
-_SUPPRESS_FLASH_UNTIL = {"av1": 0.0, "av2": 0.0} 
+_SUPPRESS_FLASH_UNTIL = {"av1": 0.0, "av2": 0.0}
 
 # --------------------------------------------------------------------
 #  Auto-provision per-user (schtasks), mutex y espera de shell
 # --------------------------------------------------------------------
 
 TASK_XML = INSTALL_DIR / "assets" / "tasks" / "task_notifier_user.xml"
-RUN_NOTIFIER_BAT = INSTALL_DIR / "run_notifier.bat"
 
 def _task_name_for_user() -> str:
     # Nombre legible y único por usuario (sin TaskPath para no requerir permisos extra)
@@ -113,42 +112,6 @@ def _schtasks_exists(name: str) -> bool:
     except subprocess.CalledProcessError:
         return False
 
-def _schtasks_create_from_xml(name: str, xml_path: str) -> None:
-    subprocess.check_call(
-        ["schtasks", "/Create", "/TN", name, "/XML", xml_path, "/F"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=0x08000000
-    )
-
-def _schtasks_run(name: str) -> None:
-    try:
-        subprocess.check_call(
-            ["schtasks", "/Run", "/TN", name],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=0x08000000
-        )
-    except Exception:
-        pass  # no es crítico
-
-
-def _maybe_provision_task_and_exit() -> bool:
-    """
-    Crea la tarea per-user si no existe y devuelve True si debemos salir
-    (handover al Programador). Si ya existe o hay error, devuelve False.
-    """
-    try:
-        if not TASK_XML.exists():
-            log.warning("No se encuentra XML per-user: %s", TASK_XML)
-            return False
-
-        name = _task_name_for_user()
-        if not _schtasks_exists(name):
-            log.info("Creando tarea per-user del Notifier: %s", name)
-            _schtasks_create_from_xml(name, str(TASK_XML))
-            log.info("Tarea creada. Handover al Programador (no ejecuto).")
-            return True  # el caller debe salir para evitar dobles
-    except Exception as e:
-        log.warning("Auto-provision per-user fallida (%s). Continuamos.", e)
-
-    return False
 
 def _wait_for_shell_ready(timeout=30) -> bool:
     """
@@ -210,7 +173,7 @@ def save_state_local(st):
         tmp.replace(STATE_FILE)
     except Exception as e:
         log.error("Error al guardar notifier_state: %s", e)
-        
+
 def _refresh_alerts_cfg():
     """Carga alerts.* de config.json y actualiza globals (umbrales y TTLs)."""
     global BANER_START_TTL, CLOSE_BANNER_TTL, _AVISO1_SEC, _AVISO2_SEC, _AVISO3_SEC
@@ -218,7 +181,7 @@ def _refresh_alerts_cfg():
         alerts = _storage_get_alerts_cfg(_storage_load_config() or {})
     except Exception:
         alerts = {"aviso1_sec": 600, "aviso2_sec": 300, "aviso3_sec": 60, "flash_ttl": 7, "close_banner_ttl": 10}
-        
+
     _AVISO1_SEC = int(alerts.get("aviso1_sec", 600))
     _AVISO2_SEC = int(alerts.get("aviso2_sec", 300))
     _AVISO3_SEC = int(alerts.get("aviso3_sec", 60))
@@ -342,7 +305,7 @@ def _log_task_introspection():
     """Registra estado del XML y la tarea per-user."""
     try:
         tn = _task_name_for_user()
-        log.info("task xml: %s (exists=%s)", TASK_XML, TASK_XML.exists())
+        log.debug("task xml: %s (exists=%s)", TASK_XML, TASK_XML.exists())
         log.info("task name: %s (exists=%s)", tn, _schtasks_exists(tn))
     except Exception as e:
         log.debug("task introspection error: %s", e)
@@ -355,15 +318,18 @@ def _log_startup_banner():
     except Exception:
         ppid = 0
 
+    log.info("------------------------------------------------")
+    log.info("TAREA NOTIFIER INICIADA")
+    log.info("------------------------------------------------")
     log.info("Notifier START pid=%s user=%s ppid=%s", os.getpid(), (getpass.getuser() or "?"), ppid)
-    log.info("install_dir=%s", INSTALL_DIR)
-    log.info("assets_dir=%s", ASSETS_DIR)
-    log.info("data_dir forced=%s → effective=%s", DATA_DIR_FORCED, _storage_data_dir())
+    log.debug("install_dir=%s", INSTALL_DIR)
+    log.debug("assets_dir=%s", ASSETS_DIR)
+    log.debug("data_dir forced=%s → effective=%s", DATA_DIR_FORCED, _storage_data_dir())
     _log_task_introspection()
     _log_overlay_and_alerts()
 
 def _log_shell_ready(waited: bool):
-    log.info("shell ready: %s", "yes" if waited else "timeout/no-shell")
+    log.debug("shell ready: %s", "yes" if waited else "timeout/no-shell")
 
 
 
@@ -741,7 +707,7 @@ def _handle_countdown_event(value: str, meta: str):
         except Exception:
             pass
 
-        _COUNTDOWN_ACTIVE_UNTIL = _t.time() + 1 # bloquea fallback por state durante el minuto
+        _COUNTDOWN_ACTIVE_UNTIL = _t.time() + 1  # bloquea fallback por state durante el minuto
         log.info("COUNTDOWN EVENT → STOP (timer local desarmado) reason=%s", reason or "?")
 
         # Banner final SOLO si el tiempo se agotó de forma natural
@@ -953,7 +919,6 @@ try:
             from ctypes import wintypes as WT
             GWL_WNDPROC = -4  # noqa: F841
             WNDPROC = ct.WINFUNCTYPE(ct.c_long, WT.HWND, ct.c_uint, WT.WPARAM, WT.LPARAM)
-            
 
             def _wndproc(hWnd, msg, wParam, lParam):
                 try:
@@ -977,7 +942,7 @@ try:
             win32gui.SetWindowPos(self.hwnd, win32con.HWND_TOPMOST, x, y, w, h,
                                   win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW)
             self.visible = True
-            
+
         def set_subtitle(self, subtitle: str | None):
             if subtitle is not None and subtitle != self.subtitle:
                 self.subtitle = subtitle
@@ -985,7 +950,7 @@ try:
                 try:
                     win32gui.InvalidateRect(self.hwnd, None, True)
                 except Exception:
-                    pass  
+                    pass
 
         def _on_paint(self, hwnd):
             hdc, ps = win32gui.BeginPaint(hwnd)
@@ -1023,14 +988,14 @@ try:
                 win32gui.SetTextColor(hdc, win32api.RGB(255, 255, 255))
                 win32gui.SelectObject(hdc, hfont1)
                 win32gui.DrawText(hdc, self._text, -1, rect_num,
-                                win32con.DT_CENTER | win32con.DT_VCENTER | win32con.DT_SINGLELINE)
+                                  win32con.DT_CENTER | win32con.DT_VCENTER | win32con.DT_SINGLELINE)
 
                 # 2) Subtítulo — parte baja del banner
                 rect_sub = (rect[0], int(h * 0.64), rect[2], rect[3])
                 win32gui.SetTextColor(hdc, win32api.RGB(220, 220, 220))
                 win32gui.SelectObject(hdc, hfont2)
                 win32gui.DrawText(hdc, self.subtitle, -1, rect_sub,
-                                win32con.DT_CENTER | win32con.DT_TOP)
+                                  win32con.DT_CENTER | win32con.DT_TOP)
 
                 win32gui.DeleteObject(hfont1)
                 win32gui.DeleteObject(hfont2)
@@ -1049,7 +1014,6 @@ try:
                 win32gui.ShowWindow(self.hwnd, win32con.SW_SHOWNA)
                 self.visible = True
 
-
         def hide(self):
             if self.visible:
                 win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
@@ -1058,11 +1022,11 @@ try:
         def destroy(self):
             try:
                 self.hide()
-            except Exception: 
+            except Exception:
                 pass
-            try: 
+            try:
                 win32gui.DestroyWindow(self.hwnd)
-            except Exception: 
+            except Exception:
                 pass
 
     class Win32OverlayManager:
@@ -1296,7 +1260,7 @@ def overlay_loop(stop_ev: threading.Event):
             pass
 
     if WIN32_OVERLAY_OK:
-        log.info("Overlay usando implementación Win32 Layered (TopMost, NoActivate).")
+        log.debug("Overlay usando implementación Win32 Layered (TopMost, NoActivate).")
         mgr = Win32OverlayManager()
         last_n = -1
         visible = False
@@ -1352,7 +1316,7 @@ def overlay_loop(stop_ev: threading.Event):
         log.info("Overlay usando fallback Tkinter (banner no disponible).")
         return tk_overlay_loop(stop_ev)
 
-        
+
 # === Timer interno (independiente de state por segundo) =======================
 class LocalCountdown:
     MAX_LAST_MINUTE   = 60
@@ -1381,7 +1345,7 @@ class LocalCountdown:
 
     def arm_for(self, seconds_from_now: float, source: str = "event"):
         self.arm_until(_t.time() + float(seconds_from_now), source=source)
-        
+
     def remaining(self) -> float:
         """Segundos (float) restantes; 0.0 si no armado o fuera de rango (sanidad 1..60s)."""
         if not self.armed:
@@ -1420,7 +1384,7 @@ def trigger_flash_banner(text: str, subtitle: str | None = None, ttl: float | No
             _FLASH["subtitle"] = s
             _FLASH["until"] = expiry
 
-        log.info("FLASH→ armed: text=%r, sub=%r, ttl=%.1fs (until=%.0f)",t, s, ttl, expiry)
+        log.info("FLASH→ armed: text=%r, sub=%r, ttl=%.1fs (until=%.0f)", t, s, ttl, expiry)
     except Exception as e:
         log.warning("FLASH→ error al armar: %s", e)
 
@@ -1449,31 +1413,21 @@ def _flash_current() -> tuple[str | None, str | None]:
 # --------------------------------------------------------------------
 def main():
     global _LAST_FLAGS, _DB_POLL_SEEN, _START_TS, _LAST_TJ_EVENT_TS
-    
+
     # 0) Single-instance (evita doble arranque si coinciden .LNK y la tarea)
     if not _ensure_single_instance():
-        return
-    
-    if _maybe_provision_task_and_exit():
         return
 
     # 0.5) Espera a que el shell esté listo para no perder toasts iniciales
     waited = _wait_for_shell_ready(30)
-    _log_shell_ready(waited) 
-    
+    _log_shell_ready(waited)
+
     _log_startup_banner()  # rutas, tarea/XML, overlay y umbrales
     env = diagnose_notification_env(auto_fix=True)
-    log.info("notify env: winrt=%s has_shortcut=%s toast_enabled=%s app_enabled=%s dnd=%s data_dir=%s",
-             env.get("winrt_available"), env.get("has_shortcut"),
-             env.get("toast_enabled"),   env.get("app_enabled"),
-             env.get("quiet_hours_active"), env.get("data_dir"))
-    
-    
-    try:
-        import logging
-        logging.getLogger().debug("XiaoHack process started (role=%s)", XH_ROLE)
-    except Exception:
-        pass
+    log.debug("notify env: winrt=%s has_shortcut=%s toast_enabled=%s app_enabled=%s dnd=%s data_dir=%s",
+              env.get("winrt_available"), env.get("has_shortcut"),
+              env.get("toast_enabled"),   env.get("app_enabled"),
+              env.get("quiet_hours_active"), env.get("data_dir"))
 
     log.info("Notifier iniciado. Overlay=%s", _OVERLAY_IMPL)
     _refresh_alerts_cfg()
@@ -1487,7 +1441,6 @@ def main():
         _LAST_FLAGS.update({"m10": bool(pa0.get("m10")), "m5": bool(pa0.get("m5"))})
     except Exception:
         pass
-    diagnose_notification_env(auto_fix=True)
     try:
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
@@ -1509,7 +1462,7 @@ def main():
             save_state_local(st_local)
             log.info("Saltado histórico hasta id=%s", last)
 
-        # Saltar histórico (compat: bloques/notifies/countdown con punteros separados)
+    # Saltar histórico (compat: bloques/notifies/countdown con punteros separados)
     st_local = load_state_local()
     last_block = int(st_local.get("last_block_id", st_local.get("last_id", 0)) or 0)
     last_cd    = int(st_local.get("last_cd_id", 0) or 0)
@@ -1529,7 +1482,7 @@ def main():
             # 2) NOTIFY
             rows_nt = query_new_notifies(last_nt)
             log.debug("DB→ poll: last_nt=%s, last_cd=%s, nt_rows=%d, cd_rows=%d",
-                    last_nt, last_cd, len(rows_nt or []), len(rows_cd or []))
+                      last_nt, last_cd, len(rows_nt or []), len(rows_cd or []))
 
             saw_tiempo_event = False
 
@@ -1571,7 +1524,6 @@ def main():
             if rows_nt:
                 save_state_local(st_local)
 
-
             # Marcar que YA hicimos primer poll
             _DB_POLL_SEEN = True
 
@@ -1581,7 +1533,6 @@ def main():
                 # evita eco si acabamos de procesar un NOTIFY
                 if (now_ts - _LAST_TJ_EVENT_TS) > 8.0:
                     _LAST_FLAGS = _flash_from_state_transitions(_LAST_FLAGS)
-
 
             # 3) BLOCKS: igual que antes
             rows = query_new_blocks(last_block)

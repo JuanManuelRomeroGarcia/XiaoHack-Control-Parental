@@ -14,7 +14,6 @@ import tempfile
 from pathlib import Path
 import logging
 
-
 # --- AppUserModelID para icono correcto en barra de tareas ---
 try:
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("XiaoHack.Parental.Panel")
@@ -55,8 +54,8 @@ PROGRAM_DATA  = Path(os.environ.get("ProgramData",  r"C:\ProgramData"))
 
 APP_NAME      = "XiaoHackParental"
 
-INSTALL_DIR = Path(__file__).resolve().parents[1]                     # %ProgramFiles%\XiaoHackParental
-DATA_DIR_SYS  = PROGRAM_DATA / APP_NAME                             # %ProgramData%\XiaoHackParental        
+INSTALL_DIR   = Path(__file__).resolve().parents[1]       # %ProgramFiles%\XiaoHackParental
+DATA_DIR_SYS  = PROGRAM_DATA / APP_NAME                   # %ProgramData%\XiaoHackParental
 
 # Config “real” ahora vive en ProgramData:
 CONFIG_PATH   = DATA_DIR_SYS / "config.json"
@@ -81,7 +80,9 @@ COMMON_START  = PROGRAM_DATA / r"Microsoft\Windows\Start Menu\Programs\StartUp" 
 TASKS = [
     r"XiaoHackParental\Guardian",     # NUEVA
     r"XiaoHack\Guardian", r"XiaoHack\Notifier", r"XiaoHack\ControlParental",
-    r"XiaoHackParental", r"Guardian", r"Notifier"
+    r"XiaoHackParental", r"Guardian", r"Notifier",
+    # heredada por versiones anteriores del uninstaller
+    r"XiaoHack_FinalCleanup",
 ]
 
 # Patrones para localizar procesos asociados
@@ -133,7 +134,6 @@ def _safe_log_info(prefix: str, cp) -> None:
     err = shorten((cp.stderr or "").strip(), width=160)
     log.info("%s rc=%s out=%s err=%s", prefix, cp.returncode, out, err)
 
-
 def run(cmd, timeout=None):
     """
     Ejecuta un proceso oculto, capturando salida como texto UTF-8 con sustitución.
@@ -153,7 +153,6 @@ def run(cmd, timeout=None):
     except Exception as e:
         log.debug("run(%s) error: %s", cmd, e)
         return subprocess.CompletedProcess(cmd, 255, "", str(e))
-
 
 def load_cfg() -> dict:
     try:
@@ -217,13 +216,12 @@ try {
 def schtasks_stop_delete_all():
     """
     Elimina cualquier tarea relacionada con XiaoHack/Guardian/Notifier en cualquier ruta.
+    También elimina 'XiaoHack_FinalCleanup' heredada de versiones anteriores del uninstaller.
     """
-    # Intento rápido por nombres conocidos
-    for name in ("\\XiaoHackParental\\Guardian", "\\XiaoHackParental\\Notifier"):
+    for name in ("\\XiaoHackParental\\Guardian", "\\XiaoHackParental\\Notifier", "XiaoHack_FinalCleanup"):
         run(["schtasks", "/End", "/TN", name])
         run(["schtasks", "/Delete", "/TN", name, "/F"])
 
-    # Barrido amplio en PS (cubre nombres personalizados)
     ps = r'''
 try {
   $ts = Get-ScheduledTask | Where-Object {
@@ -249,7 +247,6 @@ def kill_xh_processes(exclude_pids: set[int] | None = None):
     Mata guardian/notifier sin tocar el desinstalador (app.uninstall) y respetando exclude_pids.
     Usa WMI (Win32_Process) para poder filtrar por CommandLine.
     """
-    # Excluye SIEMPRE self, padres e hijos del proceso actual
     ex = set(exclude_pids or set())
     ex.add(SELF_PID)
     ex |= SELF_PARENTS
@@ -279,16 +276,12 @@ foreach ($p in $procs) {{ try {{ Stop-Process -Id $p.ProcessId -Force }} catch {
 '''.strip()
     run(["powershell","-NoProfile","-ExecutionPolicy","Bypass","-Command", ps])
 
-
 def close_all_logs():
-    """
-    Cierra manejadores de logging (libera C:\ProgramData\XiaoHackParental\logs\control.log).
-    """
+    """Cierra manejadores de logging (libera %ProgramData%\...\logs\control.log)."""
     try:
         logging.shutdown()
     except Exception:
         pass
-    # pequeña espera para que el SO libere el handle
     time.sleep(0.8)
 
 def safe_rmtree(path: Path, retries=8, delay=0.8) -> bool:
@@ -299,13 +292,13 @@ def safe_rmtree(path: Path, retries=8, delay=0.8) -> bool:
             for root, dirs, files in os.walk(path, topdown=False):
                 for n in files:
                     p = Path(root) / n
-                    try:
+                    try: 
                         os.chmod(p, stat.S_IWRITE)
                     except Exception:
                         pass
                 for n in dirs:
                     d = Path(root) / n
-                    try:
+                    try: 
                         os.chmod(d, stat.S_IWRITE)
                     except Exception:
                         pass
@@ -324,7 +317,6 @@ def revert_hosts_if_possible():
         return
     except Exception:
         pass
-    # fallback por marcadores
     try:
         hosts = Path(r"C:\Windows\System32\drivers\etc\hosts")
         if hosts.exists():
@@ -338,15 +330,12 @@ def revert_hosts_if_possible():
 
 def remove_shortcuts():
     for lnk in [
-        # Escritorio público y del usuario
         LNK_DESK_PANEL_PUB, LNK_DESK_UNINST_PUB,
         LNK_DESK_PANEL_USER, LNK_DESK_UNINST_USER,
-        # Menú Inicio (directo y antiguo)
         LNK_MENU_PANEL, LNK_MENU_UNINST,
         PROGRAMS_COMMON / "XiaoHack Control Parental.lnk",
         PROGRAMS_COMMON / "XiaoHack" / "XiaoHack Control Parental.lnk",
         PROGRAMS_COMMON / "XiaoHack" / "Desinstalar XiaoHack.lnk",
-        # Startup (por compat)
         COMMON_START / "XiaoHack Notifier.lnk",
         COMMON_START / "XiaoHackParental Notifier.lnk",
     ]:
@@ -354,22 +343,18 @@ def remove_shortcuts():
             lnk.unlink(missing_ok=True)
         except Exception:
             pass
-    # Directorio del menú si queda vacío
     try:
         if LNK_MENU_DIR.exists() and not any(LNK_MENU_DIR.iterdir()):
             LNK_MENU_DIR.rmdir()
     except Exception:
         pass
-    
+
 def restore_dns_auto():
-    """
-    Devuelve los DNS a automático (DHCP) para todas las interfaces.
-    Intenta vía app.dnsconfig; si no está empaquetado o falla, usa PowerShell.
-    """
+    """Devuelve los DNS a automático (DHCP) para todas las interfaces."""
     if _module_exists("app.dnsconfig"):
         try:
             from app import dnsconfig
-            ok, msg = dnsconfig.set_dns_auto(interface_alias=None)  # None => todas
+            ok, msg = dnsconfig.set_dns_auto(interface_alias=None)
             log.info("[dns] Auto vía módulo: %s", msg or ("OK" if ok else ""))
             return
         except Exception as e:
@@ -387,14 +372,8 @@ foreach ($i in $ifaces) {
     cp = run(["PowerShell","-NoProfile","-ExecutionPolicy","Bypass","-Command", ps])
     _safe_log_info("[dns] Auto (fallback PS)", cp)
 
-
-
 def clear_doh_policies():
-    """
-    Quita políticas DoH de Brave y Chrome (HKCU/HKLM).
-    Primero intenta nuestras APIs si están empaquetadas; si no, hace fallback PS por registro.
-    """
-    # --- Brave ---
+    """Quita políticas DoH de Brave y Chrome (HKCU/HKLM)."""
     did_brave = False
     if _module_exists("app.braveconfig"):
         try:
@@ -407,7 +386,6 @@ def clear_doh_policies():
     else:
         log.info("[doh] app.braveconfig no empaquetado. Fallback PS…")
 
-    # --- Chrome ---
     did_chrome = False
     if _module_exists("app.chromeconfig"):
         try:
@@ -420,7 +398,6 @@ def clear_doh_policies():
     else:
         log.info("[doh] app.chromeconfig no empaquetado. Fallback PS…")
 
-    # Si cualquiera de los dos “no” se pudo por módulo, aplicamos fallback PS para ambos paths
     if not (did_brave and did_chrome):
         ps = r'''
 $paths = @(
@@ -439,7 +416,6 @@ foreach ($p in $paths) {
 '''
         cp = run(["PowerShell","-NoProfile","-ExecutionPolicy","Bypass","-Command", ps])
         _safe_log_info("[doh] Fallback PS", cp)
-
 
 # --------- cierre de procesos con exclusión del propio desinstalador ----------
 SELF_PID = os.getpid()
@@ -495,14 +471,53 @@ def kill_related(install_path: str, list_only=False):
 
 # ----------------------- borrado en dos fases ---------------------------------
 
+# NUEVO: marcado de borrado en arranque (sin tareas programadas)
+MOVEFILE_DELAY_UNTIL_REBOOT = 0x00000004
+def _movefileex_delete_on_reboot(path: str) -> bool:
+    """Marca un archivo o directorio para borrado en el próximo arranque."""
+    try:
+        k32 = ctypes.windll.kernel32
+        from ctypes import wintypes
+        k32.MoveFileExW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+        k32.MoveFileExW.restype = wintypes.BOOL
+        # Prefijo \\?\ para rutas largas/Unicode
+        p = "\\\\?\\" + path
+        return bool(k32.MoveFileExW(p, None, MOVEFILE_DELAY_UNTIL_REBOOT))
+    except Exception as e:
+        log.debug("MoveFileExW failed for %s: %s", path, e)
+        return False
+
+def mark_tree_for_delete_on_reboot(root: str | Path) -> int:
+    """
+    Recorre el árbol y marca archivos y carpetas para borrado al reiniciar.
+    Devuelve el número de elementos marcados.
+    """
+    root = str(root)
+    count = 0
+    try:
+        for r, dirs, files in os.walk(root, topdown=False):
+            for f in files:
+                fp = os.path.join(r, f)
+                if _movefileex_delete_on_reboot(fp):
+                    count += 1
+            for d in dirs:
+                dp = os.path.join(r, d)
+                if _movefileex_delete_on_reboot(dp):
+                    count += 1
+        if _movefileex_delete_on_reboot(root):
+            count += 1
+    except Exception as e:
+        log.debug("mark_tree_for_delete_on_reboot error: %s", e)
+    return count
+
 def _write_post_cleanup_bat(install_path: str):
     """
-    Phase 2 from %TEMP% (ASCII-only BAT, UTF-8 write):
-      - Kill processes pointing to install path.
-      - Remove attributes, takeown/icacls (ACE quoted: (OI)(CI)).
-      - Delete hard files (guardian.db*, control.log, uninstall*).
-      - Remove-Item + rmdir with retries (for /l uses spaces).
-      - If still exists, schedule cleanup at startup (SYSTEM).
+    Phase 2 desde %TEMP% (ASCII-only BAT, UTF-8):
+      - Kill procesos que apunten a install path.
+      - Quita atributos, takeown/icacls.
+      - Borra ficheros duros (guardian.db*, control.log, uninstall*).
+      - Remove-Item + rmdir con reintentos.
+      - **SIN** programar ninguna tarea: si quedan restos, se marcarán para borrado al reiniciar desde Python.
     """
     post_bat = Path(tempfile.gettempdir()) / "xh_post_cleanup.bat"
     progdata = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "XiaoHackParental")
@@ -525,16 +540,13 @@ goto :EOF
 set "_TARGET=%~1"
 if not exist "%_TARGET%" exit /b 0
 
-rem remove attributes
 attrib -r -s -h "%_TARGET%\\*" /s /d >nul 2>&1
 
-rem retries with takeown/icacls and hard-file deletes
 for /l %%i in (1 1 8) do (
   if exist "%_TARGET%" (
     takeown /f "%_TARGET%" /r /d y >nul 2>&1
     icacls "%_TARGET%" /grant "*%SIDADM%:(OI)(CI)F" /t /c /q >nul 2>&1
 
-    rem typical hard files
     del /f /q "%_TARGET%\\guardian.db"       >nul 2>&1
     del /f /q "%_TARGET%\\guardian.db-wal"   >nul 2>&1
     del /f /q "%_TARGET%\\guardian.db-shm"   >nul 2>&1
@@ -546,15 +558,9 @@ for /l %%i in (1 1 8) do (
     if exist "%_TARGET%" ping 127.0.0.1 -n 2 >nul
   )
 )
-
-rem last resort: schedule cleanup at startup (SYSTEM)
-if exist "%_TARGET%" (
-  powershell -NoProfile -ExecutionPolicy Bypass -Command "$act=New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/c rmdir /s /q \"{progdata}\" & rmdir /s /q \"{install}\"'; $trg=New-ScheduledTaskTrigger -AtStartup; Register-ScheduledTask -TaskName 'XiaoHack_FinalCleanup' -Action $act -Trigger $trg -RunLevel Highest -Force -User 'SYSTEM' | Out-Null" >nul 2>&1
-)
 exit /b 0
 """
     try:
-        # UTF-8 (safe), CRLF newlines
         post_bat.write_text(bat, encoding="utf-8", newline="\r\n")
         log.info("post-bat OK -> %s (%d bytes)", post_bat, post_bat.stat().st_size)
     except Exception as e:
@@ -563,8 +569,8 @@ exit /b 0
 
 def _launch_post_cleanup(post_bat_path: str, install_path: str):
     """
-    Run BAT if present and non-trivial; otherwise run an inline PowerShell fallback
-    with the same logic (kill, attrs, hard-files, retries, startup task).
+    Ejecuta el BAT si existe. **Sin** programar tarea.
+    Si falla, ejecuta un PowerShell inline de limpieza sin tareas.
     """
     try:
         p = Path(post_bat_path)
@@ -579,7 +585,6 @@ def _launch_post_cleanup(post_bat_path: str, install_path: str):
         except Exception as e:
             log.warning("post-bat exec failed: %s", e)
 
-    # Fallback PS (ASCII-only content)
     progdata = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "XiaoHackParental")
     install  = str(install_path)
     ps = rf'''
@@ -601,14 +606,6 @@ foreach ($t in $paths) {{
     try {{ Remove-Item -LiteralPath $t -Recurse -Force -ErrorAction SilentlyContinue }} catch {{}}
     if (Test-Path $t) {{ Start-Sleep -Milliseconds 800 }} else {{ break }}
   }}
-  if (Test-Path $t) {{
-    try {{
-      $arg = "/c rmdir /s /q ""{progdata}"" & rmdir /s /q ""{install}"""
-      $act = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $arg
-      $trg = New-ScheduledTaskTrigger -AtStartup
-      Register-ScheduledTask -TaskName "XiaoHack_FinalCleanup" -Action $act -Trigger $trg -RunLevel Highest -Force -User "SYSTEM" | Out-Null
-    }} catch {{}}
-  }}
 }}
 '''
     try:
@@ -619,10 +616,8 @@ foreach ($t in $paths) {{
     except Exception as e:
         log.error("Fallback PS inline failed: %s", e)
 
-
 def delete_folder_two_phase(install_path: str):
     root_dir = Path(install_path)
-    # 1) borrar todo menos KEEP_NAMES
     for item in list(root_dir.iterdir()):
         if item.name in KEEP_NAMES:
             continue
@@ -643,7 +638,6 @@ def gui_main():
         if not verify_pin_gui(cfg):
             return
 
-    # Raíz de instalación (from marker o fallback a INSTALL_DIR ya corregido a parents[1])
     try:
         marker = json.loads(INSTALL_MARK.read_text(encoding="utf-8"))
         install_path = marker.get("install_path", str(INSTALL_DIR))
@@ -651,7 +645,7 @@ def gui_main():
         install_path = str(INSTALL_DIR)
 
     root = tk.Tk()
-    root.title("Desinstalar XiaoHack")
+    root.title("Desinstalador Control Parental XiaoHack")
     root.geometry("780x480")
     root.resizable(True, True)
 
@@ -662,7 +656,7 @@ def gui_main():
 
     cols = ("PID", "Nombre", "Comando")
     tree = ttk.Treeview(frm, columns=cols, show="headings", height=11)
-    for i, w in zip(cols, (80, 120, 520)):
+    for i, w in zip(cols, (80, 80, 520)):
         tree.heading(i, text=i)
         tree.column(i, width=w, anchor="w")
     tree.pack(fill="both", expand=True)
@@ -675,7 +669,7 @@ def gui_main():
 
     def refresh():
         tree.delete(*tree.get_children())
-        rows = kill_related(install_path, list_only=True)  # (esta ya excluye self)
+        rows = kill_related(install_path, list_only=True)
         for pid, name, cmd in rows:
             tree.insert("", "end", values=(pid, name, cmd))
         status.set(f"Procesos detectados: {len(rows)}")
@@ -683,9 +677,7 @@ def gui_main():
     def stop_processes():
         status.set("Cerrando procesos…")
         root.update_idletasks()
-        # 1) por ruta/patrones (psutil) → ya excluye self
         kill_related(install_path, list_only=False)
-        # 2) por WMI (guardian/notifier) → EXCLUYENDO nuestro PID/padres/hijos
         kill_xh_processes()
         time.sleep(0.6)
         refresh()
@@ -694,7 +686,6 @@ def gui_main():
     def stop_tasks():
         status.set("Eliminando tareas programadas…")
         root.update_idletasks()
-        # Barrido completo (incluye nombres personalizados tipo "XiaoHack Notifier – ...")
         schtasks_stop_delete_all()
         status.set("Tareas programadas eliminadas.")
 
@@ -715,7 +706,6 @@ def gui_main():
     def delete_folder():
         nonlocal POST_BAT
 
-        # 1) Tareas/procesos/parar logs
         status.set("Cerrando procesos…")
         root.update_idletasks()
         stop_processes()
@@ -726,9 +716,8 @@ def gui_main():
 
         status.set("Cerrando logs…")
         root.update_idletasks()
-        close_all_logs()  # libera %ProgramData%\...\logs\control.log
+        close_all_logs()
 
-        # 2) Revertir sistema (hosts / DoH / DNS) y accesos
         status.set("Eliminando accesos directos…")
         root.update_idletasks()
         clean_shortcuts()
@@ -745,33 +734,43 @@ def gui_main():
         root.update_idletasks()
         restore_dns_auto()
 
-        # 3) Fase 1: borrar contenido (manteniendo KEEP_NAMES p.ej. venv/uninstall)
         status.set("Borrando contenido (fase 1)…")
         root.update_idletasks()
         delete_folder_two_phase(install_path)
 
-        # 4) Fase 2: generar post-cleanup en %TEMP% y lanzarlo automáticamente
+        # Fase 2: post-cleanup (sin tareas)
         POST_BAT = _write_post_cleanup_bat(install_path)
-
-        status.set("Fase 1 lista. Se completará la limpieza final en segundo plano.")
-        root.update_idletasks()
-        messagebox.showinfo(
-            "Fase 1 completada",
-            "Se ha eliminado el contenido principal.\n"
-            "Ahora se completará la limpieza final en segundo plano\n"
-            "(ProgramData y carpeta de instalación)."
-        )
-
-        # Lanzar ya el post-bat y cerrar (el BAT espera unos segundos y borra todo)
         try:
             _launch_post_cleanup(POST_BAT, install_path)
         except Exception as e:
             log.warning("No se pudo ejecutar post-cleanup: %s", e)
-        # Cerrar la GUI tras un breve margen
+
+        # Comprobación tras un breve margen y, si quedan restos, marcar para borrado al reiniciar.
+        root.after(800, lambda: None)
+        root.update_idletasks()
+        time.sleep(0.8)
+
+        still_exists = any(Path(p).exists() for p in (DATA_DIR_SYS, Path(install_path)))
+        if still_exists:
+            n = 0
+            if Path(install_path).exists():
+                n += mark_tree_for_delete_on_reboot(install_path)
+            if DATA_DIR_SYS.exists():
+                n += mark_tree_for_delete_on_reboot(DATA_DIR_SYS)
+            log.info("Marcados %d elementos para borrado al reiniciar.", n)
+            status.set("Limpieza pendiente marcada para el próximo arranque (sin tareas).")
+            messagebox.showinfo(
+                "Limpieza programada al reiniciar",
+                "Se han marcado los restos para borrarse en el próximo arranque del sistema.\n"
+                "No se ha creado ninguna tarea programada."
+            )
+        else:
+            status.set("Limpieza completada.")
+            messagebox.showinfo("Completado", "Se ha eliminado XiaoHack Parental correctamente.")
+
         root.after(200, root.destroy)
 
     def on_close():
-        # Si por lo que sea no se lanzó aún el bat, lánzalo aquí
         try:
             if POST_BAT and Path(POST_BAT).exists():
                 _launch_post_cleanup(POST_BAT, install_path)
@@ -782,15 +781,14 @@ def gui_main():
     ttk.Button(btns, text="🔄 Refrescar", command=refresh).pack(side="left")
     ttk.Button(btns, text="✖ Cerrar procesos", command=stop_processes).pack(side="left", padx=6)
     ttk.Button(btns, text="🕑 Eliminar tareas", command=stop_tasks).pack(side="left", padx=6)
-    ttk.Button(btns, text="🗂️ Borrar carpeta", command=delete_folder).pack(side="left", padx=6)
     ttk.Button(btns, text="🧹 Quitar accesos", command=clean_shortcuts).pack(side="left", padx=6)
     ttk.Button(btns, text="🛡 Hosts revert", command=revert_hosts_gui).pack(side="left", padx=6)
+    ttk.Button(btns, text="🗂️ Borrar carpeta", command=delete_folder).pack(side="left", padx=6)
     ttk.Button(btns, text="Salir", command=on_close).pack(side="right")
-
+    
     root.protocol("WM_DELETE_WINDOW", on_close)
     refresh()
     root.mainloop()
-
 
 # --- fallback consola ---
 def console_main():
@@ -825,7 +823,6 @@ def console_main():
     except Exception:
         install_path = str(INSTALL_DIR)
 
-
     print("Cerrando tareas y procesos…")
     schtasks_stop_delete_all()
     kill_xh_processes()
@@ -854,15 +851,29 @@ def console_main():
         except Exception:
             pass
 
-    # Fase 2: post-cleanup y salida
     POST_BAT = _write_post_cleanup_bat(install_path)
     try:
         _launch_post_cleanup(POST_BAT, install_path)
     except Exception:
         pass
 
-    print("Fase 1 completada. Se completará la limpieza en segundo plano. Puedes cerrar esta ventana.")
+    time.sleep(0.8)
+    remaining = []
+    if Path(install_path).exists():
+        remaining.append(install_path)
+    if DATA_DIR_SYS.exists():
+        remaining.append(str(DATA_DIR_SYS))
 
+    if remaining:
+        total = 0
+        for p in remaining:
+            total += mark_tree_for_delete_on_reboot(p)
+        print(f"Quedan restos. Marcados {total} elementos para borrado al reiniciar (sin tareas).")
+    else:
+        print("Limpieza completada.")
+
+    print("Puedes cerrar esta ventana.")
+    
 if __name__ == "__main__":
     if _HAS_TK:
         gui_main()

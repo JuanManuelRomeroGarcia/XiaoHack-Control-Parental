@@ -130,7 +130,7 @@ class TimePage(ttk.Frame):
         # --- Duración sesión manual ---
         ttk.Label(self, text="Permitir jugar durante (minutos):").grid(row=2, column=0, sticky="w", **pad)
         self.ent_minutes = ttk.Entry(self, width=10)
-        self.ent_minutes.insert(0, "90")
+        self.ent_minutes.insert(0, "30")
         self.ent_minutes.grid(row=2, column=1, sticky="w", **pad)
 
         # Nota informativa

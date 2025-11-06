@@ -477,7 +477,7 @@ class OptionsPage(ttk.Frame):
     def _recreate_notifier_task(self):
         """Crea/actualiza la tarea per-user desde el XML del paquete."""
         root = find_install_root()
-        xml = Path(root) / "assets" / "tasks" / "task_notifier_user.xml"
+        xml = Path(root) / "assets" / "tasks" / "task_notifier_global.xml"
         name = self._notifier_task_name()
         if not xml.exists():
             messagebox.showerror("Notifier", f"Falta el XML:\n{xml}")
@@ -635,6 +635,7 @@ class OptionsPage(ttk.Frame):
 
     # ---------------- Desinstalar ----------------
     def _uninstall_from_app(self):
+        
         if messagebox.askyesno("Desinstalar", "¿Quieres abrir el desinstalador de XiaoHack?"):
             try:
                 launch_uninstaller_ui()

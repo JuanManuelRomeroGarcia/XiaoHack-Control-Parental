@@ -1,10 +1,10 @@
 # utils/runtime.py
 from __future__ import annotations
 import os
+import subprocess
 import sys
 import ctypes
-import traceback
-from typing import Optional
+from typing import Optional, Sequence
 
 # --- Runtime paths/helpers usados por xiao_gui/services.py -------------------
 from pathlib import Path
@@ -32,22 +32,19 @@ def control_log_path() -> Path:
     return xh_paths.get_logs_dir() / "control.log"
 
 def python_for_console() -> str:
-    """Devuelve python.exe (preferiblemente del venv)."""
-    venv = xh_paths.get_venv_dir() / "Scripts" / "python.exe"
-    if venv.exists():
-        return str(venv)
-    return sys.executable  # fallback
+    return sys.executable
+
 
 def python_for_windowed() -> str:
-    """Devuelve pythonw.exe (preferiblemente del venv)."""
-    venvw = xh_paths.get_venv_dir() / "Scripts" / "pythonw.exe"
-    if venvw.exists():
-        return str(venvw)
-    # fallback a python.exe si no hay pythonw
-    venv = xh_paths.get_venv_dir() / "Scripts" / "python.exe"
-    if venv.exists():
-        return str(venv)
-    return sys.executable
+    exe = Path(sys.executable)
+    pyw = exe.with_name("pythonw.exe")
+    return str(pyw if pyw.exists() else exe)
+
+def reexec_to_console_if_needed() -> bool:
+    return False
+
+def reexec_to_windowed_if_needed() -> bool:
+    return False
 
 def updater_path() -> Path:
     """Busca updater.py en la raíz de instalación."""
@@ -122,17 +119,17 @@ def parse_role(argv: list[str]) -> Optional[str]:
     return None
 
 # --- AppUserModelID (icono en barra de tareas) --------------------------------
-def set_appusermodelid(app_id: str = "XiaoHack.Parental.Panel") -> None:
+def set_appusermodelid(appid: str) -> None:
     try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(appid)
     except Exception:
         pass
 
 # --- Título del proceso (si setproctitle está disponible) ---------------------
-def set_process_title(role: Optional[str]) -> None:
+def set_process_title(title: str) -> None:
     try:
-        import setproctitle  # type: ignore
-        title = f"XiaoHack-{role}" if role else "XiaoHack"
+        import setproctitle  # opcional
         setproctitle.setproctitle(title)
     except Exception:
         pass
@@ -144,27 +141,40 @@ def is_admin() -> bool:
     except Exception:
         return False
 
-def relaunch_elevated(extra_args: list[str] | None = None, logger=None) -> None:
+def relaunch_elevated(argv: Sequence[str] | None = None) -> None:
     """
-    Relanza el proceso con elevación UAC, añadiendo --elevated para evitar bucles.
+    Lanza el mismo módulo/script con privilegios elevados y termina el actual.
+    Respeta XH_NO_REEXEC para no crear bucles ni dobles procesos.
     """
-    extra_args = extra_args or []
-    if "--elevated" not in extra_args:
-        extra_args = extra_args + ["--elevated"]
-    params = " ".join(f'"{a}"' for a in (sys.argv + extra_args))
-    exe = sys.executable
-    if logger:
-        logger.info("Requiere privilegios admin, relanzando con UAC…")
-        logger.debug("Exe: %s", exe)
-        logger.debug("Params: %s", params)
+    if os.environ.get("XH_NO_REEXEC") == "1":
+        return  # desactivado explícitamente
     try:
-        ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
-        if logger:
-            logger.info("ShellExecuteW retornó: %s", ret)
+        # Ya admin/SYSTEM → no relanzar
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            return
     except Exception:
-        if logger:
-            logger.error("Error al relanzar con elevación:\n%s", traceback.format_exc())
-    sys.exit(0)
+        # Si falla la detección, mejor no relanzar que duplicar procesos
+        return
+
+    args = list(argv or sys.argv)
+    exe  = current_interpreter(prefer_windowed=False)
+
+    # Construye los parámetros correctamente (maneja espacios y comillas)
+    try:
+        params = subprocess.list2cmdline(args[1:])
+    except Exception:
+        params = " ".join(args[1:])
+
+    try:
+        # SW_SHOWNORMAL = 1
+        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+        # ShellExecuteW devuelve >32 en éxito
+        if rc > 32:
+            os._exit(0)
+        # Si rc <= 32, fallo: no hacemos nada (evitamos loops)
+    except Exception:
+        pass
+
 
 def maybe_elevate(require_admin: bool, argv: list[str], logger=None) -> None:
     """
@@ -183,3 +193,41 @@ def maybe_elevate(require_admin: bool, argv: list[str], logger=None) -> None:
             logger.info("Permisos de administrador confirmados.")
         return
     relaunch_elevated([], logger=logger)
+
+
+def is_system_or_admin() -> bool:
+    try:
+        # True para Administrador y también para SYSTEM
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+def current_interpreter(prefer_windowed: bool = False) -> str:
+    """
+    Devuelve el intérprete del venv si existe; si no, sys.executable.
+    prefer_windowed=True → pythonw.exe si está disponible.
+    """
+    inst = Path(os.getenv("XH_INSTALL_DIR") or Path(__file__).resolve().parents[1])
+    scripts = inst / "venv" / "Scripts"
+    if prefer_windowed:
+        cand = [scripts / "pythonw.exe", scripts / "python.exe"]
+    else:
+        cand = [scripts / "python.exe", scripts / "pythonw.exe"]
+    for p in cand:
+        if p.exists():
+            return str(p)
+    return sys.executable
+
+
+def ensure_admin_for(role: str) -> None:
+    """
+    No eleva nunca para 'notifier'. Para 'guardian', asume que lo lanza Scheduler como SYSTEM.
+    No hace NADA si ya se está elevado. Nunca relanza si XH_NO_REEXEC=1.
+    """
+    role = (role or "").lower()
+    if role in ("notifier", "gui", "panel"):
+        return
+    if role == "guardian":
+        return
+    # Para cualquier otro rol especial, si quisieras, llama a relaunch_elevated().
+    return

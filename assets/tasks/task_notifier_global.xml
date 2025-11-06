@@ -6,35 +6,20 @@
   </RegistrationInfo>
 
   <Triggers>
-    <!-- Al iniciar sesión del usuario -->
-    <LogonTrigger>
-      <Enabled>true</Enabled>
-      <Delay>PT60S</Delay>
-    </LogonTrigger>
-    <!-- Al desbloquear sesión -->
-    <SessionStateChangeTrigger>
-      <Enabled>true</Enabled>
-      <StateChange>SessionUnlock</StateChange>
-      <Delay>PT60S</Delay>
-    </SessionStateChangeTrigger>
-    <!-- Vigilancia: cada 5 min todo el día. Si ya está corriendo, se ignora. -->
+    <LogonTrigger><Enabled>true</Enabled><Delay>PT60S</Delay></LogonTrigger>
+    <SessionStateChangeTrigger><Enabled>true</Enabled><StateChange>SessionUnlock</StateChange><Delay>PT60S</Delay></SessionStateChangeTrigger>
     <CalendarTrigger>
       <StartBoundary>2000-01-01T00:00:00</StartBoundary>
       <Enabled>true</Enabled>
       <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
-      <Repetition>
-        <Interval>PT5M</Interval>
-        <Duration>P1D</Duration>
-        <StopAtDurationEnd>false</StopAtDurationEnd>
-      </Repetition>
+      <Repetition><Interval>PT5M</Interval><Duration>P1D</Duration><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>
     </CalendarTrigger>
   </Triggers>
 
   <Principals>
     <Principal id="Users">
-      <GroupId>S-1-5-32-545</GroupId>          <!-- Grupo "Users" -->
-      <LogonType>InteractiveToken</LogonType>  <!-- En la sesión interactiva -->
-      <RunLevel>LeastPrivilege</RunLevel>
+      <GroupId>S-1-5-32-545</GroupId>     <!-- Grupo "Users" -->
+      <RunLevel>LeastPrivilege</RunLevel> <!-- Opcional, puedes dejarlo -->
     </Principal>
   </Principals>
 
@@ -45,22 +30,17 @@
     <AllowStartOnDemand>true</AllowStartOnDemand>
     <StartWhenAvailable>true</StartWhenAvailable>
     <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>  <!-- sin límite -->
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <AllowHardTerminate>false</AllowHardTerminate>
-    <IdleSettings>
-      <StopOnIdleEnd>false</StopOnIdleEnd>
-      <RestartOnIdle>false</RestartOnIdle>
-    </IdleSettings>
-    <RestartOnFailure>
-      <Interval>PT1M</Interval>  <!-- usa PT1M por compatibilidad -->
-      <Count>999</Count>
-    </RestartOnFailure>
-    <Hidden>true</Hidden> <!-- la oculta en la UI, suma fricción -->
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>
+    <Hidden>true</Hidden>
   </Settings>
 
   <Actions Context="Users">
     <Exec>
-      <Command>C:\Program Files\XiaoHackParental\run_notifier.bat</Command>
+      <Command>C:\Program Files\XiaoHackParental\venv\Scripts\pythonw.exe</Command>
+      <Arguments>-m app.notifier --xh-role notifier</Arguments>
       <WorkingDirectory>C:\Program Files\XiaoHackParental</WorkingDirectory>
     </Exec>
   </Actions>
