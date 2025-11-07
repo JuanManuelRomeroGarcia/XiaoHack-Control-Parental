@@ -1,5 +1,7 @@
 python312.zip
 .
+DLLs
+Lib
 Lib\site-packages
 Lib\site-packages\pywin32_system32
 import site
