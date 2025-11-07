@@ -94,3 +94,22 @@ __pycache__/
 *.xcf
 *.ico.bak
 *.lnk
+
+# --- ALLOWLIST: Python portable en runtime (debe versionarse) ---
+!/py312/
+!/py312/**
+
+# Mantener ejecutables/zip del embebido aunque haya *.exe / *.zip ignorados arriba
+!py312/python.exe
+!py312/pythonw.exe
+!py312/python*.zip
+
+# Libs necesarias del portable
+!py312/**/*.dll
+!py312/**/*.pyd
+!py312/tcl/**
+!py312/Lib/site-packages/**
+
+# Tareas XML y cualquier binario de assets que quieras versionar
+!/assets/tasks/
+!/assets/tasks/**

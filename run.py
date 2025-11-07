@@ -1,10 +1,40 @@
 # run.py — lanzador con elevación opcional (UAC) y logging centralizado
 from __future__ import annotations
+
+# === Bootstrap para Python portable (ANTES de cualquier import propio) ===
+import os
 import sys
+from pathlib import Path
+
+# 1) DLLs (tcl/tk) y paths para Tkinter cuando usamos Python embebido
+try:
+    pydir = os.path.dirname(sys.executable)  # ...\py312
+    try:
+        # Disponible en Python 3.8+ (evita "DLL load failed" con portable)
+        os.add_dll_directory(pydir)
+    except Exception:
+        pass
+    os.environ.setdefault("TCL_LIBRARY", os.path.join(pydir, "tcl", "tcl8.6"))
+    os.environ.setdefault("TK_LIBRARY",  os.path.join(pydir, "tcl", "tk8.6"))
+except Exception:
+    # No interferir si no estamos en portable
+    pass
+
+# 2) Asegurar que la carpeta del proyecto (donde está run.py) está en sys.path
+#    Esto evita problemas si el cwd no es el del proyecto.
+try:
+    PROJECT_ROOT = Path(__file__).resolve().parent
+    proj_str = str(PROJECT_ROOT)
+    if proj_str not in sys.path:
+        sys.path.insert(0, proj_str)
+except Exception:
+    pass
+# === Fin bootstrap portable ===
+
 import logging
 import traceback
 
-# --- Inicializar logger muy pronto ---
+# --- Inicializar logger muy pronto (ya tenemos sys.path listo) ---
 from app.logs import configure, get_logger, install_exception_hooks
 
 # --- Helpers reutilizables de runtime ---
@@ -24,7 +54,6 @@ set_process_title(XH_ROLE)
 # Permite ajustar nivel vía variable de entorno XH_LOGLEVEL (opcional)
 _log_level = "INFO"
 try:
-    import os
     _log_level = os.getenv("XH_LOGLEVEL", _log_level).upper()
 except Exception:
     pass
@@ -39,7 +68,7 @@ try:
 except Exception:
     pass
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- 
 # Ejecución principal
 # -----------------------------------------------------------------------------
 def main():
@@ -61,8 +90,6 @@ def main():
     try:
         from xiao_gui.app import run
         log.info("Ejecutando aplicación principal (xiao_gui.app.run)")
-        # Nota: cualquier operación que requiera admin (p. ej. hosts) debe usar
-        # servicios privilegiados (Guardian SYSTEM) o helpers elevados específicos.
         run()
     except Exception:
         log.error("Error durante la ejecución principal:\n%s", traceback.format_exc())
