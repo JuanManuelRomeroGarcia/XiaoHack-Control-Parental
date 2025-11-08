@@ -116,7 +116,7 @@ class OptionsPage(ttk.Frame):
     # ---------------- Hooks de navegación ----------------
     def on_show_async(self, rev=None):
         rev = self._gate.next_rev() if rev is None else rev
-        submit_limited(self.refresh_service, rev)
+        submit_limited(self._task_refresh_service, rev)
         self.after(450, self.refresh_notifier_task_info)
         self.after(1200, self._auto_check_updates)
 
@@ -261,7 +261,7 @@ class OptionsPage(ttk.Frame):
             log.debug("Cambio de PIN cancelado o inválido.")
 
     # ---------------- Servicio (Guardian) ----------------
-    def refresh_service(self):
+    def refresh_service(self, *_):
         rev = self._gate.next_rev()
         submit_limited(self._task_refresh_service, rev)
 

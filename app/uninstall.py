@@ -14,6 +14,20 @@ import tempfile
 from pathlib import Path
 import logging
 
+# === Bootstrap portable (py312) — antes de usar tkinter =======================
+try:
+    _pydir = os.path.dirname(sys.executable)  # ...\py312 cuando usamos embebido
+    try:
+        os.add_dll_directory(_pydir)  # asegura carga de tcl/tk DLLs
+        os.add_dll_directory(os.path.join(_pydir, "DLLs"))
+    except Exception:
+        pass
+    os.environ.setdefault("TCL_LIBRARY", os.path.join(_pydir, "tcl", "tcl8.6"))
+    os.environ.setdefault("TK_LIBRARY",  os.path.join(_pydir, "tcl", "tk8.6"))
+except Exception:
+    pass
+# ============================================================================
+
 # --- AppUserModelID para icono correcto en barra de tareas ---
 try:
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("XiaoHack.Parental.Panel")
@@ -27,7 +41,6 @@ try:
     install_exception_hooks("uninstall-crash")
     log = get_logger("xh.uninstall")
 except Exception:
-    import logging
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     log = logging.getLogger("xh.uninstall")
 
@@ -42,7 +55,8 @@ try:
     import psutil  # type: ignore
 except Exception:
     psutil = None
-    log.warning("psutil no disponible; instala con: venv\\Scripts\\python.exe -m pip install psutil")
+    # Mensaje ajustado para portable
+    log.warning("psutil no disponible; instala con: \"%s\" -m pip install psutil", sys.executable)
 try:
     import bcrypt  # type: ignore
 except Exception:
@@ -64,24 +78,25 @@ INSTALL_MARK  = INSTALL_DIR / "installed.json"
 
 # Accesos comunes y escritorio
 PROGRAMS_COMMON = PROGRAM_DATA / r"Microsoft\Windows\Start Menu\Programs"
-LNK_MENU_DIR    = PROGRAMS_COMMON / "XiaoHack Parental"
-LNK_MENU_PANEL  = LNK_MENU_DIR / "XiaoHack Parental.lnk"
-LNK_MENU_UNINST = LNK_MENU_DIR / "Desinstalar XiaoHack Parental.lnk"
+LNK_MENU_DIR    = PROGRAMS_COMMON / "XiaoHack Control Parental"
+LNK_MENU_PANEL  = LNK_MENU_DIR / "XiaoHack Control Parental.lnk"
+LNK_MENU_UNINST = LNK_MENU_DIR / "Desinstalar XiaoHack Control Parental.lnk"
 PUBLIC_DESKTOP  = Path(os.environ.get("PUBLIC", r"C:\Users\Public")) / "Desktop"
 USER_DESKTOP    = Path(os.environ.get("USERPROFILE", "")) / "Desktop"
-LNK_DESK_PANEL_PUB  = PUBLIC_DESKTOP / "XiaoHack Parental.lnk"
-LNK_DESK_UNINST_PUB = PUBLIC_DESKTOP / "XiaoHack Uninstall.lnk"
-LNK_DESK_PANEL_USER  = USER_DESKTOP / "XiaoHack Parental.lnk"
-LNK_DESK_UNINST_USER = USER_DESKTOP / "XiaoHack Uninstall.lnk"
+LNK_DESK_PANEL_PUB  = PUBLIC_DESKTOP / "XiaoHack Control Parental.lnk"
+LNK_DESK_UNINST_PUB = PUBLIC_DESKTOP / "XiaoHack Control Uninstall.lnk"
+LNK_DESK_PANEL_USER  = USER_DESKTOP / "XiaoHack Control Parental.lnk"
+LNK_DESK_UNINST_USER = USER_DESKTOP / "XiaoHack Control Uninstall.lnk"
 
 COMMON_START  = PROGRAM_DATA / r"Microsoft\Windows\Start Menu\Programs\StartUp"  # por compat
 
 # Tareas programadas (nueva y heredadas)
 TASKS = [
     r"XiaoHackParental\Guardian",     # NUEVA
-    r"XiaoHack\Guardian", r"XiaoHack\Notifier", r"XiaoHack\ControlParental",
-    r"XiaoHackParental", r"Guardian", r"Notifier",
-    # heredada por versiones anteriores del uninstaller
+    r"XiaoHackParental\Notificador",
+    r"XiaoHack\Guardian", r"XiaoHack\Notificador", r"XiaoHack\Notifier",
+    r"XiaoHack\ControlParental",
+    r"XiaoHackParental", r"Guardian", r"Notifier", r"Notificador",
     r"XiaoHack_FinalCleanup",
 ]
 
@@ -89,7 +104,8 @@ TASKS = [
 MATCHES = ("--xh-role", "guardian.py", "notifier.py", "run.py", "webfilter.py", "dnsconfig.py")
 
 # No borrar en fase 1 (se rematan en fase 2)
-KEEP_NAMES = {"uninstall.py", "uninstall.bat", "venv"}
+# Cambiamos 'venv' -> 'py312' para portable
+KEEP_NAMES = {"uninstall.py", "uninstall.bat", "py312"}
 
 # -------------------------------------------------------------------
 # Utilidades
@@ -115,7 +131,7 @@ def _ensure_admin_or_relaunch():
     except Exception:
         return  # si falla la detección, seguimos (mejor que bloquear)
 
-    exe = sys.executable  # debería ser pythonw.exe
+    exe = sys.executable  # pythonw.exe embebido (py312)
     params = "-m app.uninstall --elevated 1"
     try:
         ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
@@ -191,18 +207,18 @@ def schtasks_stop_delete():
         run(["schtasks", "/End", "/TN", t])
         run(["schtasks", "/Delete", "/TN", t, "/F"])
 
-    # 2) Barrido amplio con PowerShell: cualquier tarea que huela a XiaoHack,
-    # Guardian o Notifier (incluye nombres personalizados).
+    # 2) Barrido amplio con PowerShell
     ps = r'''
 try {
   $ts = Get-ScheduledTask | Where-Object {
     $_.TaskName -like '*XiaoHack*' -or
     $_.TaskPath -like '\XiaoHack*' -or
     $_.TaskName -like '*Guardian*' -or
-    $_.TaskName -like '*Notifier*'
+    $_.TaskName -like '*Notifier*' -or
+    $_.TaskName -like '*Notificador*'
   }
   foreach ($t in $ts) {
-    try { Stop-ScheduledTask     -TaskName $t.TaskName -TaskPath $t.TaskPath -ErrorAction SilentlyContinue } catch {}
+    try { Stop-ScheduledTask       -TaskName $t.TaskName -TaskPath $t.TaskPath -ErrorAction SilentlyContinue } catch {}
     try { Unregister-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -Confirm:$false -ErrorAction SilentlyContinue } catch {}
   }
   'OK'
@@ -218,7 +234,7 @@ def schtasks_stop_delete_all():
     Elimina cualquier tarea relacionada con XiaoHack/Guardian/Notifier en cualquier ruta.
     También elimina 'XiaoHack_FinalCleanup' heredada de versiones anteriores del uninstaller.
     """
-    for name in ("\\XiaoHackParental\\Guardian", "\\XiaoHackParental\\Notifier", "XiaoHack_FinalCleanup"):
+    for name in ("\\XiaoHackParental\\Guardian", "\\XiaoHackParental\\Notificador", "XiaoHack_FinalCleanup"):
         run(["schtasks", "/End", "/TN", name])
         run(["schtasks", "/Delete", "/TN", name, "/F"])
 
@@ -228,7 +244,8 @@ try {
     $_.TaskName -like '*XiaoHack*' -or
     $_.TaskPath -like '\XiaoHack*' -or
     $_.TaskName -like '*Guardian*' -or
-    $_.TaskName -like '*Notifier*'
+    $_.TaskName -like '*Notifier*' -or
+    $_.TaskName -like '*Notificador*'
   }
   foreach ($t in $ts) {
     try { Stop-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -ErrorAction SilentlyContinue } catch {}
@@ -237,7 +254,7 @@ try {
   'OK'
 } catch { 'ERR' }
 '''
-    run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps])
+    run(["powershell","-NoProfile","-ExecutionPolicy","Bypass","-Command", ps])
 
 def _ps_ex_list(exclude_pids: set[int] | None) -> str:
     return ",".join(str(p) for p in sorted(exclude_pids or set()))
@@ -248,7 +265,7 @@ def kill_xh_processes(exclude_pids: set[int] | None = None):
     Usa WMI (Win32_Process) para poder filtrar por CommandLine.
     """
     ex = set(exclude_pids or set())
-    ex.add(SELF_PID)
+    ex.add(os.getpid())
     ex |= SELF_PARENTS
     ex |= SELF_CHILDREN
     ex_list = _ps_ex_list(ex)
@@ -333,11 +350,12 @@ def remove_shortcuts():
         LNK_DESK_PANEL_PUB, LNK_DESK_UNINST_PUB,
         LNK_DESK_PANEL_USER, LNK_DESK_UNINST_USER,
         LNK_MENU_PANEL, LNK_MENU_UNINST,
-        PROGRAMS_COMMON / "XiaoHack Control Parental.lnk",
+        PROGRAMS_COMMON / "XiaoHack Parental.lnk",  # restos antiguos
         PROGRAMS_COMMON / "XiaoHack" / "XiaoHack Control Parental.lnk",
         PROGRAMS_COMMON / "XiaoHack" / "Desinstalar XiaoHack.lnk",
         COMMON_START / "XiaoHack Notifier.lnk",
         COMMON_START / "XiaoHackParental Notifier.lnk",
+        COMMON_START / "XiaoHack Control Parental Notifier.lnk",
     ]:
         try:
             lnk.unlink(missing_ok=True)
