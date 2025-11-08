@@ -6,6 +6,7 @@
 from __future__ import annotations
 import getpass
 import subprocess
+import contextlib
 import app._bootstrap  # noqa: F401  # side-effects
 
 import os
@@ -90,6 +91,11 @@ _START_TS = 0.0
 _LAST_TJ_EVENT_TS = 0.0
 _COUNTDOWN_ACTIVE_UNTIL = 0.0
 _SUPPRESS_FLASH_UNTIL = {"av1": 0.0, "av2": 0.0}
+
+# Sondeo del Notifier (ajustable por env)
+SLEEP_ACTIVE = float(os.getenv("XH_NOTIFIER_SLEEP_ACTIVE", "0.10"))
+SLEEP_IDLE   = float(os.getenv("XH_NOTIFIER_SLEEP_IDLE",   "0.35"))
+
 
 # --------------------------------------------------------------------
 #  Auto-provision per-user (schtasks), mutex y espera de shell
@@ -331,6 +337,19 @@ def _log_startup_banner():
 def _log_shell_ready(waited: bool):
     log.debug("shell ready: %s", "yes" if waited else "timeout/no-shell")
 
+def _normpath(p: str) -> str:
+    if not p:
+        return ""
+    # quita comillas y separadores al final, normaliza y pone en minúsculas en Windows
+    p = p.strip().strip('"').rstrip("\\/")
+    try:
+        return os.path.normcase(os.path.normpath(p))
+    except Exception:
+        return p
+
+def _dirtrail(p: str) -> str:
+    q = _normpath(p)
+    return q if q.endswith(os.sep) else (q + os.sep)
 
 
 # --------------------------------------------------------------------
@@ -733,7 +752,7 @@ def explorer_watch_loop(stop_ev: threading.Event):
     log.info("ExplorerWatch iniciado.")
     shell = None
     last_closed = {}
-    backoff = 0.3
+    backoff = 0.3  # se adapta dinámicamente
 
     try:
         pythoncom.CoInitialize()
@@ -741,6 +760,7 @@ def explorer_watch_loop(stop_ev: threading.Event):
         pass
 
     while not stop_ev.is_set():
+        closed_any = False
         try:
             blocked = []
             try:
@@ -751,10 +771,19 @@ def explorer_watch_loop(stop_ev: threading.Event):
                 pass
 
             if not blocked:
-                _t.sleep(0.5)
+                _t.sleep(min(backoff, 0.8))
+                # aumenta drift si no hay nada que vigilar
+                backoff = min(backoff * 1.25, 0.8)
                 continue
+
             if shell is None:
-                shell = win32com.client.Dispatch("Shell.Application")
+                try:
+                    shell = win32com.client.Dispatch("Shell.Application")
+                except Exception:
+                    _t.sleep(min(backoff, 0.8))
+                    backoff = min(backoff * 1.25, 0.8)
+                    continue
+
             for w in shell.Windows():
                 try:
                     hwnd = int(getattr(w, "HWND", 0))
@@ -764,26 +793,41 @@ def explorer_watch_loop(stop_ev: threading.Event):
                     if cls not in ("CabinetWClass", "ExploreWClass"):
                         continue
                     doc = getattr(w, "Document", None)
-                    if doc and getattr(getattr(doc, "Folder", None), "Self", None):
-                        path = getattr(doc.Folder.Self, "Path", "")
-                        for d in blocked:
-                            if path.lower().startswith(d.lower()) and _t.time() - last_closed.get(hwnd, 0) > 1.5:
-                                log.info("Cerrar carpeta bloqueada: %s", path)
-                                win32gui.PostMessage(hwnd, WM_CLOSE, 0, 0)
-                                notify_once(f"dir:{d}", "Carpeta bloqueada", "Necesitas permiso del tutor para abrir esta carpeta.", 6.0)
-                                last_closed[hwnd] = _t.time()
-                                break
-                except Exception as e:
-                    log.debug("Error ventana Explorer: %s", e)
+                    folder = getattr(doc, "Folder", None) if doc else None
+                    self_item = getattr(folder, "Self", None) if folder else None
+                    path = str(getattr(self_item, "Path", "") or "").strip()
+
+                    if not path:
+                        continue
+                    pnorm = _normpath(path)
+                    if any(pnorm.startswith(_dirtrail(bp)) for bp in blocked):
+                        # de-bounce por hwnd
+                        now = _t.time()
+                        if now - last_closed.get(hwnd, 0) < 2.0:
+                            continue
+                        last_closed[hwnd] = now
+
+                        log.info("ExplorerWatch: cerrar hwnd=%s path=%s", hwnd, pnorm)
+                        try:
+                            win32gui.PostMessage(hwnd, WM_CLOSE, 0, 0)
+                        except Exception:
+                            with contextlib.suppress(Exception):
+                                w.Quit()
+                        closed_any = True
+                except Exception:
+                    continue
+
         except Exception as e:
             log.error("ExplorerWatch loop error: %s", e)
             shell = None
+
+        # Backoff adaptativo
+        if closed_any:
+            backoff = 0.15
+        else:
+            backoff = min(backoff * 1.15, 0.8)
         _t.sleep(backoff)
-    try:
-        pythoncom.CoUninitialize()
-    except Exception:
-        pass
-    log.info("ExplorerWatch detenido.")
+
 
 # --------------------------------------------------------------------
 # Overlay TopMost nativo — per monitor
@@ -1248,8 +1292,13 @@ def overlay_loop(stop_ev: threading.Event):
       - Flash 10/5 min (5s) si está activo.
       - Si no hay flash: countdown del último minuto (n=60..1) desde el timer local/state.
     """
-    SLEEP_ACTIVE = 0.06
-    SLEEP_IDLE   = 0.20
+    # Ajustes finos de consumo (se pueden tunear por entorno)
+    try:
+        SLEEP_ACTIVE = float(os.getenv("XH_OVERLAY_SLEEP_ACTIVE", "0.08"))  # antes 0.06
+        SLEEP_IDLE   = float(os.getenv("XH_OVERLAY_SLEEP_IDLE",   "0.30"))  # antes 0.20
+    except Exception:
+        SLEEP_ACTIVE, SLEEP_IDLE = 0.08, 0.30
+
     default_subtitle = "Último minuto • Guarda tu partida"
 
     def _pump():
@@ -1274,7 +1323,7 @@ def overlay_loop(stop_ev: threading.Event):
                         log.debug("OVERLAY→ show (flash)")
                     mgr.subtitle = fsub or default_subtitle
                     mgr.render_text(ftxt)
-                    last_n = -1  # no mezclar con countdown previo
+                    last_n = -1
                     _pump()
                     _t.sleep(SLEEP_ACTIVE)
                     continue
@@ -1482,7 +1531,7 @@ def main():
             # 2) NOTIFY
             rows_nt = query_new_notifies(last_nt)
             log.debug("DB→ poll: last_nt=%s, last_cd=%s, nt_rows=%d, cd_rows=%d",
-                      last_nt, last_cd, len(rows_nt or []), len(rows_cd or []))
+                    last_nt, last_cd, len(rows_nt or []), len(rows_cd or []))
 
             saw_tiempo_event = False
 
@@ -1503,20 +1552,18 @@ def main():
                         log.info("Flash recibido → mostrar banner %s (%s)", big, sub)
                         trigger_flash_banner(big, sub, seconds=BANER_START_TTL)
 
-                        # 2) Sube flags para anular fallback (siempre que el umbral coincida)
-                        #    y abre una ventana de supresión para ese umbral (anti-eco).
+                        # 2) Flags anti-eco
                         try:
                             if abs(secs - _AVISO1_SEC) <= 2:
                                 _LAST_FLAGS["m10"] = True
                                 _SUPPRESS_FLASH_UNTIL["av1"] = _t.time() + 90.0
                             elif abs(secs - _AVISO2_SEC) <= 2:
-                                _LAST_FLAGS["m5"] = True
+                                _LAST_FLAGS["m5"]  = True
                                 _SUPPRESS_FLASH_UNTIL["av2"] = _t.time() + 90.0
                         except Exception:
                             pass
 
-                    # 3) Si es el mensaje del último minuto (o cualquier otro sin “secs”)
-                    #    no armamos flash aquí; el count-down vendrá por evento 'countdown start'
+                    # El último minuto lo maneja 'countdown start'
 
                 last_nt = rid
                 st_local["last_nt_id"] = last_nt
@@ -1534,7 +1581,7 @@ def main():
                 if (now_ts - _LAST_TJ_EVENT_TS) > 8.0:
                     _LAST_FLAGS = _flash_from_state_transitions(_LAST_FLAGS)
 
-            # 3) BLOCKS: igual que antes
+            # 3) BLOCKS
             rows = query_new_blocks(last_block)
             for rid, ts, val, meta in rows:
                 app, reason = (val or "").strip(), (meta or "").strip().lower()
@@ -1552,7 +1599,12 @@ def main():
         except Exception as e:
             log.error("Error en loop principal: %s", e)
 
-        _t.sleep(0.15)
+        # ↓↓↓ NUEVO: sueño adaptativo según actividad de esta iteración ↓↓↓
+        any_activity = bool((rows_cd and len(rows_cd) > 0) or
+                            (rows_nt and len(rows_nt) > 0) or
+                            (rows    and len(rows)    > 0))
+        _t.sleep(SLEEP_ACTIVE if any_activity else SLEEP_IDLE)
+
 
 
 if __name__ == "__main__":

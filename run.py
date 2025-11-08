@@ -1,3 +1,8 @@
+# ruff: noqa=E402
+# flake8: noqa: E402
+# pyright: reportNotTopLevelImport=false
+# isort: skip_file
+
 # run.py — lanzador con elevación opcional (UAC) y logging centralizado
 from __future__ import annotations
 
@@ -9,18 +14,16 @@ import sys
 import traceback
 from pathlib import Path
 
-# Endurecimiento del entorno (evita heredar cosas raras del sistema/usuario)
+# Endurecimiento del entorno
 os.environ.setdefault("PYTHONUTF8", "1")
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 os.environ.setdefault("PYTHONNOUSERSITE", "1")
 
-# 1) Resolver rutas clave
+# 1) Resolver rutas clave y fijar cwd al proyecto
 try:
     PROJECT_ROOT = Path(__file__).resolve().parent
 except Exception:
     PROJECT_ROOT = Path.cwd()
-
-# Si nos lanzan por .lnk/Task Scheduler sin cwd, fuerzo cwd al proyecto
 try:
     os.chdir(str(PROJECT_ROOT))
 except Exception:
@@ -33,61 +36,55 @@ try:
     LIB   = PYDIR / "Lib"
     SITE  = LIB / "site-packages"
 
-    # Carga de DLLs nativos (tcl/tk, _tkinter.pyd, pywin32, etc.)
+    for d in (PYDIR, DLLS):
+        try:
+            os.add_dll_directory(str(d))
+        except Exception:
+            pass
+
+    def _prepend_env_path(p: str) -> None:
+        cur = os.environ.get("PATH", "")
+        parts = cur.split(";") if cur else []
+        if p and p not in parts:
+            os.environ["PATH"] = (p + ";" + cur) if cur else p
+
+    def _prepend_syspath(p: Path) -> None:
+        sp = str(p)
+        if sp and sp not in sys.path:
+            sys.path.insert(0, sp)
+
+    for p in (str(PYDIR), str(DLLS)):
+        _prepend_env_path(p)
+    for p in (PYDIR, DLLS, LIB, SITE):
+        _prepend_syspath(p)
+
+    PYW32_SYS = SITE / "pywin32_system32"
+    if PYW32_SYS.exists():
+        _prepend_syspath(PYW32_SYS)
+        _prepend_env_path(str(PYW32_SYS))
+
+    os.environ.setdefault("TCL_LIBRARY", str(PYDIR / "tcl" / "tcl8.6"))
+    os.environ.setdefault("TK_LIBRARY",  str(PYDIR / "tcl" / "tk8.6"))
+
     try:
-        # Python 3.8+: imprescindible para evitar "DLL load failed" en portable
-        os.add_dll_directory(str(PYDIR))
-        os.add_dll_directory(str(DLLS))
+        import site as _site
+        _site.addsitedir(str(SITE))  # asegura escaneo de .pth y añade paths
     except Exception:
         pass
 
-    # Amplío PATH para que Windows resuelva dependencias nativas
-    os.environ["PATH"] = (
-        f"{PYDIR};{DLLS};{os.environ.get('PATH','')}"
-    )
-
-    # Rutas de importación (primero portable)
-    for p in (PYDIR, DLLS, LIB, SITE):
-        sp = str(p)
-        if sp not in sys.path:
-            sys.path.insert(0, sp)
-
-    # pywin32 system32 (si existe)
-    PYW32_SYS = SITE / "pywin32_system32"
-    if PYW32_SYS.exists():
-        sp = str(PYW32_SYS)
-        if sp not in sys.path:
-            sys.path.insert(0, sp)
-        os.environ["PATH"] = f"{sp};{os.environ.get('PATH','')}"
-
-    # Tcl/Tk (Tkinter)
-    os.environ.setdefault("TCL_LIBRARY", str(PYDIR / "tcl" / "tcl8.6"))
-    os.environ.setdefault("TK_LIBRARY",  str(PYDIR / "tcl" / "tk8.6"))
 except Exception:
-    # No interferir si no estamos en portable
-    pass
+    pass  # no interferir si no es portable
 
 # =======================
 # Resto del lanzador
 # =======================
 import logging
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-# si el .lnk o la tarea no ponen WorkingDirectory, nos plantamos en el del proyecto
-try:
-    os.chdir(str(PROJECT_ROOT))
-except Exception:
-    pass
-
-# inserta el directorio del proyecto al principio de sys.path
 proj_str = str(PROJECT_ROOT)
 if proj_str not in sys.path:
     sys.path.insert(0, proj_str)
 
-# --- Inicializar logger muy pronto (ya con sys.path listo) ---
 from app.logs import configure, get_logger, install_exception_hooks  # noqa: E402
-
-# --- Helpers reutilizables de runtime ---
 from utils.runtime import (  # noqa: E402
     parse_role,
     set_appusermodelid,
@@ -95,32 +92,22 @@ from utils.runtime import (  # noqa: E402
     maybe_elevate,
 )
 
-# --- AppUserModelID (icono barra de tareas) + título del proceso --------------
 XH_ROLE = parse_role(sys.argv) or "panel"
 set_appusermodelid("XiaoHack.Parental.Panel")
 set_process_title(XH_ROLE)
 
-# --- Config de logs del lanzador ----------------------------------------------
-# Permite ajustar nivel vía variable de entorno XH_LOGLEVEL (opcional)
 _log_level = os.getenv("XH_LOGLEVEL", "INFO").upper()
-configure(level=_log_level)  # "INFO" por defecto
+configure(level=_log_level)
 install_exception_hooks("launcher-crash")
 log = get_logger("launcher")
 
-# Log útil al arrancar (root)
 try:
     logging.getLogger().info("XiaoHack process started (role=%s)", XH_ROLE)
 except Exception:
     pass
 
-# -----------------------------------------------------------------------------
-# Ejecución principal
-# -----------------------------------------------------------------------------
-def main() -> None:
-    # Flags de control:
-    #   --require-admin : fuerza elevación al inicio (escenario mantenimiento/instalación)
-    #   --no-elevate    : ignora cualquier intento de elevación (útil para debugging)
-    #   --xh-role       : rol (panel/guardian/notifier/etc.) — no obligatorio aquí
+
+def main():
     argv_lower = {a.lower() for a in sys.argv[1:]}
     require_admin = "--require-admin" in argv_lower
     no_elevate    = "--no-elevate" in argv_lower
@@ -129,17 +116,17 @@ def main() -> None:
 
     if require_admin and not no_elevate:
         maybe_elevate(require_admin=True, argv=sys.argv, logger=log)
-        # Nota: maybe_elevate relanza el proceso si procede.
     else:
         log.info("Ejecución sin elevación inicial (se elevará SOLO cuando haga falta).")
 
     try:
-        from xiao_gui.app import run
+        from xiao_gui.app import run  # noqa: E402
         log.info("Ejecutando aplicación principal (xiao_gui.app.run)")
         run()
     except Exception:
         log.error("Error durante la ejecución principal:\n%s", traceback.format_exc())
         raise
+
 
 if __name__ == "__main__":
     main()

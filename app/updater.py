@@ -1,11 +1,10 @@
-# updater.py — XiaoHack Control Parental
+# app/updater.py — XiaoHack Control Parental (portable)
 # - Comprueba última versión en GitHub y (opcional) aplica update desde ZIP runtime
-# - Elevación UAC sólo al aplicar (si faltan permisos)
+# - Elevación UAC solo al aplicar (si faltan permisos)
 # - Detiene/relanza tarea SYSTEM del Guardian de forma segura
-# - No toca ProgramData ni LocalAppData (solo binarios en INSTALL_DIR)
-# --- bootstrap de imports cuando se ejecuta por ruta --------------------------
-
+# - Diseñado para instalación con Python embebido en INSTALL_DIR\py312
 from __future__ import annotations
+
 import json
 import os
 import sys
@@ -20,12 +19,10 @@ from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
 
-# --- bootstrap de imports cuando se ejecuta por ruta --------------------------
-# Permite "from app..." aunque se lance updater.py por ruta.
+# --- bootstrap para imports relativos cuando se ejecuta por ruta --------------
 _ROOT = Path(__file__).resolve().parents[1]  # ...\XiaoHackParental
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
-# ------------------------------------------------------------------------------
 
 from app.logs import get_logger  # noqa: E402
 
@@ -35,10 +32,56 @@ try:
 except Exception:
     pass
 
-
 log = get_logger("gui.Updater")
-  # ya usas time, Path, etc.
 
+# ---------------- Rutas base / ficheros de versión ----------------------------
+BASE_DIR    = Path(__file__).resolve().parent
+INSTALL_DIR = _ROOT
+VER_JSON    = INSTALL_DIR / "VERSION.json"
+VER_TXT     = INSTALL_DIR / "VERSION"
+
+# Python portable preferido para relanzar GUI
+def _portable_pythonw() -> Path:
+    pyw = INSTALL_DIR / "py312" / "pythonw.exe"
+    if pyw.exists():
+        return pyw
+    py = INSTALL_DIR / "py312" / "python.exe"
+    return py if py.exists() else Path(sys.executable)
+
+# Tarea programada del servicio guardian (SYSTEM)
+TASK_GUARDIAN = r"XiaoHackParental\Guardian"
+
+# ---------------- Config GitHub (con overrides por entorno) -------------------
+OWNER = os.getenv("XH_GH_OWNER", "JuanManuelRomeroGarcia")
+REPO  = os.getenv("XH_GH_REPO",  "XiaoHack-Control-Parental")
+API_LATEST = f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest"
+HTTP_TIMEOUT = float(os.getenv("XH_HTTP_TIMEOUT", "60"))
+
+# ---------------- Utilidades de texto / versión --------------------------------
+def _read_text_clean(path: Path) -> str:
+    return path.read_text(encoding="utf-8-sig").strip().lstrip("\ufeff")
+
+def _write_text_utf8(path: Path, text: str) -> None:
+    path.write_text((text or "").rstrip() + "\n", encoding="utf-8")
+
+def _normalize_version_str(v: str) -> str:
+    v = (v or "").strip()
+    if v.lower().startswith("v"):
+        v = v[1:].strip()
+    return v
+
+def _ver_tuple(v: str):
+    parts = []
+    for tok in v.replace("-", ".").split("."):
+        try:
+            parts.append(int(tok))
+        except Exception:
+            break
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
+
+# ---------------- Log auxiliar persistente ------------------------------------
 def _apply_log_path() -> Path:
     try:
         base = Path(os.getenv("ProgramData", r"C:\ProgramData")) / "XiaoHackParental" / "logs"
@@ -56,11 +99,8 @@ def _apply_log(msg: str) -> None:
             f.write(f"[{ts}] {msg}\n")
     except Exception:
         pass
-    
+
 def _write_result_json(ok: bool, latest: str, mode: str) -> None:
-    """
-    Guarda un JSON para que la GUI muestre el resultado.
-    """
     try:
         p = _apply_log_path().parent / "updater_result.json"
         data = {"ok": ok, "latest": latest, "mode": mode, "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
@@ -69,164 +109,15 @@ def _write_result_json(ok: bool, latest: str, mode: str) -> None:
     except Exception as e:
         _apply_log(f"RESULT write failed: {e}")
 
-
-
 def _fail(code: int, message: str, exc: Exception | None = None) -> NoReturn:
-
     _apply_log(f"ERROR {code}: {message}")
     if exc:
         _apply_log("TRACEBACK:\n" + "".join(traceback.format_exception(exc)))
-    print(message, file=sys.stdout, flush=True)  # <- la GUI lo capturará
+    print(message, file=sys.stdout, flush=True)
     raise SystemExit(code)
 
-def _build_relaunch_plan_from_env() -> dict:
-    exe = os.getenv("XH_GUI_EXE") or str(INSTALL_DIR / "venv" / "Scripts" / "pythonw.exe")
-    script = os.getenv("XH_GUI_SCRIPT") or ""
-    try:
-        args = json.loads(os.getenv("XH_GUI_ARGS_JSON") or "[]")
-    except Exception:
-        args = []
-    return {"exe": exe, "script": script, "args": args}
-
-def _build_relaunch_plan_from_payload(payload: dict) -> dict:
-    exe = payload.get("gui_exe") or str(INSTALL_DIR / "venv" / "Scripts" / "pythonw.exe")
-    script = payload.get("gui_script") or ""
-    argsj = payload.get("gui_args_json") or "[]"
-    try:
-        args = json.loads(argsj)
-    except Exception:
-        args = []
-    return {"exe": exe, "script": script, "args": args}
-
-
-def _relaunch_panel(plan: dict | None = None) -> bool:
-    """
-    Relanza el panel con el plan indicado (exe/script/args). Si no hay script,
-    intenta -m xiao_gui.app como fallback.
-    """
-    try:
-        if plan is None:
-            plan = _build_relaunch_plan_from_env()
-
-        exe = Path(plan.get("exe") or (INSTALL_DIR / "venv" / "Scripts" / "pythonw.exe"))
-        script = plan.get("script") or ""
-        args = plan.get("args") or []
-
-        if script and Path(script).exists():
-            cmd = [str(exe), script] + list(args)
-        else:
-            # Fallback muy robusto
-            cmd = [str(exe), "-m", "xiao_gui.app"]
-
-        _apply_log("RELAUNCH panel: " + " ".join(map(str, cmd)))
-        subprocess.Popen(cmd, cwd=str(INSTALL_DIR), creationflags=0x08000000)
-        return True
-    except Exception as e:
-        _apply_log(f"RELAUNCH failed: {e}")
-        return False
-
-
-# ---------------- Config GitHub (con overrides por entorno) ----------------
-# [XH] Permitir override para pruebas con forks o ramas
-OWNER = os.getenv("XH_GH_OWNER", "JuanManuelRomeroGarcia")  # [XH]
-REPO  = os.getenv("XH_GH_REPO",  "XiaoHack-Control-Parental")  # [XH]
-API_LATEST = f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest"
-
-
-# [XH] Timeout y UA
-HTTP_TIMEOUT = float(os.getenv("XH_HTTP_TIMEOUT", "60"))  # segs  # [XH]
-
-# --- Texto / versiones: robusto con BOM y normalización ----------------------
-def _read_text_clean(path):
-    # Lee UTF-8 con/sin BOM y limpia espacios/BOM residuales
-    return path.read_text(encoding="utf-8-sig").strip().lstrip("\ufeff")
-
-def _write_text_utf8(path, text):
-    # Escribe en UTF-8 sin BOM (con LF final estándar)
-    path.write_text((text or "").rstrip() + "\n", encoding="utf-8")
-
-def _normalize_version_str(v: str) -> str:
-    # quita prefijo "v", recorta y deja solo "X.Y.Z" (o "X.Y")
-    v = (v or "").strip()
-    if v.lower().startswith("v"):
-        v = v[1:].strip()
-    return v
-# -----------------------------------------------------------------------------
-
-
-def _local_version_for_ua() -> str:  # [XH]
-    try:
-        return read_local_version()
-    except Exception:
-        return "0.0.0"
-
-def _build_user_agent() -> str:  # [XH]
-    return f"XiaoHack-Updater/{_local_version_for_ua()} (+https://github.com/{OWNER}/{REPO})"
-
-# Rutas
-BASE_DIR     = Path(__file__).resolve().parent   
-INSTALL_DIR  = _ROOT                                        
-VER_JSON = INSTALL_DIR / "VERSION.json"
-VER_TXT  = INSTALL_DIR / "VERSION"
-
-
-
-# Tarea programada del servicio guardian (SYSTEM)
-TASK_GUARDIAN = r"XiaoHackParental\Guardian"
-
-# Nombres de ZIP aceptados (por orden de preferencia)
-def candidate_zip_names(tag: str):
-    return [
-        f"XiaoHackParental-{tag}-runtime.zip",
-        f"XiaoHack-Control-Parental-{tag}-runtime.zip",
-        f"XiaoHackParental-{tag}.zip",
-        f"XiaoHack-Control-Parental-{tag}.zip",
-    ]
-
-# Carpetas/archivos a NO copiar nunca al cliente
-EXCLUDE_DIRS = {".git", ".github", "test", "tests", "__pycache__", ".venv", "venv", "dist", "build", "node_modules"}
-EXCLUDE_FILESUFFIX = {".md", ".MD", ".markdown", ".rst"}
-EXCLUDE_FILES = {".gitignore", ".gitattributes", ".editorconfig", "README", "README.md", "CHANGELOG.md", "LICENSE"}
-
-# ---------------- Utilidades ----------------
-def _http_get(url: str) -> bytes:
-    # [XH] UA + Accept + token opcional para evitar rate-limit en pruebas
-    headers = {
-        "User-Agent": _build_user_agent(),
-        "Accept": "application/vnd.github+json",
-    }
-    token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    req = Request(url, headers=headers)
-    try:
-        with urlopen(req, timeout=HTTP_TIMEOUT) as r:  # [XH] timeout
-            return r.read()
-    except HTTPError as e:
-        # Mensaje claro (rate limit, etc.)
-        if e.code in (403, 429):
-            raise RuntimeError(f"GitHub rate limit o acceso denegado ({e.code}). "
-                               f"Intenta más tarde o configura GITHUB_TOKEN.")
-        raise RuntimeError(f"HTTP {e.code} en {url}: {e.reason}")
-    except URLError as e:
-        raise RuntimeError(f"Error de red para {url}: {e.reason}")
-    except Exception as e:
-        raise RuntimeError(f"HTTP GET falló para {url}: {type(e).__name__}: {e}")
-
-def _ver_tuple(v: str):
-    # robusto: acepta "1.2.3" o "1.2"
-    parts = []
-    for tok in v.replace("-", ".").split("."):
-        try:
-            parts.append(int(tok))
-        except Exception:
-            break
-    while len(parts) < 3:
-        parts.append(0)
-    return tuple(parts[:3])
-
+# ---------------- Versión local / remota --------------------------------------
 def read_local_version() -> str:
-    # Prioriza JSON, luego texto; ambos BOM-safe
     try:
         if VER_JSON.exists():
             data = json.loads(_read_text_clean(VER_JSON))
@@ -243,24 +134,54 @@ def read_local_version() -> str:
     return "0.0.0"
 
 def write_local_version(new_version: str) -> None:
-    # Escribe SIEMPRE JSON bonito y sin BOM
     data = {"version": _normalize_version_str(new_version)}
     _write_text_utf8(VER_JSON, json.dumps(data, ensure_ascii=False))
 
+def _local_version_for_ua() -> str:
+    try:
+        return read_local_version()
+    except Exception:
+        return "0.0.0"
+
+def _build_user_agent() -> str:
+    return f"XiaoHack-Updater/{_local_version_for_ua()} (+https://github.com/{OWNER}/{REPO})"
+
+def _http_get(url: str) -> bytes:
+    headers = {
+        "User-Agent": _build_user_agent(),
+        "Accept": "application/vnd.github+json",
+    }
+    token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = Request(url, headers=headers)
+    try:
+        with urlopen(req, timeout=HTTP_TIMEOUT) as r:
+            return r.read()
+    except HTTPError as e:
+        if e.code in (403, 429):
+            raise RuntimeError(f"GitHub rate limit o acceso denegado ({e.code}).")
+        raise RuntimeError(f"HTTP {e.code} en {url}: {e.reason}")
+    except URLError as e:
+        raise RuntimeError(f"Error de red para {url}: {e.reason}")
+    except Exception as e:
+        raise RuntimeError(f"HTTP GET falló para {url}: {type(e).__name__}: {e}")
+
 def get_latest_release():
-    """
-    Devuelve (tag, zip_asset) o (None, None) en caso de error.
-    Nunca lanza excepción.
-    """
     try:
         data = json.loads(_http_get(API_LATEST).decode("utf-8"))
         tag = _normalize_version_str((data.get("tag_name") or data.get("name") or ""))
         assets = data.get("assets", []) or []
-        # Intenta casar con tus nombres zip esperados según 'tag'
-        wanted = set(candidate_zip_names(tag)) if tag else set()
-        zip_asset = None
+        # Elegimos cualquier .zip si solo hay uno; si hay varios, preferimos nombres típicos
+        preferred = {
+            f"XiaoHackParental-{tag}-runtime.zip",
+            f"XiaoHack-Control-Parental-{tag}-runtime.zip",
+            f"XiaoHackParental-{tag}.zip",
+            f"XiaoHack-Control-Parental-{tag}.zip",
+        } if tag else set()
         by_name = {a.get("name", ""): a for a in assets}
-        for name in wanted:
+        zip_asset = None
+        for name in preferred:
             if name in by_name:
                 zip_asset = by_name[name]
                 break
@@ -270,15 +191,10 @@ def get_latest_release():
                 zip_asset = zips[0]
         return (tag or None), zip_asset
     except Exception as e:
-        log.error("Error obteniendo última versión desde GitHub: %s", e, exc_info=True)
+        log.error("Error obteniendo última versión (releases): %s", e, exc_info=True)
         return None, None
 
-
 def get_latest_version_fallback(owner: str, repo: str, branch: str = "main"):
-    """
-    Intenta leer VERSION.json o VERSION desde la rama.
-    Devuelve (latest_version, error_str|None).
-    """
     last_err = None
     urls = [
         f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/VERSION.json",
@@ -296,15 +212,10 @@ def get_latest_version_fallback(owner: str, repo: str, branch: str = "main"):
                 return v, None
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
-    return None, (last_err or "No se pudo leer VERSION en raw.githubusercontent.com")
-
+    return None, (last_err or "No se pudo leer VERSION")
 
 def resolve_latest_version(owner: str, repo: str, branch: str = "main"):
-    """
-    Devuelve (latest_version|None, error_str|None).
-    Primero intenta releases, si no hay, cae a raw VERSION.
-    """
-    tag, _asset = get_latest_release()
+    tag, _ = get_latest_release()
     if tag:
         return tag, None
     latest, err = get_latest_version_fallback(owner, repo, branch)
@@ -312,7 +223,10 @@ def resolve_latest_version(owner: str, repo: str, branch: str = "main"):
         return latest, None
     return None, (err or "No se pudo obtener la versión de GitHub")
 
-
+# ---------------- Filtros de copia --------------------------------------------
+EXCLUDE_DIRS = {".git", ".github", "test", "tests", "__pycache__", ".venv", "venv", "dist", "build", "node_modules"}
+EXCLUDE_FILESUFFIX = {".md", ".MD", ".markdown", ".rst"}
+EXCLUDE_FILES = {".gitignore", ".gitattributes", ".editorconfig", "README", "README.md", "CHANGELOG.md", "LICENSE"}
 
 def _should_skip(path: str, is_dir: bool) -> bool:
     name = os.path.basename(path)
@@ -326,6 +240,7 @@ def _should_skip(path: str, is_dir: bool) -> bool:
                 return True
     return False
 
+# ---------------- Gestión de tareas/Procesos ----------------------------------
 def _stop_guardian_task():
     try:
         subprocess.run(["schtasks", "/End", "/TN", TASK_GUARDIAN], check=False, capture_output=True, creationflags=0x08000000)
@@ -339,10 +254,6 @@ def _start_guardian_task():
         pass
 
 def _kill_processes_in_install(extra_names: tuple[str, ...] = ()) -> None:
-    """
-    Mata procesos cuyo ExecutablePath esté dentro de INSTALL_DIR,
-    excepto el proceso actual y el propio intérprete que ejecuta el updater.
-    """
     base = str(INSTALL_DIR).lower()
     me = os.getpid()
     try:
@@ -352,7 +263,6 @@ def _kill_processes_in_install(extra_names: tuple[str, ...] = ()) -> None:
 
     _apply_log(f"KILL in install dir: base={base} pid_me={me} exe_me={myexe}")
 
-    # Preparar literales seguros para PowerShell
     base_ps  = base.replace("'", "''")
     myexe_ps = myexe.lower().replace("'", "''")
 
@@ -370,8 +280,8 @@ Get-CimInstance Win32_Process | ForEach-Object {{
     if (-not $exe) {{ return }}
     $exel = $exe.ToLower()
     if ($exel.StartsWith($base)) {{
-      if ($_.ProcessId -eq $me) {{ return }}                  
-      if ($exel -eq '{myexe_ps}') {{ return }}                
+      if ($_.ProcessId -eq $me) {{ return }}
+      if ($exel -eq '{myexe_ps}') {{ return }}
       $name = ($_.Name); if ($name) {{ $name = $name.ToLower() }} else {{ $name = '' }}
       {allow_block}
       Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
@@ -380,10 +290,8 @@ Get-CimInstance Win32_Process | ForEach-Object {{
   }} catch {{ }}
 }}
 """
-    cp = subprocess.run(
-        ["PowerShell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
-        capture_output=True, text=True, creationflags=0x08000000
-    )
+    cp = subprocess.run(["PowerShell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                        capture_output=True, text=True, creationflags=0x08000000)
     if cp.stdout:
         for line in cp.stdout.splitlines():
             _apply_log(line.strip())
@@ -391,10 +299,6 @@ Get-CimInstance Win32_Process | ForEach-Object {{
         _apply_log("KILL STDERR: " + cp.stderr.strip())
 
 def _kill_gui_explicit(gui_pid: int | None, gui_exe: str | None) -> None:
-    """
-    Intenta cerrar el panel por PID y/o por ruta de ejecutable.
-    Refuerza por CommandLine (run.py / --xh-role panel).
-    """
     try:
         pid = int(gui_pid) if gui_pid is not None else 0
     except Exception:
@@ -434,23 +338,16 @@ try {{
   }}
 }} catch {{ }}
 """
-    cp = subprocess.run(
-        ["PowerShell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
-        capture_output=True, text=True, creationflags=0x08000000
-    )
+    cp = subprocess.run(["PowerShell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                        capture_output=True, text=True, creationflags=0x08000000)
     if cp.stdout:
         for line in cp.stdout.splitlines():
             _apply_log(line.strip())
     if cp.stderr:
         _apply_log("KILL GUI STDERR: " + cp.stderr.strip())
 
-
-
+# ---------------- Aplicación del ZIP ------------------------------------------
 def _find_zip_root(tmp_dir: Path) -> Path:
-    """
-    Si el ZIP trae una carpeta raíz única (p.ej. XiaoHackParental-1.2.3/...), úsala como root.
-    Si no, usa tmp_dir directamente.
-    """
     entries = [p for p in tmp_dir.iterdir()]
     if len(entries) == 1 and entries[0].is_dir():
         return entries[0]
@@ -462,7 +359,6 @@ def _apply_zip_to_install(zip_path: Path):
         with zipfile.ZipFile(zip_path, "r") as z:
             z.extractall(tmp)
         root = _find_zip_root(tmp)
-        # Copia filtrada
         for src_dir, dirs, files in os.walk(root):
             dirs[:] = [d for d in dirs if not _should_skip(os.path.join(src_dir, d), True)]
             for f in files:
@@ -474,20 +370,16 @@ def _apply_zip_to_install(zip_path: Path):
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
 
-        # Limpieza opcional de restos de versiones anteriores
         _cleanup_orphans_from_install(root)
 
-                
 def _cleanup_orphans_from_install(zip_root: Path):
     """
-    Elimina archivos presentes en INSTALL_DIR que no están en el zip aplicado.
-    Se activa sólo si XH_CLEAN_ORPHANS=1.
-    Nunca borra: venv/, logs/, *.log, installed.json
+    Limpia archivos huérfanos si XH_CLEAN_ORPHANS=1.
+    Nunca borra: logs/, *.log, installed.json
     """
     if os.getenv("XH_CLEAN_ORPHANS", "0") != "1":
         return
-
-    keep_dirs = {"venv", "logs"}
+    keep_dirs = {"logs"}
     keep_files = {"installed.json"}
 
     wanted = set()
@@ -499,21 +391,19 @@ def _cleanup_orphans_from_install(zip_root: Path):
             wanted.add((rel_dir / f).as_posix())
 
     for cur_dir, dirs, files in os.walk(INSTALL_DIR):
-        # filtra dirs que nunca borraríamos
         dirs[:] = [d for d in dirs if d not in keep_dirs]
         for f in files:
             if f in keep_files:
                 continue
             p = Path(cur_dir) / f
             rel = p.relative_to(INSTALL_DIR).as_posix()
-            # si el archivo no está en el zip y no es un excluido explícito, borra
             if rel not in wanted and not _should_skip(str(p), False):
                 try:
                     p.unlink()
                 except Exception:
                     pass
 
-# ---------------- Elevación UAC (sólo al aplicar) ----------------
+# ---------------- Elevación UAC y relanzado GUI -------------------------------
 def _is_admin() -> bool:
     try:
         import ctypes
@@ -521,173 +411,71 @@ def _is_admin() -> bool:
     except Exception:
         return False
 
-def _elevate_and_apply(tmp_json: Path) -> int:
-    _apply_log(f"Elevando para aplicar. Payload: {tmp_json}")
-    py = os.path.normpath(sys.executable)
-    pyw = str(Path(py).with_name("pythonw.exe"))
-    py_to_use = pyw if os.path.exists(pyw) else py
-
-    exe     = py_to_use.replace("'", "''")
-    script  = str(Path(__file__).resolve()).replace("'", "''")
-    payload = str(tmp_json).replace("'", "''")
-
-    ps_cmd = (
-        "$argsList=@('{script}','--apply-elevated','{payload}');"
-        "$p=Start-Process -Verb RunAs -WindowStyle Hidden -FilePath '{exe}' "
-        "-ArgumentList $argsList -PassThru -Wait;"
-        "exit $p.ExitCode"
-    ).format(exe=exe, script=script, payload=payload)
-
-    cp = subprocess.run(
-        ["PowerShell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
-        text=True, capture_output=True, creationflags=0x08000000
-    )
-    _apply_log(f"Elevación terminada. rc={cp.returncode}")
-    if cp.stdout:
-        _apply_log("ELEVATION STDOUT:\n" + cp.stdout.strip())
-    if cp.stderr:
-        _apply_log("ELEVATION STDERR:\n" + cp.stderr.strip())
-    return cp.returncode
-
-def cmd_check() -> int:
-    info = check_for_update(auto_apply=False)
-    print(json.dumps(info, ensure_ascii=False))
-    return 0
-
-def cmd_apply() -> int:
-    _apply_log("BEGIN --apply")
+def _build_relaunch_plan_from_env() -> dict:
+    exe = os.getenv("XH_GUI_EXE") or str(_portable_pythonw())
+    script = os.getenv("XH_GUI_SCRIPT") or ""
     try:
-        current = read_local_version()
-        _apply_log(f"Versión local: {current}; INSTALL_DIR={INSTALL_DIR}")
+        args = json.loads(os.getenv("XH_GUI_ARGS_JSON") or "[]")
+    except Exception:
+        args = []
+    return {"exe": exe, "script": script, "args": args}
 
-        latest, err = resolve_latest_version(OWNER, REPO, branch="main")
-        if not latest:
-            _fail(15, f"No se pudo obtener la versión de GitHub: {err}")
+def _build_relaunch_plan_from_payload(payload: dict) -> dict:
+    exe = payload.get("gui_exe") or str(_portable_pythonw())
+    script = payload.get("gui_script") or ""
+    argsj = payload.get("gui_args_json") or "[]"
+    try:
+        args = json.loads(argsj)
+    except Exception:
+        args = []
+    return {"exe": exe, "script": script, "args": args}
 
-        _apply_log(f"Latest en GitHub: {latest}")
-        if _ver_tuple(latest) <= _ver_tuple(current):
-            msg = f"Ya está actualizado (local={current}, latest={latest})."
-            _apply_log(msg)
-            print(msg, flush=True)
-            _write_result_json(True, latest, mode="noop")
-            return 0
-
-        tag, zip_asset = get_latest_release()
-        if not tag or _normalize_version_str(tag) != _normalize_version_str(latest):
-            _fail(15, "No se encontró un release con ZIP para esta versión. "
-                      "Sube el asset runtime al release o ajusta get_latest_release().")
-        if not zip_asset:
-            _fail(15, "No se encontró un ZIP de runtime en el release. "
-                      "Sugerido: XiaoHackParental-<version>-runtime.zip")
-
-        zip_url  = zip_asset.get("browser_download_url")
-        zip_name = zip_asset.get("name", "update.zip")
-        if not zip_url:
-            _fail(15, "El asset ZIP del release no tiene browser_download_url.")
-
-        manual = (os.getenv("XH_MANUAL_RELAUNCH") == "1")
-
-        with tempfile.TemporaryDirectory() as td:
-            td_p = Path(td)
-            local_zip = td_p / zip_name
-            _apply_log(f"Descargando ZIP: {zip_url}")
-            local_zip.write_bytes(_http_get(zip_url))
-            _apply_log(f"ZIP descargado: {local_zip} ({local_zip.stat().st_size} bytes)")
-
-            can_write = os.access(INSTALL_DIR, os.W_OK)
-            if not can_write or not _is_admin():
-                payload = {
-                    "zip": str(local_zip),
-                    "latest": latest,
-                    "install_dir": str(INSTALL_DIR),
-                    "gui_pid": int(os.getenv("XH_GUI_PID") or "0"),
-                    "gui_exe": os.getenv("XH_GUI_EXE"),
-                    "gui_script": os.getenv("XH_GUI_SCRIPT"),
-                    "gui_args_json": os.getenv("XH_GUI_ARGS_JSON"),
-                    "manual": 1 if manual else 0,
-                }
-                tmp_json = td_p / "apply.json"
-                tmp_json.write_text(json.dumps(payload), encoding="utf-8")
-                _apply_log(f"Sin permisos. Elevando con payload: {tmp_json}")
-                code = _elevate_and_apply(tmp_json)
-                if code != 0:
-                    _fail(code or 15, f"Operación cancelada o fallida durante la elevación (rc={code}).")
-                _apply_log("OK: actualización aplicada por proceso elevado (hijo).")
-                print("OK: actualización aplicada (elevado).", flush=True)
-                return 0
-
-            # --- Aplicación en línea (somos admin) ---
-            _apply_log("Parando guardian y aplicando ZIP en línea (somos admin).")
-            _stop_guardian_task()
-
-            # En modo manual NO cerramos la GUI desde aquí (la GUI espera y muestra diálogo).
-            if not manual:
-                gui_pid = os.getenv("XH_GUI_PID")
-                gui_exe = os.getenv("XH_GUI_EXE")
-                _kill_gui_explicit(gui_pid, gui_exe)
-
-            _kill_processes_in_install()
-            time.sleep(0.5)
-            _apply_zip_to_install(local_zip)
-            try:
-                write_local_version(latest)
-            except Exception as e:
-                _apply_log(f"WARNING: no pude escribir VERSION.json: {e}")
-            _start_guardian_task()
-
-            # Resultado para la GUI
-            _write_result_json(True, latest, mode=("manual" if manual else "inline"))
-
-            if manual:
-                _apply_log("Manual mode: no relaunch/kill; devuelve control a la GUI.")
-                print("OK: actualización aplicada (manual).", flush=True)
-                return 0
-
-            # Automático: relanzar
+def _relaunch_panel(plan: dict | None = None) -> bool:
+    try:
+        if plan is None:
             plan = _build_relaunch_plan_from_env()
-            _ok = _relaunch_panel(plan)
-            _apply_log("OK: actualización aplicada (en línea). Relaunch=" + ("yes" if _ok else "no"))
-            print("OK: actualización aplicada.", flush=True)
-            return 0
 
-    except SystemExit:
-        raise
+        exe = Path(plan.get("exe") or _portable_pythonw())
+        script = plan.get("script") or ""
+        args = plan.get("args") or []
+
+        if script and Path(script).exists():
+            cmd = [str(exe), script] + list(args)
+        else:
+            # Fallback robusto: módulo principal de la GUI
+            cmd = [str(exe), "-m", "xiao_gui.app"]
+
+        _apply_log("RELAUNCH panel: " + " ".join(map(str, cmd)))
+        subprocess.Popen(cmd, cwd=str(INSTALL_DIR), creationflags=0x08000000)
+        return True
     except Exception as e:
-        _fail(15, f"Fallo inesperado en --apply: {e}", e)
+        _apply_log(f"RELAUNCH failed: {e}")
+        return False
 
-
-
-# ---------------- API pública ----------------
+# ---------------- Comandos públicos -------------------------------------------
 def check_for_update(auto_apply=False) -> dict:
-    """
-    Comprueba versión y, si auto_apply=True, aplica update con elevación si hace falta.
-    Devuelve: {"current","latest","update_available","applied","error"}
-    """
     info = {"current": read_local_version(), "latest": None, "update_available": False, "applied": False, "error": None}
 
-    # 1) Resolver latest con releases -> fallback a raw VERSION(.json)
-    latest, err = resolve_latest_version(OWNER, REPO, branch="main")  # cambia a "master" si toca
+    latest, err = resolve_latest_version(OWNER, REPO, branch="main")
     if not latest:
         info["error"] = f"No se pudo obtener la versión de GitHub: {err}"
         return info
 
     info["latest"] = latest
     if _ver_tuple(latest) <= _ver_tuple(info["current"]):
-        return info  # ya al día
+        return info
 
     info["update_available"] = True
     if not auto_apply:
         return info
 
-    # 2) Para auto-apply necesitamos localizar el ZIP en releases
     tag, zip_asset = get_latest_release()
     if not tag or _normalize_version_str(tag) != _normalize_version_str(latest):
         info["error"] = ("No se encontró un release con ZIP para esta versión. "
-                         "Descarga manual o publica el asset runtime.")
+                         "Publica el asset runtime.")
         return info
     if not zip_asset:
-        info["error"] = ("No se encontró un ZIP de runtime en el release. "
-                         "Sugerido: XiaoHackParental-<version>-runtime.zip")
+        info["error"] = "No se encontró un ZIP de runtime en el release."
         return info
 
     zip_url  = zip_asset.get("browser_download_url")
@@ -696,7 +484,6 @@ def check_for_update(auto_apply=False) -> dict:
         info["error"] = "El asset ZIP no tiene URL de descarga."
         return info
 
-    # 3) Descarga/aplica (eleva si hace falta)
     try:
         with tempfile.TemporaryDirectory() as td:
             td_p = Path(td)
@@ -735,62 +522,129 @@ def check_for_update(auto_apply=False) -> dict:
         info["error"] = f"Fallo al actualizar: {e}"
         return info
 
+def _elevate_and_apply(tmp_json: Path) -> int:
+    _apply_log(f"Elevando para aplicar. Payload: {tmp_json}")
+    py  = os.path.normpath(str(_portable_pythonw()))
+    exe = py.replace("'", "''")
+    script  = str(Path(__file__).resolve()).replace("'", "''")
+    payload = str(tmp_json).replace("'", "''")
 
-# ---------------- Entrada CLI (modo elevado) ----------------
-def _apply_elevated_from_payload(payload_path: Path) -> int:
-    _apply_log(f"BEGIN --apply-elevated payload={payload_path}")
+    ps_cmd = (
+        "$argsList=@('{script}','--apply-elevated','{payload}');"
+        "$p=Start-Process -Verb RunAs -WindowStyle Hidden -FilePath '{exe}' "
+        "-ArgumentList $argsList -PassThru -Wait;"
+        "exit $p.ExitCode"
+    ).format(exe=exe, script=script, payload=payload)
+
+    cp = subprocess.run(["PowerShell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
+                        text=True, capture_output=True, creationflags=0x08000000)
+    _apply_log(f"Elevación terminada. rc={cp.returncode}")
+    if cp.stdout:
+        _apply_log("ELEVATION STDOUT:\n" + cp.stdout.strip())
+    if cp.stderr:
+        _apply_log("ELEVATION STDERR:\n" + cp.stderr.strip())
+    return cp.returncode
+
+def cmd_check() -> int:
+    info = check_for_update(auto_apply=False)
+    print(json.dumps(info, ensure_ascii=False))
+    return 0
+
+def cmd_apply() -> int:
+    _apply_log("BEGIN --apply")
     try:
-        payload = json.loads(payload_path.read_text(encoding="utf-8"))
-        zip_path = Path(payload["zip"])
-        latest = payload.get("latest", "")
-        if not zip_path.exists():
-            _fail(3, f"ZIP temporal no existe: {zip_path}")
+        current = read_local_version()
+        _apply_log(f"Versión local: {current}; INSTALL_DIR={INSTALL_DIR}")
 
-        manual = bool(payload.get("manual"))
-        plan = _build_relaunch_plan_from_payload(payload)
+        latest, err = resolve_latest_version(OWNER, REPO, branch="main")
+        if not latest:
+            _fail(15, f"No se pudo obtener la versión de GitHub: {err}")
 
-        _apply_log("Parando guardian y aplicando ZIP (elevado).")
-        _stop_guardian_task()
-
-        # En modo manual NO cerramos la GUI; la GUI espera al updater.
-        if not manual:
-            gui_pid = payload.get("gui_pid", 0) or 0
-            gui_exe = payload.get("gui_exe", "")
-            _kill_gui_explicit(gui_pid, gui_exe)
-
-        _kill_processes_in_install()
-        time.sleep(0.5)
-        _apply_zip_to_install(zip_path)
-        try:
-            write_local_version(latest)
-        except Exception as e:
-            _apply_log(f"WARNING: no pude escribir VERSION.json elevado: {e}")
-        _start_guardian_task()
-
-        _write_result_json(True, latest, mode=("manual" if manual else "elevated"))
-
-        if manual:
-            _apply_log("Manual mode (elevado): no relaunch/kill; devuelve control a la GUI.")
-            print("OK: actualización aplicada (elevado, manual).", flush=True)
+        _apply_log(f"Latest en GitHub: {latest}")
+        if _ver_tuple(latest) <= _ver_tuple(current):
+            msg = f"Ya está actualizado (local={current}, latest={latest})."
+            _apply_log(msg)
+            print(msg, flush=True)
+            _write_result_json(True, latest, mode="noop")
             return 0
 
-        _ok = _relaunch_panel(plan)
-        _apply_log("OK: actualización aplicada (elevado). Relaunch=" + ("yes" if _ok else "no"))
-        print("OK: actualización aplicada (elevado).", flush=True)
-        return 0
+        tag, zip_asset = get_latest_release()
+        if not tag or _normalize_version_str(tag) != _normalize_version_str(latest):
+            _fail(15, "No se encontró un release con ZIP para esta versión.")
+        if not zip_asset:
+            _fail(15, "No se encontró un ZIP de runtime en el release.")
+
+        zip_url  = zip_asset.get("browser_download_url")
+        zip_name = zip_asset.get("name", "update.zip")
+        if not zip_url:
+            _fail(15, "El asset ZIP del release no tiene browser_download_url.")
+
+        manual = (os.getenv("XH_MANUAL_RELAUNCH") == "1")
+
+        with tempfile.TemporaryDirectory() as td:
+            td_p = Path(td)
+            local_zip = td_p / zip_name
+            _apply_log(f"Descargando ZIP: {zip_url}")
+            local_zip.write_bytes(_http_get(zip_url))
+            _apply_log(f"ZIP descargado: {local_zip} ({local_zip.stat().st_size} bytes)")
+
+            can_write = os.access(INSTALL_DIR, os.W_OK)
+            if not can_write or not _is_admin():
+                payload = {
+                    "zip": str(local_zip),
+                    "latest": latest,
+                    "install_dir": str(INSTALL_DIR),
+                    "gui_pid": int(os.getenv("XH_GUI_PID") or "0"),
+                    "gui_exe": os.getenv("XH_GUI_EXE"),
+                    "gui_script": os.getenv("XH_GUI_SCRIPT"),
+                    "gui_args_json": os.getenv("XH_GUI_ARGS_JSON"),
+                    "manual": 1 if manual else 0,
+                }
+                tmp_json = td_p / "apply.json"
+                tmp_json.write_text(json.dumps(payload), encoding="utf-8")
+                _apply_log(f"Sin permisos. Elevando con payload: {tmp_json}")
+                code = _elevate_and_apply(tmp_json)
+                if code != 0:
+                    _fail(code or 15, f"Operación cancelada o fallida durante la elevación (rc={code}).")
+                _apply_log("OK: actualización aplicada por proceso elevado (hijo).")
+                print("OK: actualización aplicada (elevado).", flush=True)
+                return 0
+
+            # Aplicación en línea (somos admin)
+            _apply_log("Parando guardian y aplicando ZIP en línea (somos admin).")
+            _stop_guardian_task()
+
+            if not manual:
+                _kill_gui_explicit(os.getenv("XH_GUI_PID"), os.getenv("XH_GUI_EXE"))
+
+            _kill_processes_in_install()
+            time.sleep(0.5)
+            _apply_zip_to_install(local_zip)
+            try:
+                write_local_version(latest)
+            except Exception as e:
+                _apply_log(f"WARNING: no pude escribir VERSION.json: {e}")
+            _start_guardian_task()
+
+            _write_result_json(True, latest, mode=("manual" if manual else "inline"))
+
+            if manual:
+                _apply_log("Manual mode: no relaunch/kill; devuelve control a la GUI.")
+                print("OK: actualización aplicada (manual).", flush=True)
+                return 0
+
+            plan = _build_relaunch_plan_from_env()
+            _ok = _relaunch_panel(plan)
+            _apply_log("OK: actualización aplicada (en línea). Relaunch=" + ("yes" if _ok else "no"))
+            print("OK: actualización aplicada.", flush=True)
+            return 0
 
     except SystemExit:
         raise
     except Exception as e:
-        try:
-            _start_guardian_task()
-        except Exception:
-            pass
-        _fail(2, f"Fallo en --apply-elevated: {e}", e)
+        _fail(15, f"Fallo inesperado en --apply: {e}", e)
 
-
-
-
+# ---------------- Entrada CLI --------------------------------------------------
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(prog="app.updater")
@@ -800,8 +654,40 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.apply_elevated:
-        sys.exit(_apply_elevated_from_payload(Path(args.apply_elevated)))
+        # Reutilizamos la misma lógica inline pero con payload (ya lo hace cmd_apply elevando)
+        payload_path = Path(args.apply_elevated)
+        # Implementación simple: leemos y ejecutamos como en cmd_apply pero elevado
+        # Para no duplicar demasiada lógica, reusamos _elevate_and_apply al revés:
+        # aquí simplemente cargamos el JSON y aplicamos en caliente (somos admin).
+        try:
+            data = json.loads(payload_path.read_text(encoding="utf-8"))
+            # Mínimo: zip + latest
+            zip_path = Path(data["zip"])
+            latest = data.get("latest", "")
+            manual = bool(data.get("manual"))
+            _apply_log(f"BEGIN --apply-elevated payload={payload_path}")
+            _stop_guardian_task()
+            if not manual:
+                _kill_gui_explicit(data.get("gui_pid", 0) or 0, data.get("gui_exe", ""))
+            _kill_processes_in_install()
+            time.sleep(0.5)
+            _apply_zip_to_install(zip_path)
+            try:
+                write_local_version(latest)
+            except Exception as ex:
+                _apply_log(f"WARNING: no pude escribir VERSION.json elevado: {ex}")
+            _start_guardian_task()
+            _write_result_json(True, latest, mode=("manual" if manual else "elevated"))
+            if not manual:
+                _relaunch_panel(_build_relaunch_plan_from_payload(data))
+            sys.exit(0)
+        except Exception as ex:
+            try:
+                _start_guardian_task()
+            except Exception:
+                pass
+            _fail(2, f"Fallo en --apply-elevated: {ex}", ex)
+
     if args.apply:
         sys.exit(cmd_apply())
-    # por defecto o --check:
     sys.exit(cmd_check())

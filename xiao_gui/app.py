@@ -1,10 +1,33 @@
 # app.py — XiaoHack Control Parental — GUI Tutor (revisado)
 from __future__ import annotations
+
+# --- Bootstrap portátil para Tk antes de importar tkinter ---
+# (No molesta si no se usa portable. Solo añade rutas DLL y TCL/TK si existen.)
+import os
+import sys
+try:
+    pydir = os.path.dirname(sys.executable)  # ...\py312
+    # En portable, añade rutas de DLLs primero para evitar "DLL load failed"
+    if hasattr(os, "add_dll_directory"):
+        try:
+            os.add_dll_directory(pydir)
+        except Exception:
+            pass
+        try:
+            os.add_dll_directory(os.path.join(pydir, "DLLs"))
+        except Exception:
+            pass
+    # Variables TCL/TK si no estuvieran
+    os.environ.setdefault("TCL_LIBRARY", os.path.join(pydir, "tcl", "tcl8.6"))
+    os.environ.setdefault("TK_LIBRARY",  os.path.join(pydir, "tcl", "tk8.6"))
+except Exception:
+    # Si no es portable o algo falla, seguimos como estábamos
+    pass
+
 import contextlib
 import json
 from pathlib import Path
 import traceback
-import sys
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime
@@ -68,16 +91,17 @@ def _normalize_version(v: str) -> str:
 
 def _read_version() -> str:
     root = Path(__file__).resolve().parents[1]  # ...\XiaoHackParental
-    # 1) VERSION.json
-    try:
-        vjson = root / "VERSION.json"
-        if vjson.exists():
-            data = json.loads(_read_text_clean(vjson))
-            v = _normalize_version(str(data.get("version", "")))
-            if v:
-                return v
-    except Exception:
-        pass
+    # 1) VERSION.json o version.json
+    for name in ("VERSION.json", "version.json"):
+        try:
+            pj = root / name
+            if pj.exists():
+                data = json.loads(_read_text_clean(pj))
+                v = _normalize_version(str(data.get("version", "")))
+                if v:
+                    return v
+        except Exception:
+            pass
     # 2) VERSION (texto plano)
     try:
         vtxt = root / "VERSION"

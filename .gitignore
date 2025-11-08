@@ -35,6 +35,7 @@ dist/
 
 # === Local tools (NO instalar en cliente) ===
 updated/
+*.old
 
 # === Development files ===
 .gitattributes

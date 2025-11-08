@@ -2,23 +2,40 @@
 # Bloqueo por nombre, ruta exacta, carpeta; argumentos; ficheros abiertos;
 # auto-protección opcional; detección instantánea por WMI; logs centralizados; heartbeat;
 # SINGLE-INSTANCE para evitar múltiples procesos.
+
 from __future__ import annotations
+
+# --- Bootstrap para entorno portable / rutas antes de imports propios ---
+import os
+import sys
+from pathlib import Path
+
+try:
+    # En portable, run.py ya hace esto, pero si guardian se invoca directo:
+    pydir = os.path.dirname(sys.executable)
+    try:
+        os.add_dll_directory(pydir)
+        os.add_dll_directory(os.path.join(pydir, "DLLs"))
+    except Exception:
+        pass
+    os.environ.setdefault("TCL_LIBRARY", os.path.join(pydir, "tcl", "tcl8.6"))
+    os.environ.setdefault("TK_LIBRARY",  os.path.join(pydir, "tcl", "tk8.6"))
+except Exception:
+    pass
+
+# -----------------------------------------------------------------------
 import contextlib
 import json
 import math
-import app._bootstrap  # noqa: F401
-
 import datetime
-import os
 import time
-import traceback
 import threading
 import queue
-from pathlib import Path
 import urllib
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
+import app._bootstrap  # noqa: F401 (asegura sys.path/site-packages en portable)
 import psutil  # type: ignore
 
 try:
@@ -46,7 +63,6 @@ except Exception:
     pythoncom = win32com = win32gui = win32process = None
 
 # --- Identidad de proceso XiaoHack (centralizado) ---
-import sys
 from utils.runtime import parse_role, set_process_title, set_appusermodelid
 
 XH_ROLE = parse_role(sys.argv) or "guardian"
@@ -60,7 +76,10 @@ set_process_title(XH_ROLE)
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = LOGS_DIR.parent
 CONFIG_PATH = DATA_DIR / "config.json"
-PROTECT_SELF = False  # pon True si quieres blindar la carpeta de instalación
+PROTECT_SELF = False  # True si quieres blindar carpeta de instalación
+# Desactivar la vigilancia de Explorer desde Guardian (consume y no es ideal en SYSTEM)
+# Si alguna vez quieres activarlo: set XH_GUARDIAN_EXPLORER_WATCH=1
+ENABLE_EXPLORER_WATCH = bool(int(os.getenv("XH_GUARDIAN_EXPLORER_WATCH", "0")))
 
 # Forzar data dir único (ProgramData) respetando XH_DATA_DIR si viene en entorno
 try:
@@ -70,23 +89,23 @@ try:
     else:
         _storage_set_data_dir_forced(str(Path(os.getenv("ProgramData", r"C:\ProgramData")) / "XiaoHackParental"))
 except Exception:
-    # no impedimos el arranque si falla el forzado
-    pass
+    pass  # no impedimos el arranque si falla
 
 log = get_logger("guardian")
 install_exception_hooks("guardian-crash")
 
 # =============================================================================
-# Normalización y utilidades
+# Normalización y utilidades (ajustes micro para bajar coste por iteración)
 # =============================================================================
 def _norm_name(s: str) -> str:
     return (s or "").strip().lower()
 
 def _normpath(p: str) -> str:
+    # Evitamos realpath() (puede tocar disco / UNC). Con abspath+normcase basta
     try:
-        return os.path.normcase(os.path.realpath(os.path.abspath(p or "")))
-    except Exception:
         return os.path.normcase(os.path.abspath(p or ""))
+    except Exception:
+        return os.path.normcase(p or "")
 
 def _dirtrail(p: str) -> str:
     p = _normpath(p).rstrip("\\/")
@@ -123,7 +142,7 @@ def _log_event(kind: str, value: str, meta: str = ""):
         from app.helperdb import log_event as _db_log_event
         _db_log_event(kind, value, meta)
     except Exception as e:
-        log.warning("Error escribiendo evento notifier: %s", e)
+        log.debug("EventDB warn: %s", e)  # baja a debug para no llenar logs
 
 # =============================================================================
 # Notificaciones de tiempo de juego (avisos 10/5/1 min + cuenta atrás)
@@ -237,6 +256,7 @@ def _notepad_has_blocked_window(pid: int, blocked_dirs_plus_self: list[str]) -> 
     if not (win32gui and win32process):
         return False
     hit = False
+
     def _enum(hwnd, _):
         nonlocal hit
         try:
@@ -252,6 +272,7 @@ def _notepad_has_blocked_window(pid: int, blocked_dirs_plus_self: list[str]) -> 
         except Exception:
             pass
         return True
+
     try:
         win32gui.EnumWindows(_enum, None)
     except Exception:
@@ -300,8 +321,8 @@ def _match_blocked(proc: psutil.Process, cfg, st,
     # --- whitelist por juego ---
     play_until = int(st.get("play_until", 0) or 0)
     now_sec = now_epoch()
-    allowed_by_manual = play_until > now_sec
     now_dt = datetime.datetime.fromtimestamp(now_sec)
+    allowed_by_manual = play_until > now_sec
     allowed_by_schedule = is_within_allowed_hours(cfg, now_dt)
     if allowed_by_manual or allowed_by_schedule:
         wl = set(_norm_name(x) for x in (st.get("play_whitelist") or cfg.get("game_whitelist", [])))
@@ -355,9 +376,8 @@ def _match_blocked(proc: psutil.Process, cfg, st,
                 return "wnd:notepad"
     return None
 
-
 # =============================================================================
-# WMI watcher: detección instantánea
+# WMI watcher: detección instantánea (solo si hay reglas)
 # =============================================================================
 def _wmi_watch_loop(q: "queue.Queue[tuple[int,str]]", stop_ev: threading.Event):
     if not (pythoncom and win32com):
@@ -371,7 +391,7 @@ def _wmi_watch_loop(q: "queue.Queue[tuple[int,str]]", stop_ev: threading.Event):
             log.info("WMI watcher activo")
             while not stop_ev.is_set():
                 try:
-                    evt = watcher.NextEvent(2000)
+                    evt = watcher.NextEvent(2000)  # 2s timeout
                     if evt:
                         q.put((int(evt.ProcessID), (evt.ProcessName or "").lower()))
                 except pythoncom.com_error:
@@ -386,7 +406,7 @@ def _wmi_watch_loop(q: "queue.Queue[tuple[int,str]]", stop_ev: threading.Event):
                 pythoncom.CoUninitialize()
 
 # =============================================================================
-# Explorer Watch
+# Explorer Watch (solo si hay blocked_dirs)
 # =============================================================================
 def _explorer_watch_loop(get_blocked_dirs_callable, stop_ev: threading.Event):
     if not (win32com and win32gui):
@@ -408,22 +428,26 @@ def _explorer_watch_loop(get_blocked_dirs_callable, stop_ev: threading.Event):
                 last_check = now
             else:
                 blocked_dirs = list(last_dirs)
+
             if not blocked_dirs:
                 time.sleep(backoff)
                 continue
+
             if shell is None:
                 try:
                     shell = win32com.client.Dispatch("Shell.Application")
                 except Exception as e:
-                    log.warning("ExplorerWatch fallo inicial: %s", e)
+                    log.debug("ExplorerWatch: %s", e)
                     time.sleep(backoff)
                     continue
+
             try:
                 wins = shell.Windows()
             except Exception:
                 shell = None
                 time.sleep(backoff)
                 continue
+
             for w in wins:
                 try:
                     url = (w.LocationURL or "")
@@ -448,7 +472,7 @@ def _explorer_watch_loop(get_blocked_dirs_callable, stop_ev: threading.Event):
                 except Exception:
                     continue
         except Exception as e:
-            log.error("ExplorerWatch loop error: %s", e)
+            log.debug("ExplorerWatch loop error: %s", e)
             shell = None
         time.sleep(backoff)
     with contextlib.suppress(Exception):
@@ -478,6 +502,64 @@ def _acquire_singleton() -> bool:
         return False
 
 # =============================================================================
+# Helpers para arrancar/parar detectores según haya reglas (menos CPU idle)
+# =============================================================================
+class _Detectors:
+    def __init__(self):
+        self.wmi_q: "queue.Queue[tuple[int,str]]" | None = None
+        self.wmi_stop: threading.Event | None = None
+        self.wmi_thr: threading.Thread | None = None
+
+        self.exp_stop: threading.Event | None = None
+        self.exp_thr: threading.Thread | None = None
+
+    def start_if_needed(self, blocked_names, blocked_execs, blocked_dirs, get_dirs_callable):
+        # WMI: si hay cualquier tipo de regla, lo necesitamos
+        need_wmi = bool(blocked_names or blocked_execs or blocked_dirs)
+
+        # Explorer (solo si hay paths Y si está habilitado explícitamente)
+        need_exp = ENABLE_EXPLORER_WATCH and bool(blocked_dirs)
+
+        # --- WMI watcher ---
+        if need_wmi and (self.wmi_thr is None or not self.wmi_thr.is_alive()):
+            self.wmi_q = queue.Queue()
+            self.wmi_stop = threading.Event()
+            self.wmi_thr = threading.Thread(
+                target=_wmi_watch_loop,
+                args=(self.wmi_q, self.wmi_stop),
+                name="WMIWatch",
+                daemon=True,
+            )
+            self.wmi_thr.start()
+            log.debug("WMI watcher iniciado")
+        if (not need_wmi) and self.wmi_stop is not None:
+            self.wmi_stop.set()
+            self.wmi_stop = None
+            self.wmi_thr = None
+            self.wmi_q = None
+            log.debug("WMI watcher detenido (sin reglas)")
+
+        # --- Explorer watcher ---
+        if need_exp and (self.exp_thr is None or not self.exp_thr.is_alive()):
+            self.exp_stop = threading.Event()
+            self.exp_thr = threading.Thread(
+                target=_explorer_watch_loop,
+                args=(get_dirs_callable, self.exp_stop),
+                name="ExplorerWatch",
+                daemon=True,
+            )
+            self.exp_thr.start()
+            log.debug("Explorer watcher iniciado (Guardian)")
+        if (not need_exp) and self.exp_stop is not None:
+            self.exp_stop.set()
+            self.exp_stop = None
+            self.exp_thr = None
+            log.debug("Explorer watcher detenido (sin paths o deshabilitado)")
+
+    def wmi_queue(self):
+        return self.wmi_q
+
+# =============================================================================
 # Main
 # =============================================================================
 def main():
@@ -495,8 +577,10 @@ def main():
     log.info("TAREA GUARDIAN INICIADA")
     log.info("------------------------------------------------")
     log.info("Guardian START pid=%s", os.getpid())
+
+    # Bajar prioridad para no competir con GUI/Explorer (menor impacto CPU)
     with contextlib.suppress(Exception):
-        psutil.Process(os.getpid()).nice(psutil.HIGH_PRIORITY_CLASS)  # type: ignore[attr-defined]
+        psutil.Process(os.getpid()).nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)  # type: ignore[attr-defined]
 
     cfg = load_config()
     st  = load_state()
@@ -539,16 +623,9 @@ def main():
     def _get_blocked_dirs_snapshot():
         return blocked_dirs + self_dirs
 
-    exp_stop_ev = threading.Event()
-    threading.Thread(target=_explorer_watch_loop,
-                     args=(_get_blocked_dirs_snapshot, exp_stop_ev),
-                     name="ExplorerWatch", daemon=True).start()
-
-    q: "queue.Queue[tuple[int,str]]" = queue.Queue()
-    stop_ev = threading.Event()
-    threading.Thread(target=_wmi_watch_loop,
-                     args=(q, stop_ev),
-                     name="WMIWatch", daemon=True).start()
+    # Detectores condicionales (solo si hay reglas ⇒ menos hilos y menos COM/WMI)
+    det = _Detectors()
+    det.start_if_needed(blocked_names, blocked_execs, blocked_dirs, _get_blocked_dirs_snapshot)
 
     log.info("Servicio XiaoHack Parental iniciado correctamente.")
     recently_blocked: dict[int, float] = {}
@@ -569,38 +646,46 @@ def main():
                 st  = load_state()
                 _playtime_tick(cfg, st, _last_play_tick, datetime.datetime.fromtimestamp(_last_play_tick))
         except Exception as e:
-            log.warning("playtime_tick error: %s", e)
+            log.debug("playtime_tick: %s", e)
 
-        # 1) Procesos nuevos vía WMI
+        # 1) Procesos nuevos vía WMI (si está activo)
         drained = 0
-        while drained < 50:
-            try:
-                pid, _nm = q.get_nowait()
-            except queue.Empty:
-                break
-            drained += 1
-            try:
-                p = psutil.Process(pid)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-
-            for _ in range(3):
-                reason = _match_blocked(p, cfg, st, blocked_names, blocked_execs, blocked_dirs, self_dirs, ancestor_pids)
-                if reason:
-                    if recently_blocked.get(pid, 0) + 2.0 > now:
-                        break
-                    pname = (p.info.get("name") if hasattr(p, "info") else None) or p.name() or "?"
-                    log.warning("FAST-BLOCK %s reason=%s", pname, reason)
-                    audit.log_block(pname, reason)
-                    _log_event("block", pname, reason)
-                    _kill_tree(p)
-                    recently_blocked[pid] = now
+        wmi_q = det.wmi_queue()
+        if wmi_q is not None:
+            while drained < 50:
+                try:
+                    pid, _nm = wmi_q.get_nowait()
+                except queue.Empty:
                     break
-                time.sleep(0.03)
+                drained += 1
+                try:
+                    p = psutil.Process(pid)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
 
-        # 2) Escaneo de respaldo con intervalo dinámico
-        scan_interval = 1.0 if (blocked_names or blocked_execs or blocked_dirs) else 3.0
-        if (now - _last_scan_ts) >= scan_interval:
+                for _ in range(3):
+                    reason = _match_blocked(p, cfg, st, blocked_names, blocked_execs, blocked_dirs, self_dirs, ancestor_pids)
+                    if reason:
+                        if recently_blocked.get(pid, 0) + 2.0 > now:
+                            break
+                        pname = (p.info.get("name") if hasattr(p, "info") else None) or p.name() or "?"
+                        log.warning("FAST-BLOCK %s reason=%s", pname, reason)
+                        audit.log_block(pname, reason)
+                        _log_event("block", pname, reason)
+                        _kill_tree(p)
+                        recently_blocked[pid] = now
+                        break
+                    time.sleep(0.02)
+
+        # 2) Escaneo de respaldo con intervalo adaptativo
+        #    - si hay reglas: 1.0 s (2.0 s si ya hemos bloqueado por WMI en este segundo)
+        #    - si no hay reglas: 3.0 s
+        if blocked_names or blocked_execs or blocked_dirs:
+            base_interval = 2.0 if drained > 0 else 1.0
+        else:
+            base_interval = 3.0
+
+        if (now - _last_scan_ts) >= base_interval:
             _last_scan_ts = now
             for p in psutil.process_iter(attrs=["pid", "name", "exe", "cwd", "cmdline"]):
                 try:
@@ -625,7 +710,7 @@ def main():
                 with contextlib.suppress(Exception):
                     audit.log_seen(p.info["name"])
 
-        # 4) Recarga de configuración al detectar cambio de archivo
+        # 4) Recarga de configuración al detectar cambio de archivo (y re-evaluar detectores)
         try:
             mtime = CONFIG_PATH.stat().st_mtime
         except FileNotFoundError:
@@ -643,6 +728,7 @@ def main():
                 blocked_dirs  = [_dirtrail(x) for x in (_normpath(p) for p in cfg.get("blocked_paths", []) if p)]
                 _cfg_mtime = mtime
                 log.info("Config recargada (cambio detectado en archivo).")
+                det.start_if_needed(blocked_names, blocked_execs, blocked_dirs, _get_blocked_dirs_snapshot)
 
         # reaccionar a cambios de applied
         try:
@@ -671,10 +757,11 @@ def main():
             _last_hb_sec = now_i
             log.debug("heartbeat")
 
-        # Idle adaptativo: más descanso cuando no hay trabajo pendiente
-        idle = 0.06
-        if not (blocked_names or blocked_execs or blocked_dirs):
-            idle = 0.10
+        # Idle adaptativo: más descanso cuando no hay trabajo o no hay reglas
+        if blocked_names or blocked_execs or blocked_dirs:
+            idle = 0.08 if drained == 0 else 0.04  # si hubo eventos WMI, dormimos menos un ciclo
+        else:
+            idle = 0.12
         time.sleep(idle)
 
 # =============================================================================
@@ -682,5 +769,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
-        log.error("FATAL:\n%s", traceback.format_exc())
+        log.error("FATAL:\n%s", __import__("traceback").format_exc())
         raise
