@@ -34,6 +34,7 @@ dist/
 *.temp
 
 # === Local tools (NO instalar en cliente) ===
+update_portable.ps1
 make_py312_portable.ps1
 make_runtime_zip.ps1
 install_debug.ps1

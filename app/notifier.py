@@ -789,7 +789,7 @@ def explorer_watch_loop(stop_ev: threading.Event):
 # Overlay TopMost nativo — per monitor
 # --------------------------------------------------------------------
 def _overlay_settings():
-    """
+    r"""
     Lee ProgramData\XiaoHackParental\config.json:
       "overlay": {"mode":"banner|fullscreen","position":"top|bottom","height":160,"opacity":0.92}
     Defaults: banner/top/160/0.92
