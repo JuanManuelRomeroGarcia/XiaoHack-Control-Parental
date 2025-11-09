@@ -339,7 +339,7 @@ def check_playtime_alerts(state: dict, now: datetime, cfg: Optional[dict] = None
         pa["m1"] = True
         pa["countdown_started"] = True
         messages.append("⚠️ ¡Último minuto! Comienza la cuenta atrás.")
-        (log.warning if origin == "guardian" else log.debug)("Último minuto: inicia cuenta atrás")
+        (log.debug if origin == "guardian" else log.debug)("Último minuto: inicia cuenta atrás")
 
     # Cuenta atrás visible (0..60)
     if pa.get("countdown_started", False):

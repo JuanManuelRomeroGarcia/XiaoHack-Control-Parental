@@ -1,4 +1,4 @@
-# uninstall.py — XiaoHack (GUI completa, 2 fases, limpieza ProgramData/LocalAppData y exclusión de self)
+# uninstall.py — XiaoHack (GUI completa, 2 fases, limpieza ProgramData/LocalAppData y sin tareas)
 from __future__ import annotations
 import importlib.util
 import os
@@ -7,18 +7,17 @@ import json
 import shutil
 import ctypes
 import stat
-from textwrap import shorten
 import time
 import subprocess
 import tempfile
 from pathlib import Path
 import logging
 
-# === Bootstrap portable (py312) — antes de usar tkinter =======================
+# ========= Bootstrap portable (py312) antes de usar tkinter =========
 try:
-    _pydir = os.path.dirname(sys.executable)  # ...\py312 cuando usamos embebido
+    _pydir = os.path.dirname(sys.executable)  # ...\py312 si usamos embebido
     try:
-        os.add_dll_directory(_pydir)  # asegura carga de tcl/tk DLLs
+        os.add_dll_directory(_pydir)
         os.add_dll_directory(os.path.join(_pydir, "DLLs"))
     except Exception:
         pass
@@ -26,15 +25,15 @@ try:
     os.environ.setdefault("TK_LIBRARY",  os.path.join(_pydir, "tcl", "tk8.6"))
 except Exception:
     pass
-# ============================================================================
+# ===================================================================
 
-# --- AppUserModelID para icono correcto en barra de tareas ---
+# --- AppUserModelID para icono correcto en barra de tareas
 try:
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("XiaoHack.Parental.Panel")
 except Exception:
     pass
 
-# --- logging básico (usa logs.py si está) ---
+# --- logging básico (usa logs.py si está)
 try:
     from app.logs import configure, get_logger, install_exception_hooks
     configure(level="INFO")
@@ -48,21 +47,19 @@ except Exception:
 _HAS_TK = True
 try:
     import tkinter as tk
-    from tkinter import ttk, messagebox, simpledialog
+    from tkinter import ttk, messagebox
 except Exception:
     _HAS_TK = False
 try:
     import psutil  # type: ignore
 except Exception:
     psutil = None
-    # Mensaje ajustado para portable
-    log.warning("psutil no disponible; instala con: \"%s\" -m pip install psutil", sys.executable)
 try:
     import bcrypt  # type: ignore
 except Exception:
     bcrypt = None
 
-# --- RUTAS / POLÍTICA NUEVA ---
+# --- RUTAS / POLÍTICA ---
 PROGRAM_FILES = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
 PROGRAM_DATA  = Path(os.environ.get("ProgramData",  r"C:\ProgramData"))
 
@@ -71,41 +68,36 @@ APP_NAME      = "XiaoHackParental"
 INSTALL_DIR   = Path(__file__).resolve().parents[1]       # %ProgramFiles%\XiaoHackParental
 DATA_DIR_SYS  = PROGRAM_DATA / APP_NAME                   # %ProgramData%\XiaoHackParental
 
-# Config “real” ahora vive en ProgramData:
 CONFIG_PATH   = DATA_DIR_SYS / "config.json"
-# Marker opcional (si existe):
 INSTALL_MARK  = INSTALL_DIR / "installed.json"
 
-# Accesos comunes y escritorio
 PROGRAMS_COMMON = PROGRAM_DATA / r"Microsoft\Windows\Start Menu\Programs"
-LNK_MENU_DIR    = PROGRAMS_COMMON / "XiaoHack Control Parental"
-LNK_MENU_PANEL  = LNK_MENU_DIR / "XiaoHack Control Parental.lnk"
-LNK_MENU_UNINST = LNK_MENU_DIR / "Desinstalar XiaoHack Control Parental.lnk"
+LNK_MENU_DIR_NEW = PROGRAMS_COMMON / "XiaoHack Control Parental"
+LNK_MENU_DIR_OLD = PROGRAMS_COMMON / "XiaoHack Parental"
 PUBLIC_DESKTOP  = Path(os.environ.get("PUBLIC", r"C:\Users\Public")) / "Desktop"
 USER_DESKTOP    = Path(os.environ.get("USERPROFILE", "")) / "Desktop"
-LNK_DESK_PANEL_PUB  = PUBLIC_DESKTOP / "XiaoHack Control Parental.lnk"
-LNK_DESK_UNINST_PUB = PUBLIC_DESKTOP / "XiaoHack Control Uninstall.lnk"
-LNK_DESK_PANEL_USER  = USER_DESKTOP / "XiaoHack Control Parental.lnk"
-LNK_DESK_UNINST_USER = USER_DESKTOP / "XiaoHack Control Uninstall.lnk"
 
-COMMON_START  = PROGRAM_DATA / r"Microsoft\Windows\Start Menu\Programs\StartUp"  # por compat
+COMMON_START  = PROGRAM_DATA / r"Microsoft\Windows\Start Menu\Programs\StartUp"
 
-# Tareas programadas (nueva y heredadas)
-TASKS = [
-    r"XiaoHackParental\Guardian",     # NUEVA
-    r"XiaoHackParental\Notificador",
-    r"XiaoHack\Guardian", r"XiaoHack\Notificador", r"XiaoHack\Notifier",
-    r"XiaoHack\ControlParental",
-    r"XiaoHackParental", r"Guardian", r"Notifier", r"Notificador",
-    r"XiaoHack_FinalCleanup",
+MATCHES = ("--xh-role", "guardian.py", "notifier.py", "run.py", "webfilter.py", "dnsconfig.py")
+KEEP_NAMES = {"uninstall.py"}  # NO excluimos py312 (hay que borrarlo)
+
+# --- Icono de la app (XiaoHack) ----------------------------------------------
+ICON_CANDIDATES = [
+    Path(__file__).resolve().parents[1] / "assets" / "xiaohack.ico",
+    Path(__file__).resolve().parents[1] / "assets" / "icon.ico",
+    Path(__file__).resolve().parents[1] / "icon.ico",
 ]
 
-# Patrones para localizar procesos asociados
-MATCHES = ("--xh-role", "guardian.py", "notifier.py", "run.py", "webfilter.py", "dnsconfig.py")
-
-# No borrar en fase 1 (se rematan en fase 2)
-# Cambiamos 'venv' -> 'py312' para portable
-KEEP_NAMES = {"uninstall.py", "uninstall.bat", "py312"}
+def _apply_app_icon(win: "tk.Tk|tk.Toplevel") -> None:
+    """Intenta poner el icono .ico propio en la ventana."""
+    try:
+        for p in ICON_CANDIDATES:
+            if p.exists():
+                win.iconbitmap(str(p))
+                return
+    except Exception:
+        pass
 
 # -------------------------------------------------------------------
 # Utilidades
@@ -116,45 +108,27 @@ def is_admin() -> bool:
     except Exception:
         return False
 
-def relaunch_as_admin():
-    params = " ".join(f'"{a}"' for a in sys.argv)
-    ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
-    sys.exit(0)
-
 def _ensure_admin_or_relaunch():
-    """
-    Si no somos admin, relanza el mismo módulo con elevación UAC y sale del proceso actual.
-    """ 
     try:
         if ctypes.windll.shell32.IsUserAnAdmin():
             return
     except Exception:
-        return  # si falla la detección, seguimos (mejor que bloquear)
-
+        return
     exe = sys.executable  # pythonw.exe embebido (py312)
     params = "-m app.uninstall --elevated 1"
     try:
         ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
         sys.exit(0)
     except Exception:
-        pass  # si no podemos elevar, seguimos (mostrará errores de permisos si los hay)
-    
+        pass
+
 def _module_exists(modname: str) -> bool:
     try:
         return importlib.util.find_spec(modname) is not None
     except Exception:
         return False
 
-def _safe_log_info(prefix: str, cp) -> None:
-    out = shorten((cp.stdout or "").strip(), width=160)
-    err = shorten((cp.stderr or "").strip(), width=160)
-    log.info("%s rc=%s out=%s err=%s", prefix, cp.returncode, out, err)
-
 def run(cmd, timeout=None):
-    """
-    Ejecuta un proceso oculto, capturando salida como texto UTF-8 con sustitución.
-    Evita UnicodeDecodeError en máquinas con codepage OEM/ANSI.
-    """
     CREATE_NO_WINDOW = 0x08000000
     try:
         return subprocess.run(
@@ -178,123 +152,179 @@ def load_cfg() -> dict:
         pass
     return {}
 
+# ---------- helpers UI ----------
+def _raise_front(win: "tk.Tk|tk.Toplevel", ms: int = 1200) -> None:
+    try:
+        win.lift()
+        win.attributes("-topmost", True)
+        win.after(ms, lambda: win.attributes("-topmost", False))
+        win.focus_force()
+    except Exception:
+        pass
+
+def _center(win: "tk.Tk|tk.Toplevel", w: int, h: int) -> None:
+    try:
+        win.update_idletasks()
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 2)
+        win.geometry(f"{w}x{h}+{x}+{y}")
+    except Exception:
+        pass
+
+class _PinDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Tk, title: str = "Desinstalador Control Parental"):
+        super().__init__(parent)
+        _apply_app_icon(self)
+        self.title(title)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        _center(self, 380, 180)
+        _raise_front(self, 1500)
+
+        frm = ttk.Frame(self, padding=12)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm, text="Introduce el PIN del tutor:", font=("Segoe UI", 10)).pack(anchor="w")
+        self.var = tk.StringVar()
+        e = ttk.Entry(frm, show="*", textvariable=self.var, width=32)
+        e.pack(fill="x", pady=(6, 10))
+        e.focus_set()
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="OK", command=self._ok).pack(side="left")
+        ttk.Button(btns, text="Cancelar", command=self._cancel).pack(side="right")
+
+        self.result: str | None = None
+        self.bind("<Return>", lambda *_: self._ok())
+        self.bind("<Escape>", lambda *_: self._cancel())
+
+    def _ok(self):
+        self.result = self.var.get().strip()
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+class _ConfirmDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Tk):
+        super().__init__(parent)
+        _apply_app_icon(self)
+        self.title("Confirmación")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        _center(self, 420, 200)
+        _raise_front(self, 1500)
+
+        frm = ttk.Frame(self, padding=12)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text='Escribe EXACTAMENTE: DESINSTALAR', font=("Segoe UI", 10)).pack(anchor="w")
+        self.var = tk.StringVar()
+        e = ttk.Entry(frm, textvariable=self.var, width=36)
+        e.pack(fill="x", pady=(6, 10))
+        e.focus_set()
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Confirmar", command=self._ok).pack(side="left")
+        ttk.Button(btns, text="Cancelar", command=self._cancel).pack(side="right")
+
+        self.ok = False
+        self.bind("<Return>", lambda *_: self._ok())
+        self.bind("<Escape>", lambda *_: self._cancel())
+
+    def _ok(self):
+        self.ok = (self.var.get().strip() == "DESINSTALAR")
+        self.destroy()
+
+    def _cancel(self):
+        self.ok = False
+        self.destroy()
+
 def uninstall_requires_pin(cfg: dict) -> bool:
     return bool(cfg.get("uninstall_requires_pin", True))
 
-def verify_pin_gui(cfg: dict) -> bool:
-    pin = simpledialog.askstring("Desinstalar XiaoHack", "Introduce el PIN del tutor:", show="*")
+def verify_pin_gui(root: tk.Tk, cfg: dict) -> bool:
+    dlg = _PinDialog(root)
+    root.wait_window(dlg)
+    pin = dlg.result
     if not pin:
         return False
+
     stored = (cfg.get("parent_password_hash") or "").strip()
     if stored and bcrypt:
         try:
             if bcrypt.checkpw(pin.encode(), stored.encode()):
                 return True
-            messagebox.showerror("PIN incorrecto", "El PIN no coincide.")
+            messagebox.showerror("PIN incorrecto", "El PIN no coincide.", parent=root)
             return False
         except Exception:
             pass
-    phrase = simpledialog.askstring("Confirmación", "Escribe EXACTAMENTE: DESINSTALAR")
-    if phrase != "DESINSTALAR":
-        messagebox.showwarning("Cancelado", "No se confirmó la desinstalación.")
+
+    # Confirmación textual si no hay hash o bcrypt no está
+    cdlg = _ConfirmDialog(root)
+    root.wait_window(cdlg)
+    if not cdlg.ok:
+        messagebox.showwarning("Cancelado", "No se confirmó la desinstalación.", parent=root)
         return False
+
     plain = (cfg.get("parent_password_plain") or "").strip()
     return (not plain) or (pin == plain)
 
-def schtasks_stop_delete():
-    # 1) Intento directo sobre nombres conocidos (por compat)
-    for t in TASKS:
-        run(["schtasks", "/End", "/TN", t])
-        run(["schtasks", "/Delete", "/TN", t, "/F"])
-
-    # 2) Barrido amplio con PowerShell
-    ps = r'''
-try {
-  $ts = Get-ScheduledTask | Where-Object {
-    $_.TaskName -like '*XiaoHack*' -or
-    $_.TaskPath -like '\XiaoHack*' -or
-    $_.TaskName -like '*Guardian*' -or
-    $_.TaskName -like '*Notifier*' -or
-    $_.TaskName -like '*Notificador*'
-  }
-  foreach ($t in $ts) {
-    try { Stop-ScheduledTask       -TaskName $t.TaskName -TaskPath $t.TaskPath -ErrorAction SilentlyContinue } catch {}
-    try { Unregister-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -Confirm:$false -ErrorAction SilentlyContinue } catch {}
-  }
-  'OK'
-} catch { 'ERR' }
-'''
-    try:
-        run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps])
-    except Exception:
-        pass
-    
+# -------------------- procesos / tareas / borrado -----------------------------
 def schtasks_stop_delete_all():
-    """
-    Elimina cualquier tarea relacionada con XiaoHack/Guardian/Notifier en cualquier ruta.
-    También elimina 'XiaoHack_FinalCleanup' heredada de versiones anteriores del uninstaller.
-    """
     for name in ("\\XiaoHackParental\\Guardian", "\\XiaoHackParental\\Notificador", "XiaoHack_FinalCleanup"):
         run(["schtasks", "/End", "/TN", name])
         run(["schtasks", "/Delete", "/TN", name, "/F"])
 
-    ps = r'''
-try {
-  $ts = Get-ScheduledTask | Where-Object {
-    $_.TaskName -like '*XiaoHack*' -or
-    $_.TaskPath -like '\XiaoHack*' -or
-    $_.TaskName -like '*Guardian*' -or
-    $_.TaskName -like '*Notifier*' -or
-    $_.TaskName -like '*Notificador*'
-  }
-  foreach ($t in $ts) {
-    try { Stop-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -ErrorAction SilentlyContinue } catch {}
-    try { Unregister-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -Confirm:$false -ErrorAction SilentlyContinue } catch {}
-  }
-  'OK'
-} catch { 'ERR' }
-'''
-    run(["powershell","-NoProfile","-ExecutionPolicy","Bypass","-Command", ps])
+def _exclude_self(p):
+    try:
+        return p.pid == os.getpid()
+    except Exception:
+        return False
 
-def _ps_ex_list(exclude_pids: set[int] | None) -> str:
-    return ",".join(str(p) for p in sorted(exclude_pids or set()))
-
-def kill_xh_processes(exclude_pids: set[int] | None = None):
-    """
-    Mata guardian/notifier sin tocar el desinstalador (app.uninstall) y respetando exclude_pids.
-    Usa WMI (Win32_Process) para poder filtrar por CommandLine.
-    """
-    ex = set(exclude_pids or set())
-    ex.add(os.getpid())
-    ex |= SELF_PARENTS
-    ex |= SELF_CHILDREN
-    ex_list = _ps_ex_list(ex)
-
-    ps = f'''
-$ex    = @({ex_list})
-$hasEx = $ex.Count -gt 0
-$procs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {{
-  $exe = (($_.ExecutablePath) + '')
-  $cmd = (($_.CommandLine) + '')
-  $pid = $_.ProcessId
-  $isXH  = ($exe -like '*\\XiaoHackParental\\*') -or ($cmd -like '*\\XiaoHackParental\\*')
-  $role  = ($cmd -match '--xh-role\\s+(guardian|notifier)') -or
-           ($cmd -match 'app\\.guardian') -or
-           ($cmd -match 'app\\.notifier') -or
-           ($cmd -match 'run_guardian')  -or
-           ($cmd -match 'run_notifier')
-  $isUninstall = ($cmd -match 'app\\.uninstall')
-  $ok = $isXH -and $role -and (-not $isUninstall)
-  if ($hasEx) {{ $ok = $ok -and ($ex -notcontains $pid) }}
-  $ok
-}}
-foreach ($p in $procs) {{ try {{ Stop-Process -Id $p.ProcessId -Force }} catch {{}} }}
-"OK"
-'''.strip()
-    run(["powershell","-NoProfile","-ExecutionPolicy","Bypass","-Command", ps])
+def kill_related(install_path: str, list_only=False):
+    rows = []
+    if not psutil:
+        return rows
+    inst = install_path.lower()
+    for p in psutil.process_iter(attrs=["pid", "name", "cmdline", "exe", "cwd"]):
+        try:
+            if _exclude_self(p):
+                continue
+            info = p.info
+            cmd = " ".join(info.get("cmdline") or [])
+            exe = (info.get("exe") or "").lower()
+            cwd = (info.get("cwd") or "").lower()
+            if (inst in cmd.lower()) or (inst in exe) or (inst in cwd) or any(m in cmd.lower() for m in MATCHES):
+                rows.append((p.pid, info.get("name") or "python", cmd))
+                if not list_only:
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    if not list_only:
+        time.sleep(0.9)
+        for pid, _, _ in rows:
+            try:
+                q = psutil.Process(pid)
+                if q.is_running():
+                    try:
+                        q.kill()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    return rows
 
 def close_all_logs():
-    """Cierra manejadores de logging (libera %ProgramData%\...\logs\control.log)."""
     try:
         logging.shutdown()
     except Exception:
@@ -306,23 +336,22 @@ def safe_rmtree(path: Path, retries=8, delay=0.8) -> bool:
         return True
     for _ in range(retries):
         try:
-            for root, dirs, files in os.walk(path, topdown=False):
-                for n in files:
-                    p = Path(root) / n
+            for r, dnames, fnames in os.walk(path, topdown=False):
+                for n in fnames:
+                    p = Path(r) / n
                     try: 
                         os.chmod(p, stat.S_IWRITE)
                     except Exception:
                         pass
-                for n in dirs:
-                    d = Path(root) / n
-                    try: 
+                for n in dnames:
+                    d = Path(r) / n
+                    try:
                         os.chmod(d, stat.S_IWRITE)
-                    except Exception:
+                    except Exception: 
                         pass
             shutil.rmtree(path, ignore_errors=False)
             return True
-        except Exception as e:
-            log.debug("safe_rmtree retry: %s", e)
+        except Exception:
             time.sleep(delay)
     return False
 
@@ -346,40 +375,42 @@ def revert_hosts_if_possible():
         pass
 
 def remove_shortcuts():
-    for lnk in [
-        LNK_DESK_PANEL_PUB, LNK_DESK_UNINST_PUB,
-        LNK_DESK_PANEL_USER, LNK_DESK_UNINST_USER,
-        LNK_MENU_PANEL, LNK_MENU_UNINST,
-        PROGRAMS_COMMON / "XiaoHack Parental.lnk",  # restos antiguos
-        PROGRAMS_COMMON / "XiaoHack" / "XiaoHack Control Parental.lnk",
-        PROGRAMS_COMMON / "XiaoHack" / "Desinstalar XiaoHack.lnk",
-        COMMON_START / "XiaoHack Notifier.lnk",
-        COMMON_START / "XiaoHackParental Notifier.lnk",
-        COMMON_START / "XiaoHack Control Parental Notifier.lnk",
-    ]:
+    def _del(p: Path):
         try:
-            lnk.unlink(missing_ok=True)
+            p.unlink(missing_ok=True)
         except Exception:
             pass
-    try:
-        if LNK_MENU_DIR.exists() and not any(LNK_MENU_DIR.iterdir()):
-            LNK_MENU_DIR.rmdir()
-    except Exception:
-        pass
+
+    for name in ("XiaoHack Control Parental.lnk", "XiaoHack Control Uninstall.lnk",
+                 "XiaoHack Parental.lnk", "XiaoHack Uninstall.lnk"):
+        _del(PUBLIC_DESKTOP / name)
+        if USER_DESKTOP:
+            _del(USER_DESKTOP / name)
+
+    for base in (LNK_MENU_DIR_NEW, LNK_MENU_DIR_OLD):
+        if base.exists():
+            for lnk in base.glob("*.lnk"):
+                _del(lnk)
+            try:
+                if not any(base.iterdir()):
+                    base.rmdir()
+            except Exception:
+                pass
+
+    for name in ("XiaoHack Notifier.lnk",
+                 "XiaoHackParental Notifier.lnk",
+                 "XiaoHack Control Parental Notifier.lnk"):
+        _del(COMMON_START / name)
 
 def restore_dns_auto():
-    """Devuelve los DNS a automático (DHCP) para todas las interfaces."""
     if _module_exists("app.dnsconfig"):
         try:
             from app import dnsconfig
             ok, msg = dnsconfig.set_dns_auto(interface_alias=None)
             log.info("[dns] Auto vía módulo: %s", msg or ("OK" if ok else ""))
             return
-        except Exception as e:
-            log.warning("[dns] Módulo dnsconfig falló: %s. Fallback PS…", e)
-    else:
-        log.info("[dns] Módulo app.dnsconfig no empaquetado. Fallback PS…")
-
+        except Exception:
+            pass
     ps = r'''
 $ifaces = Get-DnsClient | Where-Object { $_.AddressFamily -in ('IPv4','IPv6') }
 foreach ($i in $ifaces) {
@@ -387,37 +418,22 @@ foreach ($i in $ifaces) {
 }
 "OK"
 '''
-    cp = run(["PowerShell","-NoProfile","-ExecutionPolicy","Bypass","-Command", ps])
-    _safe_log_info("[dns] Auto (fallback PS)", cp)
+    run(["PowerShell","-NoProfile","-ExecutionPolicy","Bypass","-Command", ps])
 
 def clear_doh_policies():
-    """Quita políticas DoH de Brave y Chrome (HKCU/HKLM)."""
-    did_brave = False
-    if _module_exists("app.braveconfig"):
-        try:
-            from app import braveconfig
-            ok, msg = braveconfig.clear_brave_policy(scope="BOTH")
-            log.info("[doh] Brave vía módulo: %s", msg or ("OK" if ok else ""))
-            did_brave = True
-        except Exception as e:
-            log.warning("[doh] braveconfig falló: %s. Fallback PS…", e)
-    else:
-        log.info("[doh] app.braveconfig no empaquetado. Fallback PS…")
-
-    did_chrome = False
-    if _module_exists("app.chromeconfig"):
-        try:
-            from app import chromeconfig
-            ok, msg = chromeconfig.clear_chrome_policy(scope="BOTH")
-            log.info("[doh] Chrome vía módulo: %s", msg or ("OK" if ok else ""))
-            did_chrome = True
-        except Exception as e:
-            log.warning("[doh] chromeconfig falló: %s. Fallback PS…", e)
-    else:
-        log.info("[doh] app.chromeconfig no empaquetado. Fallback PS…")
-
-    if not (did_brave and did_chrome):
-        ps = r'''
+    did_any = False
+    for mod, path in (("app.braveconfig", "Brave"), ("app.chromeconfig", "Chrome")):
+        if _module_exists(mod):
+            try:
+                m = importlib.import_module(mod)
+                ok, msg = m.clear_brave_policy(scope="BOTH") if "brave" in mod else m.clear_chrome_policy(scope="BOTH")
+                log.info("[doh] %s vía módulo: %s", path, msg or ("OK" if ok else ""))
+                did_any = True
+            except Exception:
+                pass
+    if did_any:
+        return
+    ps = r'''
 $paths = @(
  'HKCU:\Software\Policies\Google\Chrome',
  'HKLM:\SOFTWARE\Policies\Google\Chrome',
@@ -432,84 +448,22 @@ foreach ($p in $paths) {
 }
 "OK"
 '''
-        cp = run(["PowerShell","-NoProfile","-ExecutionPolicy","Bypass","-Command", ps])
-        _safe_log_info("[doh] Fallback PS", cp)
-
-# --------- cierre de procesos con exclusión del propio desinstalador ----------
-SELF_PID = os.getpid()
-SELF_PARENTS = set()
-SELF_CHILDREN = set()
-try:
-    if psutil:
-        proc_self = psutil.Process(SELF_PID)
-        SELF_PARENTS = {p.pid for p in proc_self.parents()}
-        SELF_CHILDREN = {p.pid for p in proc_self.children(recursive=True)}
-except Exception:
-    pass
-
-def _exclude_self(p):
-    return p.pid in (SELF_PID,) or p.pid in SELF_PARENTS or p.pid in SELF_CHILDREN
-
-def kill_related(install_path: str, list_only=False):
-    rows = []
-    if not psutil:
-        return rows
-    inst = install_path.lower()
-    for p in psutil.process_iter(attrs=["pid", "name", "cmdline", "exe", "cwd"]):
-        try:
-            if _exclude_self(p):
-                continue
-            info = p.info
-            cmd = " ".join(info.get("cmdline") or [])
-            exe = (info.get("exe") or "").lower()
-            cwd = (info.get("cwd") or "").lower()
-            hit = (inst in cmd.lower()) or (inst in exe) or (inst in cwd) or any(m in cmd.lower() for m in MATCHES)
-            if hit:
-                rows.append((p.pid, info.get("name") or "python", cmd))
-                if not list_only:
-                    try:
-                        p.terminate()
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-    if not list_only:
-        time.sleep(0.9)
-        for pid, _, _ in rows:
-            try:
-                p = psutil.Process(pid)
-                if p.is_running():
-                    try:
-                        p.kill()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-    return rows
+    run(["PowerShell","-NoProfile","-ExecutionPolicy","Bypass","-Command", ps])
 
 # ----------------------- borrado en dos fases ---------------------------------
-
-# NUEVO: marcado de borrado en arranque (sin tareas programadas)
 MOVEFILE_DELAY_UNTIL_REBOOT = 0x00000004
 def _movefileex_delete_on_reboot(path: str) -> bool:
-    """Marca un archivo o directorio para borrado en el próximo arranque."""
     try:
         k32 = ctypes.windll.kernel32
         from ctypes import wintypes
         k32.MoveFileExW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
         k32.MoveFileExW.restype = wintypes.BOOL
-        # Prefijo \\?\ para rutas largas/Unicode
         p = "\\\\?\\" + path
         return bool(k32.MoveFileExW(p, None, MOVEFILE_DELAY_UNTIL_REBOOT))
-    except Exception as e:
-        log.debug("MoveFileExW failed for %s: %s", path, e)
+    except Exception:
         return False
 
 def mark_tree_for_delete_on_reboot(root: str | Path) -> int:
-    """
-    Recorre el árbol y marca archivos y carpetas para borrado al reiniciar.
-    Devuelve el número de elementos marcados.
-    """
     root = str(root)
     count = 0
     try:
@@ -520,119 +474,39 @@ def mark_tree_for_delete_on_reboot(root: str | Path) -> int:
                     count += 1
             for d in dirs:
                 dp = os.path.join(r, d)
-                if _movefileex_delete_on_reboot(dp):
+                if _movefileex_delete_on_reboot(dp): 
                     count += 1
         if _movefileex_delete_on_reboot(root):
             count += 1
-    except Exception as e:
-        log.debug("mark_tree_for_delete_on_reboot error: %s", e)
+    except Exception:
+        pass
     return count
 
-def _write_post_cleanup_bat(install_path: str):
-    """
-    Phase 2 desde %TEMP% (ASCII-only BAT, UTF-8):
-      - Kill procesos que apunten a install path.
-      - Quita atributos, takeown/icacls.
-      - Borra ficheros duros (guardian.db*, control.log, uninstall*).
-      - Remove-Item + rmdir con reintentos.
-      - **SIN** programar ninguna tarea: si quedan restos, se marcarán para borrado al reiniciar desde Python.
-    """
-    post_bat = Path(tempfile.gettempdir()) / "xh_post_cleanup.bat"
-    progdata = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "XiaoHackParental")
-    install  = str(install_path)
-
-    bat = f"""@echo off
-setlocal enableextensions
-pushd "%TEMP%" >nul 2>&1
-
-rem --- kill leftover processes pointing to install path ---
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$b='{install}'.ToLower(); Get-CimInstance Win32_Process | ?{{ (($_.ExecutablePath+'') -and $_.ExecutablePath.ToLower().StartsWith($b)) -or (($_.CommandLine+'').ToLower().Contains($b)) }} | %%{{ try {{ Stop-Process -Id $_.ProcessId -Force }} catch {{}} }}" >nul 2>&1
-ping 127.0.0.1 -n 3 >nul
-
-set "SIDADM=S-1-5-32-544"
-
-for %%D in ("{progdata}" "{install}") do call :CLEAN "%%~fD"
-goto :EOF
-
-:CLEAN
-set "_TARGET=%~1"
-if not exist "%_TARGET%" exit /b 0
-
-attrib -r -s -h "%_TARGET%\\*" /s /d >nul 2>&1
-
-for /l %%i in (1 1 8) do (
-  if exist "%_TARGET%" (
-    takeown /f "%_TARGET%" /r /d y >nul 2>&1
-    icacls "%_TARGET%" /grant "*%SIDADM%:(OI)(CI)F" /t /c /q >nul 2>&1
-
-    del /f /q "%_TARGET%\\guardian.db"       >nul 2>&1
-    del /f /q "%_TARGET%\\guardian.db-wal"   >nul 2>&1
-    del /f /q "%_TARGET%\\guardian.db-shm"   >nul 2>&1
-    del /f /q "%_TARGET%\\logs\\control.log" >nul 2>&1
-    del /f /q "%_TARGET%\\uninstall*"        >nul 2>&1
-
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "Remove-Item -LiteralPath '%_TARGET%' -Recurse -Force -ErrorAction SilentlyContinue" >nul 2>&1
-    rmdir /s /q "%_TARGET%" >nul 2>&1
-    if exist "%_TARGET%" ping 127.0.0.1 -n 2 >nul
-  )
-)
-exit /b 0
-"""
+def register_runonce_cleanup(paths: list[str]) -> bool:
     try:
-        post_bat.write_text(bat, encoding="utf-8", newline="\r\n")
-        log.info("post-bat OK -> %s (%d bytes)", post_bat, post_bat.stat().st_size)
-    except Exception as e:
-        log.error("post-bat write failed: %s", e)
-    return post_bat
-
-def _launch_post_cleanup(post_bat_path: str, install_path: str):
-    """
-    Ejecuta el BAT si existe. **Sin** programar tarea.
-    Si falla, ejecuta un PowerShell inline de limpieza sin tareas.
-    """
-    try:
-        p = Path(post_bat_path)
-        sz = p.stat().st_size if p.exists() else 0
+        import winreg as wr
     except Exception:
-        sz = 0
-
-    if sz >= 64:
-        try:
-            subprocess.Popen(["cmd", "/c", f'"{post_bat_path}"'], creationflags=0x08000000)
-            return
-        except Exception as e:
-            log.warning("post-bat exec failed: %s", e)
-
-    progdata = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "XiaoHackParental")
-    install  = str(install_path)
-    ps = rf'''
-$b = "{install}".ToLower()
-try {{
-  Get-CimInstance Win32_Process | ?{{ (($_.ExecutablePath+'') -and $_.ExecutablePath.ToLower().StartsWith($b)) -or (($_.CommandLine+'').ToLower().Contains($b)) }} |
-    %%{{ try {{ Stop-Process -Id $_.ProcessId -Force }} catch {{}} }}
-}} catch {{}}
-$paths = @("{progdata}","{install}")
-foreach ($t in $paths) {{
-  if (-not (Test-Path $t)) {{ continue }}
-  try {{ attrib -r -s -h "$t\*" /s /d }} catch {{}}
-  for ($i=0; $i -lt 8; $i++) {{
-    try {{ takeown /f "$t" /r /d y | Out-Null }} catch {{}}
-    try {{ icacls "$t" /grant "*S-1-5-32-544:(OI)(CI)F" /t /c /q | Out-Null }} catch {{}}
-    foreach ($f in @("guardian.db","guardian.db-wal","guardian.db-shm","logs\\control.log")) {{
-      try {{ Remove-Item -LiteralPath (Join-Path $t $f) -Force -ErrorAction SilentlyContinue }} catch {{}}
-    }}
-    try {{ Remove-Item -LiteralPath $t -Recurse -Force -ErrorAction SilentlyContinue }} catch {{}}
-    if (Test-Path $t) {{ Start-Sleep -Milliseconds 800 }} else {{ break }}
-  }}
-}}
+        return False
+    ps = '$paths=@(' + ",".join(f'"{p}"' for p in paths) + r''');
+foreach($t in $paths){
+  if(Test-Path $t){
+    try{ takeown /f "$t" /r /d y | Out-Null }catch{}
+    try{ icacls "$t" /grant "*S-1-5-32-544:(OI)(CI)F" /t /c /q | Out-Null }catch{}
+    try{ Remove-Item -LiteralPath $t -Recurse -Force -ErrorAction SilentlyContinue }catch{}
+  }
+}
+"OK"
 '''
+    cmd = rf'PowerShell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command {ps}'
     try:
-        subprocess.Popen(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", ps],
-            creationflags=0x08000000
-        )
-    except Exception as e:
-        log.error("Fallback PS inline failed: %s", e)
+        key = wr.OpenKey(wr.HKEY_LOCAL_MACHINE,
+                         r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce",
+                         0, wr.KEY_SET_VALUE | 0x0100)
+        wr.SetValueEx(key, "XiaoHack_FinalCleanup", 0, wr.REG_SZ, cmd)
+        wr.CloseKey(key)
+        return True
+    except Exception:
+        return False
 
 def delete_folder_two_phase(install_path: str):
     root_dir = Path(install_path)
@@ -644,16 +518,26 @@ def delete_folder_two_phase(install_path: str):
                 safe_rmtree(item)
             else:
                 item.unlink(missing_ok=True)
-        except Exception as e:
-            log.debug("No se pudo borrar %s: %s", item, e)
+        except Exception:
+            pass
 
-# --- GUI principal ---
+# ----------------------- GUI principal ----------------------------------------
 def gui_main():
     _ensure_admin_or_relaunch()
 
+    # Ventana root primero (para que los diálogos sean hijos y salgan delante)
+    root = tk.Tk()
+    _apply_app_icon(root) 
+    root.title("Desinstalador Control Parental XiaoHack")
+    root.minsize(980, 560)
+    _center(root, 1024, 600)
+    _raise_front(root, 1500)
+    root.resizable(True, True)
+
     cfg = load_cfg()
     if uninstall_requires_pin(cfg):
-        if not verify_pin_gui(cfg):
+        if not verify_pin_gui(root, cfg):
+            root.destroy()
             return
 
     try:
@@ -662,11 +546,6 @@ def gui_main():
     except Exception:
         install_path = str(INSTALL_DIR)
 
-    root = tk.Tk()
-    root.title("Desinstalador Control Parental XiaoHack")
-    root.geometry("780x480")
-    root.resizable(True, True)
-
     frm = ttk.Frame(root, padding=12)
     frm.pack(fill="both", expand=True)
     ttk.Label(frm, text=f"Carpeta de instalación: {install_path}").pack(anchor="w", pady=(0, 6))
@@ -674,7 +553,7 @@ def gui_main():
 
     cols = ("PID", "Nombre", "Comando")
     tree = ttk.Treeview(frm, columns=cols, show="headings", height=11)
-    for i, w in zip(cols, (80, 80, 520)):
+    for i, w in zip(cols, (80, 120, 640)):
         tree.heading(i, text=i)
         tree.column(i, width=w, anchor="w")
     tree.pack(fill="both", expand=True)
@@ -693,19 +572,13 @@ def gui_main():
         status.set(f"Procesos detectados: {len(rows)}")
 
     def stop_processes():
-        status.set("Cerrando procesos…")
+        status.set("Cerrando procesos y tareas…")
         root.update_idletasks()
         kill_related(install_path, list_only=False)
-        kill_xh_processes()
+        schtasks_stop_delete_all()
         time.sleep(0.6)
         refresh()
         status.set("Procesos cerrados (si había).")
-
-    def stop_tasks():
-        status.set("Eliminando tareas programadas…")
-        root.update_idletasks()
-        schtasks_stop_delete_all()
-        status.set("Tareas programadas eliminadas.")
 
     def clean_shortcuts():
         status.set("Eliminando accesos directos…")
@@ -723,65 +596,45 @@ def gui_main():
 
     def delete_folder():
         nonlocal POST_BAT
-
-        status.set("Cerrando procesos…")
+        status.set("Cerrando procesos/tareas…")
         root.update_idletasks()
         stop_processes()
-
-        status.set("Eliminando tareas programadas…")
-        root.update_idletasks()
-        stop_tasks()
-
         status.set("Cerrando logs…")
         root.update_idletasks()
         close_all_logs()
-
-        status.set("Eliminando accesos directos…")
+        status.set("Eliminando accesos…")
         root.update_idletasks()
         clean_shortcuts()
-
-        status.set("Revirtiendo hosts…")
-        root.update_idletasks()
-        revert_hosts_gui()
-
-        status.set("Limpiando políticas DoH (Brave/Chrome)…")
+        status.set("Restaurando DNS y limpiando DoH…")
         root.update_idletasks()
         clear_doh_policies()
-
-        status.set("Restaurando DNS a automático…")
-        root.update_idletasks()
         restore_dns_auto()
 
         status.set("Borrando contenido (fase 1)…")
         root.update_idletasks()
         delete_folder_two_phase(install_path)
 
-        # Fase 2: post-cleanup (sin tareas)
         POST_BAT = _write_post_cleanup_bat(install_path)
-        try:
-            _launch_post_cleanup(POST_BAT, install_path)
-        except Exception as e:
-            log.warning("No se pudo ejecutar post-cleanup: %s", e)
+        try: 
+            subprocess.Popen(["cmd","/c",f'"{POST_BAT}"'], creationflags=0x08000000)
+        except Exception:
+            pass
 
-        # Comprobación tras un breve margen y, si quedan restos, marcar para borrado al reiniciar.
-        root.after(800, lambda: None)
-        root.update_idletasks()
-        time.sleep(0.8)
-
-        still_exists = any(Path(p).exists() for p in (DATA_DIR_SYS, Path(install_path)))
-        if still_exists:
+        time.sleep(0.9)
+        remaining = Path(install_path).exists() or DATA_DIR_SYS.exists()
+        if remaining:
             n = 0
             if Path(install_path).exists():
                 n += mark_tree_for_delete_on_reboot(install_path)
-            if DATA_DIR_SYS.exists():
+            if DATA_DIR_SYS.exists(): 
                 n += mark_tree_for_delete_on_reboot(DATA_DIR_SYS)
-            log.info("Marcados %d elementos para borrado al reiniciar.", n)
-            status.set("Limpieza pendiente marcada para el próximo arranque (sin tareas).")
+            register_runonce_cleanup([str(install_path), str(DATA_DIR_SYS)])
             messagebox.showinfo(
-                "Limpieza programada al reiniciar",
-                "Se han marcado los restos para borrarse en el próximo arranque del sistema.\n"
-                "No se ha creado ninguna tarea programada."
+                "Limpieza pendiente",
+                "Quedan restos bloqueados (py312/ o ProgramData). Se han marcado para borrarse al reiniciar "
+                "y se ha registrado un RunOnce para forzar la limpieza."
             )
+            status.set("Limpieza pendiente al reinicio.")
         else:
             status.set("Limpieza completada.")
             messagebox.showinfo("Completado", "Se ha eliminado XiaoHack Parental correctamente.")
@@ -789,52 +642,22 @@ def gui_main():
         root.after(200, root.destroy)
 
     def on_close():
-        try:
-            if POST_BAT and Path(POST_BAT).exists():
-                _launch_post_cleanup(POST_BAT, install_path)
-        except Exception as e:
-            log.warning("No se pudo ejecutar post-cleanup en cierre: %s", e)
         root.destroy()
 
     ttk.Button(btns, text="🔄 Refrescar", command=refresh).pack(side="left")
     ttk.Button(btns, text="✖ Cerrar procesos", command=stop_processes).pack(side="left", padx=6)
-    ttk.Button(btns, text="🕑 Eliminar tareas", command=stop_tasks).pack(side="left", padx=6)
     ttk.Button(btns, text="🧹 Quitar accesos", command=clean_shortcuts).pack(side="left", padx=6)
     ttk.Button(btns, text="🛡 Hosts revert", command=revert_hosts_gui).pack(side="left", padx=6)
     ttk.Button(btns, text="🗂️ Borrar carpeta", command=delete_folder).pack(side="left", padx=6)
     ttk.Button(btns, text="Salir", command=on_close).pack(side="right")
-    
+
     root.protocol("WM_DELETE_WINDOW", on_close)
     refresh()
     root.mainloop()
 
-# --- fallback consola ---
+# ------------------- fallback consola -------------------
 def console_main():
     _ensure_admin_or_relaunch()
-
-    cfg = load_cfg()
-    if uninstall_requires_pin(cfg):
-        try:
-            import getpass
-            pin = getpass.getpass("PIN: ")
-        except Exception:
-            pin = ""
-        if not pin:
-            print("Abortado.")
-            return
-        stored = (cfg.get("parent_password_hash") or "").strip()
-        if stored and bcrypt:
-            try:
-                if not bcrypt.checkpw(pin.encode(), stored.encode()):
-                    print("PIN incorrecto.")
-                    return
-            except Exception:
-                pass
-        phrase = input("Escribe DESINSTALAR para confirmar: ").strip()
-        if phrase != "DESINSTALAR":
-            print("Cancelado.")
-            return
-
     try:
         marker = json.loads(INSTALL_MARK.read_text(encoding="utf-8"))
         install_path = marker.get("install_path", str(INSTALL_DIR))
@@ -843,9 +666,8 @@ def console_main():
 
     print("Cerrando tareas y procesos…")
     schtasks_stop_delete_all()
-    kill_xh_processes()
-    close_all_logs()
     kill_related(install_path, list_only=False)
+    close_all_logs()
 
     print("Revirtiendo hosts…")
     revert_hosts_if_possible()
@@ -853,45 +675,70 @@ def console_main():
     print("Eliminando accesos…")
     remove_shortcuts()
 
-    print("Limpiando políticas DoH (Brave/Chrome)…")
+    print("Limpiando DoH y restaurando DNS…")
     clear_doh_policies()
-
-    print("Restaurando DNS a automático…")
     restore_dns_auto()
 
     print("Borrando contenido (fase 1)…")
-    root_dir = Path(install_path)
-    for item in list(root_dir.iterdir()):
-        if item.name in KEEP_NAMES:
-            continue
-        try:
-            safe_rmtree(item) if item.is_dir() else item.unlink(missing_ok=True)
-        except Exception:
-            pass
+    delete_folder_two_phase(install_path)
 
-    POST_BAT = _write_post_cleanup_bat(install_path)
-    try:
-        _launch_post_cleanup(POST_BAT, install_path)
+    post_bat = _write_post_cleanup_bat(install_path)
+    try: 
+        subprocess.Popen(["cmd","/c",f'"{post_bat}"'], creationflags=0x08000000)
     except Exception:
         pass
 
-    time.sleep(0.8)
+    time.sleep(0.9)
     remaining = []
     if Path(install_path).exists():
         remaining.append(install_path)
-    if DATA_DIR_SYS.exists():
+    if DATA_DIR_SYS.exists():    
         remaining.append(str(DATA_DIR_SYS))
-
     if remaining:
-        total = 0
-        for p in remaining:
-            total += mark_tree_for_delete_on_reboot(p)
-        print(f"Quedan restos. Marcados {total} elementos para borrado al reiniciar (sin tareas).")
+        n = 0
+        for p in remaining: 
+            n += mark_tree_for_delete_on_reboot(p)
+        register_runonce_cleanup([str(install_path), str(DATA_DIR_SYS)])
+        print(f"Pendiente: marcados {n} elementos para borrado al reiniciar + RunOnce registrado.")
     else:
         print("Limpieza completada.")
-
     print("Puedes cerrar esta ventana.")
-    
+
+# ------------------- helpers post-cleanup (BAT) -------------------
+def _write_post_cleanup_bat(install_path: str):
+    post_bat = Path(tempfile.gettempdir()) / "xh_post_cleanup.bat"
+    progdata = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "XiaoHackParental")
+    install  = str(install_path)
+    bat = f"""@echo off
+setlocal enableextensions
+pushd "%TEMP%" >nul 2>&1
+set "SIDADM=S-1-5-32-544"
+for %%D in ("{progdata}" "{install}") do (
+  if exist "%%~fD" (
+    attrib -r -s -h "%%~fD\\*" /s /d >nul 2>&1
+    for /l %%i in (1 1 8) do (
+      takeown /f "%%~fD" /r /d y >nul 2>&1
+      icacls "%%~fD" /grant "*%SIDADM%:(OI)(CI)F" /t /c /q >nul 2>&1
+      del /f /q "%%~fD\\guardian.db"       >nul 2>&1
+      del /f /q "%%~fD\\guardian.db-wal"   >nul 2>&1
+      del /f /q "%%~fD\\guardian.db-shm"   >nul 2>&1
+      del /f /q "%%~fD\\logs\\control.log" >nul 2>&1
+      powershell -NoProfile -ExecutionPolicy Bypass -Command "Remove-Item -LiteralPath '%%~fD' -Recurse -Force -ErrorAction SilentlyContinue" >nul 2>&1
+      rmdir /s /q "%%~fD" >nul 2>&1
+      if exist "%%~fD" ping 127.0.0.1 -n 2 >nul
+    )
+  )
+)
+exit /b 0
+"""
+    try:
+        post_bat.write_text(bat, encoding="utf-8", newline="\r\n")
+        log.info("post-bat OK -> %s", post_bat)
+    except Exception as e:
+        log.error("post-bat write failed: %s", e)
+    return post_bat
+
+# ------------------------------------------------------------------
 if __name__ == "__main__":
     if _HAS_TK:
         gui_main()

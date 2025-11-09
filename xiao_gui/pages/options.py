@@ -716,8 +716,27 @@ class OptionsPage(ttk.Frame):
 
     # ---------------- Desinstalar ----------------
     def _uninstall_from_app(self):
-        if messagebox.askyesno("Desinstalar", "¿Quieres abrir el desinstalador de XiaoHack?"):
-            try:
-                launch_uninstaller_ui()
-            except Exception as e:
-                messagebox.showerror("Error", f"No se pudo abrir el desinstalador:\n{e}")
+        from tkinter import messagebox
+        import logging
+        import os
+
+        if not messagebox.askyesno("Desinstalar", "¿Quieres abrir el desinstalador de XiaoHack?"):
+            return
+        try:
+            # Abre tu UI de desinstalación (ya la tienes implementada)
+            launch_uninstaller_ui()
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo abrir el desinstalador:\n{e}")
+            return
+
+        # Cierra la app para liberar el intérprete/DLLs
+        try:
+            logging.shutdown()
+        except Exception:
+            pass
+
+        root = getattr(self, "root", None)
+        if root:
+            root.after(100, root.destroy)  # pequeño delay para que el launcher arranque
+        else:
+            os._exit(0)

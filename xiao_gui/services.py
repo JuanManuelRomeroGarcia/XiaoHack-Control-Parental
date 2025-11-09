@@ -341,9 +341,10 @@ def run_updater_apply_ui() -> None:
 # ---------------------------------------------------------------------------
 def launch_uninstaller_ui() -> None:
     """
-    Lanza el desinstalador priorizando pythonw -m app.uninstall (sin consola, con UAC dentro).
-    Fallback: uninstall.bat si existe.
+    Lanza el desinstalador con pythonw -m app.uninstall (sin consola).
+    Tras lanzarlo, cierra el Panel para liberar el intérprete/archivos.
     """
+
     base = find_install_root()
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
@@ -354,22 +355,27 @@ def launch_uninstaller_ui() -> None:
     except Exception:
         pyw = None
 
-    # 1) Preferir pythonw -m app.uninstall (silencioso, GUI)
     if pyw and pyw.exists():
+        # CREATE_NO_WINDOW por si algún entorno cae en python.exe
+        CREATE_NO_WINDOW = 0x08000000
         subprocess.Popen([str(pyw), "-m", "app.uninstall"],
-                         cwd=str(base), env=env, creationflags=0x08000000)
+                         cwd=str(base), env=env, creationflags=CREATE_NO_WINDOW)
+    else:
+        messagebox.showerror(
+            "Desinstalar",
+            "No se encontró el desinstalador.\nReinstala con el instalador actual y vuelve a intentarlo."
+        )
         return
 
-    # 2) Fallback: uninstall.bat (con start para no dejar consola)
-    bat = base / "uninstall.bat"
-    if bat.exists():
-        comspec = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
-        subprocess.Popen([comspec, "/c", "start", "", f'"{bat}"'],
-                         cwd=str(base), creationflags=0x08000000)
-        return
+    # Cerrar el Panel (si existe UI Tk activa)
+    try:
+        import tkinter as tk
+        root = tk._default_root
+        if root is not None:
+            root.after(50, root.destroy)
+    except Exception:
+        pass
 
-    messagebox.showerror("Desinstalar",
-                         "No se encontró el desinstalador.\nReinstala con el instalador actual y vuelve a intentarlo.")
 
 
 # ---------------------------------------------------------------------------
