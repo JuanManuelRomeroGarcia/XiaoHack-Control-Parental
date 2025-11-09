@@ -77,6 +77,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = LOGS_DIR.parent
 CONFIG_PATH = DATA_DIR / "config.json"
 PROTECT_SELF = False  # True si quieres blindar carpeta de instalación
+
 # Desactivar la vigilancia de Explorer desde Guardian (consume y no es ideal en SYSTEM)
 # Si alguna vez quieres activarlo: set XH_GUARDIAN_EXPLORER_WATCH=1
 ENABLE_EXPLORER_WATCH = bool(int(os.getenv("XH_GUARDIAN_EXPLORER_WATCH", "0")))

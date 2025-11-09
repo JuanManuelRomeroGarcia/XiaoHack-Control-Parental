@@ -96,6 +96,9 @@ _SUPPRESS_FLASH_UNTIL = {"av1": 0.0, "av2": 0.0}
 SLEEP_ACTIVE = float(os.getenv("XH_NOTIFIER_SLEEP_ACTIVE", "0.10"))
 SLEEP_IDLE   = float(os.getenv("XH_NOTIFIER_SLEEP_IDLE",   "0.35"))
 
+# --- Explorer Watch flags (por entorno) ---
+ENABLE_EXPLORER_WATCH = os.getenv("XH_EXPLORER_WATCH", "1") != "0"
+EXPLORER_DEBUG = os.getenv("XH_EXPLORER_DEBUG", "0") in ("1", "true", "yes")
 
 # --------------------------------------------------------------------
 #  Auto-provision per-user (schtasks), mutex y espera de shell
@@ -350,6 +353,73 @@ def _normpath(p: str) -> str:
 def _dirtrail(p: str) -> str:
     q = _normpath(p)
     return q if q.endswith(os.sep) else (q + os.sep)
+
+def _is_fs_path(p: str) -> bool:
+    """True si es una ruta de FS (C:\..., \\server\..., file:///...)."""
+    if not p:
+        return False
+    p = p.strip()
+    if p.startswith("::{") or p.startswith("shell:"):
+        return False
+    if p.startswith(("http://", "https://")):
+        return False
+    if p.lower().startswith("file:///"):
+        return True
+    # C:\... o UNC \\...
+    return (len(p) >= 3 and p[1] == ":" and p[2] in ("\\", "/")) or p.startswith("\\\\")
+
+def _path_from_window(w, hwnd) -> str:
+    """
+    Intenta extraer una ruta útil desde la ventana del Explorador:
+    1) Document.Folder.Self.Path  (puede ser FS o virtual shell)
+    2) LocationURL -> file:///C:/...
+    3) Si es 'shell:*', traducimos varios conocidos a FS.
+    Devuelve cadena (quizá virtual). El normalizado/decisión se hace fuera.
+    """
+    path = ""
+    try:
+        doc = getattr(w, "Document", None)
+        folder = getattr(doc, "Folder", None) if doc else None
+        self_item = getattr(folder, "Self", None) if folder else None
+        path = str(getattr(self_item, "Path", "") or "").strip()
+    except Exception:
+        path = ""
+
+    # Fallback por URL
+    if not path:
+        try:
+            loc = getattr(w, "LocationURL", "") or ""
+            if isinstance(loc, str) and loc:
+                if loc.lower().startswith("file:///"):
+                    path = loc[8:].replace("/", "\\")
+                else:
+                    path = loc  # puede ser shell: o ::{GUID}
+        except Exception:
+            pass
+
+    # Traducción básica de varios 'shell:' conocidos a FS del usuario
+    try:
+        pl = (path or "").lower()
+        if pl.startswith("shell:"):
+            user = os.path.expandvars(r"%USERPROFILE%")
+            mapping = {
+                "shell:downloads":  os.path.join(user, "Downloads"),
+                "shell:documents":  os.path.join(user, "Documents"),
+                "shell:pictures":   os.path.join(user, "Pictures"),
+                "shell:music":      os.path.join(user, "Music"),
+                "shell:videos":     os.path.join(user, "Videos"),
+                "shell:desktop":    os.path.join(user, "Desktop"),
+            }
+            if pl in mapping:
+                path = mapping[pl]
+    except Exception:
+        pass
+
+    if EXPLORER_DEBUG:
+        log.debug("Explorer hwnd=%s path_raw=%r", hwnd, path)
+    return path
+
+
 
 
 # --------------------------------------------------------------------
@@ -749,39 +819,51 @@ def explorer_watch_loop(stop_ev: threading.Event):
     if not (pythoncom and win32com and win32gui):
         log.warning("ExplorerWatch: COM/Win32 no disponible.")
         return
+
     log.info("ExplorerWatch iniciado.")
     shell = None
-    last_closed = {}
-    backoff = 0.3  # se adapta dinámicamente
+    last_closed: dict[int, float] = {}
+    backoff = 0.30
 
     try:
         pythoncom.CoInitialize()
     except Exception:
         pass
 
+    def _bn(p: str) -> str:
+        p = (p or "").rstrip("\\/") 
+        return (os.path.basename(p) or "").lower()
+
     while not stop_ev.is_set():
         closed_any = False
         try:
+            # Cargar paths bloqueados (PD\config.json) en cada vuelta
             blocked = []
             try:
                 if CONFIG_PATH_PD.exists():
                     cfg = json.loads(CONFIG_PATH_PD.read_text(encoding="utf-8"))
                     blocked = [p for p in (cfg.get("blocked_paths") or []) if p]
             except Exception:
-                pass
+                blocked = []
 
             if not blocked:
-                _t.sleep(min(backoff, 0.8))
-                # aumenta drift si no hay nada que vigilar
-                backoff = min(backoff * 1.25, 0.8)
+                _t.sleep(min(backoff, 0.80))
+                backoff = min(backoff * 1.25, 0.80)
                 continue
 
+            # Normalización (con barra final para prefijo) + set de basenames
+            blocked_norm = [_dirtrail(bp) for bp in blocked]
+            blocked_names = {_bn(bp) for bp in blocked}
+
+            # Crear/recuperar Shell.Application
             if shell is None:
                 try:
                     shell = win32com.client.Dispatch("Shell.Application")
                 except Exception:
-                    _t.sleep(min(backoff, 0.8))
-                    backoff = min(backoff * 1.25, 0.8)
+                    if EXPLORER_DEBUG:
+                        log.debug("ExplorerWatch: Shell.Application no disponible aún.")
+                    _t.sleep(min(backoff, 0.80))
+                    backoff = min(backoff * 1.25, 0.80)
                     continue
 
             for w in shell.Windows():
@@ -789,44 +871,67 @@ def explorer_watch_loop(stop_ev: threading.Event):
                     hwnd = int(getattr(w, "HWND", 0))
                     if not hwnd:
                         continue
+
                     cls = win32gui.GetClassName(hwnd)
                     if cls not in ("CabinetWClass", "ExploreWClass"):
-                        continue
-                    doc = getattr(w, "Document", None)
-                    folder = getattr(doc, "Folder", None) if doc else None
-                    self_item = getattr(folder, "Self", None) if folder else None
-                    path = str(getattr(self_item, "Path", "") or "").strip()
+                        continue  # no es una ventana del Explorador
 
-                    if not path:
+                    raw = _path_from_window(w, hwnd)
+                    if not raw:
                         continue
-                    pnorm = _normpath(path)
-                    if any(pnorm.startswith(_dirtrail(bp)) for bp in blocked):
-                        # de-bounce por hwnd
-                        now = _t.time()
-                        if now - last_closed.get(hwnd, 0) < 2.0:
-                            continue
-                        last_closed[hwnd] = now
 
-                        log.info("ExplorerWatch: cerrar hwnd=%s path=%s", hwnd, pnorm)
-                        try:
-                            win32gui.PostMessage(hwnd, WM_CLOSE, 0, 0)
-                        except Exception:
-                            with contextlib.suppress(Exception):
-                                w.Quit()
-                        closed_any = True
-                except Exception:
+                    pnorm = _normpath(raw)
+                    # Coincidencia por prefijo FS...
+                    match_prefix = any(pnorm.startswith(_dirtrail(bp)) for bp in blocked_norm)
+                    # ...o por nombre de carpeta si es virtual (::{GUID}/shell:)
+                    base_hit = (_bn(pnorm) in blocked_names)
+
+                    if not (match_prefix or base_hit):
+                        continue
+
+                    # debounce por hwnd (2s)
+                    now = _t.time()
+                    if now - last_closed.get(hwnd, 0.0) < 2.0:
+                        continue
+                    last_closed[hwnd] = now
+
+                    shown = _bn(pnorm) or "(ruta protegida)"
+                    if EXPLORER_DEBUG:
+                        log.debug("ExplorerWatch: MATCH → hwnd=%s path=%s (prefix=%s base=%s)",
+                                  hwnd, pnorm, match_prefix, base_hit)
+                    log.info("ExplorerWatch: cerrar hwnd=%s path=%s", hwnd, pnorm)
+
+                    try:
+                        win32gui.PostMessage(hwnd, WM_CLOSE, 0, 0)
+                    except Exception:
+                        with contextlib.suppress(Exception):
+                            w.Quit()
+                    closed_any = True
+
+                    try:
+                        notify_once(f"dir:{pnorm}", "Carpeta bloqueada",
+                                    f"No tienes permiso para abrir: {shown}", 8.0)
+                    except Exception:
+                        pass
+
+                except Exception as e:
+                    if EXPLORER_DEBUG:
+                        log.debug("ExplorerWatch: error enumerando ventana: %s", e)
                     continue
 
         except Exception as e:
             log.error("ExplorerWatch loop error: %s", e)
-            shell = None
+            shell = None  # reintentar en la siguiente vuelta
 
         # Backoff adaptativo
-        if closed_any:
-            backoff = 0.15
-        else:
-            backoff = min(backoff * 1.15, 0.8)
+        backoff = 0.15 if closed_any else min(backoff * 1.15, 0.80)
         _t.sleep(backoff)
+
+    try:
+        pythoncom.CoUninitialize()
+    except Exception:
+        pass
+
 
 
 # --------------------------------------------------------------------
@@ -1497,8 +1602,16 @@ def main():
         pass
 
     stop_ev = threading.Event()
-    threading.Thread(target=explorer_watch_loop, args=(stop_ev,), name="ExplorerWatch", daemon=True).start()
-    threading.Thread(target=overlay_loop,    args=(stop_ev,), name="Overlay",        daemon=True).start()
+
+    if ENABLE_EXPLORER_WATCH:
+        threading.Thread(target=explorer_watch_loop, args=(stop_ev,),
+                         name="ExplorerWatch", daemon=True).start()
+        log.info("ExplorerWatch habilitado (XH_EXPLORER_WATCH=1).")
+    else:
+        log.info("ExplorerWatch desactivado (XH_EXPLORER_WATCH=0).")
+
+    threading.Thread(target=overlay_loop, args=(stop_ev,),
+                     name="Overlay", daemon=True).start()
 
     # Saltar histórico de bloqueos
     st_local = load_state_local()
