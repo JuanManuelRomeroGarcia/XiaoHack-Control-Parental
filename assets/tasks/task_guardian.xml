@@ -40,7 +40,7 @@
   </Settings>
   <Actions Context="System">
     <Exec>
-      <Command>C:\Program Files\XiaoHackParental\venv\Scripts\python.exe</Command>
+      <Command>C:\Program Files\XiaoHackParental\py312\python.exe</Command>
       <Arguments>-m app.guardian --xh-role guardian --no-ui</Arguments>
       <WorkingDirectory>C:\Program Files\XiaoHackParental</WorkingDirectory>
     </Exec>

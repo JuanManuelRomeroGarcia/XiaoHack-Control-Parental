@@ -10,9 +10,9 @@ from tkinter import ttk, messagebox, simpledialog, filedialog
 
 # webfilter: funciones locales + variantes elevadas si están disponibles
 from app.webfilter import (
-    ensure_hosts_rules,
+    ensure_hosts_rules_or_elevate as ensure_hosts_rules,
+    remove_parental_block_or_elevate as remove_parental_block,
     rollback_hosts,
-    remove_parental_block,
     HOSTS,
     GOOGLE_TLDS,
     GOOGLE_SAFE_IP, BING_STRICT_IP, YANDEX_FAMILY_IP,
